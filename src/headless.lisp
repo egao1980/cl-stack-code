@@ -214,7 +214,9 @@ count is 0."
   (plan-failure nil)                          ; a condition that fails a finished run
   ;; H5b
   (plan-pre nil)                              ; --apply: APPROVE-PLAN's PRE, recorded after the commit
-  (rewind nil))                               ; the result's "rewind" object, or NIL
+  (rewind nil)                                ; the result's "rewind" object, or NIL
+  ;; H4b
+  (image-tools nil))                          ; the LISP-TOOLS, or NIL
 
 (defun %write-json-line (report object)
   (let ((out (%report-output report)))
@@ -296,7 +298,9 @@ would only become a warning, so it never signals: the first error is kept,
 the run is canceled and the error fails the run afterwards."
   (handler-case
       (case kind
-        (:started (setf (%report-run report) payload))
+        (:started (setf (%report-run report) payload)
+         ;; H4b: events queued before the run reach its first step.
+         (%post-if-going (%report-image-tools report) payload))
         (:step (setf (%report-step report) payload))
         (:part (when (and (llm:llm-text-part-p payload)
                           (plusp (length (llm:llm-text-part-text payload))))
@@ -823,6 +827,10 @@ result, then signals its failure."
          (backend (first resolved))
          (model (third resolved))
          (mode (or (settings-permission-mode settings) :default))
+         ;; H4b: the checks, before the session is written.
+         (link (when (settings-lisp-image settings)
+                 (check-lisp-image-settings settings mode)
+                 (and (lisp-image-enabled-p settings) (%make-image-link))))
          (max-turns (or (settings-max-turns settings) +default-max-turns+))
          (store (%session-for-run inv source sessions-dir (or (find-project-root cwd) cwd)))
          ;; H5b: after the session, before anything is written to OUTPUT.
@@ -855,14 +863,25 @@ result, then signals its failure."
                  (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                         agent:*off-loop-specials*)))
            (setf sources (make-code-tools (if plan (plan-tool-root plan cwd) cwd)
-                                          :settings settings))
+                                          :settings settings
+                                          :on-image-event (and link (%link-callback link))))
+           ;; H4b: the image starts before the system event; its events are
+           ;; written and posted on the loop thread.
+           (when link
+             (setf (%link-tools link) (third sources)
+                   (%report-image-tools report) (third sources))
+             (%link-attach link (lambda (event)
+                                  (event:wake-call event-backend event-loop
+                                                   (lambda ()
+                                                     (%headless-image-event report event)))))
+             (start-lisp-image (third sources) settings))
            (let ((offered (loop for source in sources
                                 append (mapcar #'llm:llm-tool-name
                                                (agent:list-agent-tools source)))))
              (multiple-value-bind (instructions files)
                  (assemble-system-prompt cwd :tools offered :backend backend
                                              :settings settings :user-config-dir config
-                                             :plan plan)
+                                             :plan plan :lisp-image (third sources))
                (let ((agent (agent:make-ai-agent
                              :name "cl-stack-code"
                              :backend backend
@@ -872,15 +891,17 @@ result, then signals its failure."
                              :permissions (%agent-permissions settings)
                              :settings (%agent-settings cwd settings)))
                      (root (find-project-root cwd)))
-                 (%emit-event report "system"
-                              "subtype" "init"
-                              "version" +version+
-                              "cwd" (uiop:native-namestring cwd)
-                              "project_root" (if root (uiop:native-namestring root) :null)
-                              "model" designator
-                              "permission_mode" (permission-mode-name mode)
-                              "tools" (coerce offered 'vector)
-                              "instructions" (map 'vector #'uiop:native-namestring files))
+                 (apply #'%emit-event report "system"
+                        "subtype" "init"
+                        "version" +version+
+                        "cwd" (uiop:native-namestring cwd)
+                        "project_root" (if root (uiop:native-namestring root) :null)
+                        "model" designator
+                        "permission_mode" (permission-mode-name mode)
+                        "tools" (coerce offered 'vector)
+                        "instructions" (map 'vector #'uiop:native-namestring files)
+                        ;; H4b: only with the image on.
+                        (and link (list "lisp_image" (%lisp-image-object settings))))
                  (when plan
                    (%emit-event report "plan"
                                 "subtype" (if (second plan-and-reopened) "reopened" "opened")
@@ -905,10 +926,35 @@ result, then signals its failure."
                                                   revision)
                          (end-checkpoint-turn checkpointer went-to pre revision)))
                      (%report-run-end report run failure interrupted max-turns start)))))))
+      ;; H4b: no event reaches the loop after this; -p never waits for
+      ;; events after the run (the queue goes with the tools).
+      (%link-close link)
       (when (second sources)
         (tools:close-shell-tools (second sources)))
       (close-checkpointer checkpointer)
       (event:close-event-loop event-backend event-loop))))
+
+(defun %headless-image-event (report event)
+  "H4b, loop thread: EVENT's image_event line (none for :debugger-return),
+then the queued events posted into the run while it is going. Like
+%ON-AGENT-EVENT it never signals: the first error is kept and fails the run."
+  (handler-case
+      (progn
+        (unless (eq :debugger-return (lt:image-event-kind event))
+          (flet ((value (x) (or x :null)))
+            (%emit-event report "image_event"
+                         "kind" (string-downcase (symbol-name (lt:image-event-kind event)))
+                         "connection" (value (lt:image-event-connection event))
+                         "thread" (value (lt:image-event-thread event))
+                         "level" (value (lt:image-event-level event))
+                         "job" (value (lt:image-event-job event))
+                         "text" (lt:image-event-text event))))
+        (%post-if-going (%report-image-tools report) (%report-run report)))
+    (error (e)
+      (unless (%report-failure report)
+        (setf (%report-failure report) e))
+      (let ((run (%report-run report)))
+        (when run (agent:cancel-agent-run run))))))
 
 (defun %list-sessions (inv &key output getenv data-dir)
   "--list-sessions: this project's SESSION-SUMMARY-LINES on OUTPUT. → 0."

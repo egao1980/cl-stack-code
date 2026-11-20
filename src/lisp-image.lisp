@@ -100,63 +100,266 @@
 (defparameter +lisp-image-connection+ "image"
   "H4b: the connection name of the product's image.")
 
+(defparameter +observe-needs-attach+
+  "--lisp-observe needs --lisp-image attach:[HOST:]PORT (an observer attaches; it does not spawn)"
+  "The CODE-USAGE-ERROR message of observe without attach.")
+
+(defparameter +image-not-in-plan+
+  "--lisp-image is not available in plan mode yet (the image would not see the plan area)"
+  "The CODE-USAGE-ERROR message of the image in plan mode.")
+
 (defun check-lisp-image-settings (settings mode)
   "→ T when SETTINGS's lispImage goes with permission MODE; otherwise
 CODE-USAGE-ERROR (see the file header)."
-  (declare (ignore settings mode))
-  (%not-implemented 'check-lisp-image-settings))
+  (multiple-value-bind (image backend observe) (lisp-image-settings settings)
+    (declare (ignore backend))
+    (cond ((and observe (not (eq :attach (first image))))
+           (error 'code-usage-error :message +observe-needs-attach+))
+          ((and (eq mode :plan) (lisp-image-enabled-p settings))
+           (error 'code-usage-error :message +image-not-in-plan+))
+          (t t))))
+
+(defun %condition-text (condition)
+  "CONDITION's report, or its type when the report fails."
+  (handler-case (princ-to-string condition)
+    (error () (format nil "~a" (type-of condition)))))
+
+(defun %lisp-image-failure (image cause text)
+  "Signal LISP-IMAGE-ERROR for designator IMAGE with CAUSE (a condition or
+NIL) and the cause's TEXT."
+  (error 'lisp-image-error
+         :image image :cause cause
+         :message (if (eq :attach (first image))
+                      (format nil "cannot attach to the Lisp image at ~a:~d: ~a"
+                              (second image) (third image) text)
+                      (format nil "cannot start the Lisp image: ~a" text))))
 
 (defun make-code-lisp-tools (cwd settings &key on-image-event)
   "→ the LISP-MCP/AGENT:LISP-TOOLS for CWD and SETTINGS (see the file header)."
-  (declare (ignore cwd settings on-image-event))
-  (%not-implemented 'make-code-lisp-tools))
+  (multiple-value-bind (image backend observe) (lisp-image-settings settings)
+    (declare (ignore backend))
+    (let ((root (uiop:ensure-directory-pathname cwd))
+          (mode (if observe :observe :full)))
+      (flet ((make (&optional tools)
+               (lt:make-lisp-tools :root root :groups nil :tools tools :mode mode
+                                   :needs-approval t :image-events t
+                                   :on-image-event on-image-event)))
+        ;; A source made without :TOOLS offers the catalog (filtered by MODE),
+        ;; so its names are valid :TOOLS for the real one. It has no
+        ;; connection yet: closing it is cheap.
+        (let* ((source (make))
+               (names (lt:lisp-tools-names source))
+               (hidden (hidden-tool-names settings names)))
+          (if (null hidden)
+              source
+              (let ((keep (remove-if (lambda (name) (member name hidden :test #'string=))
+                                     names)))
+                (lt:close-lisp-tools source)
+                ;; :TOOLS NIL would mean "every tool".
+                (when (null keep)
+                  (%lisp-image-failure image nil "every lisp tool is hidden by a deny rule"))
+                (make keep))))))))
 
 (defun start-lisp-image (tools settings)
   "Spawn or attach SETTINGS's image on TOOLS. → the tool's result text;
 LISP-IMAGE-ERROR when it fails."
-  (declare (ignore tools settings))
-  (%not-implemented 'start-lisp-image))
+  (multiple-value-bind (image backend) (lisp-image-settings settings)
+    (destructuring-bind (kind &optional host port) image
+      (handler-case
+          (if (eq kind :attach)
+              (lt:call-lisp-tool tools "repl-connect"
+                                 (%json-object "host" host "port" port "backend" backend
+                                               "name" +lisp-image-connection+))
+              (lt:call-lisp-tool tools "repl-spawn"
+                                 (%json-object "backend" backend
+                                               "name" +lisp-image-connection+)))
+        ;; ERROR, not SERIOUS-CONDITION: an interrupt keeps its own exit.
+        (error (e)
+          (%lisp-image-failure image e (%condition-text e)))))))
 
 (defun lisp-image-description (settings)
   "\"image (spawned, swank)\", \"image (attached H:P, B[, observe])\"."
-  (declare (ignore settings))
-  (%not-implemented 'lisp-image-description))
+  (multiple-value-bind (image backend observe) (lisp-image-settings settings)
+    (if (eq :attach (first image))
+        (format nil "image (attached ~a:~d, ~a~:[~;, observe~])"
+                (second image) (third image) backend observe)
+        (format nil "image (spawned, ~a)" backend))))
 
 (defun %lisp-image-sections (tools settings)
   "→ (\"# Lisp image…\"), the system prompt section for TOOLS."
-  (declare (ignore tools settings))
-  (%not-implemented '%lisp-image-sections))
+  (list (format nil "# Lisp image~%- Image: ~a~%~a"
+                (lisp-image-description settings)
+                (lt:lisp-tools-instructions tools))))
+
+(defun %lisp-image-object (settings)
+  "The headless init event's \"lisp_image\" object for SETTINGS."
+  (multiple-value-bind (image backend observe) (lisp-image-settings settings)
+    (let ((attach (eq :attach (first image))))
+      (%json-object "name" +lisp-image-connection+
+                    "kind" (if attach "attach" "spawn")
+                    "backend" backend
+                    "host" (if attach (second image) :null)
+                    "port" (if attach (third image) :null)
+                    "observe" (and observe t)))))
 
 (defun lisp-image-state (settings)
   "→ the interactive state's image plist for SETTINGS: (:name \"image\"
 :description (LISP-IMAGE-DESCRIPTION) :observe B :on-debugger P :debuggers ()),
 or NIL when the image is off."
-  (declare (ignore settings))
-  (%not-implemented 'lisp-image-state))
+  (when (lisp-image-enabled-p settings)
+    (multiple-value-bind (image backend observe on-debugger) (lisp-image-settings settings)
+      (declare (ignore image backend))
+      (list :name +lisp-image-connection+
+            :description (lisp-image-description settings)
+            :observe (and observe t)
+            :on-debugger on-debugger
+            :debuggers '()))))
+
+(defun %image-first-line (text)
+  (let ((text (or text "")))
+    (subseq text 0 (or (position #\Newline text) (length text)))))
 
 (defun image-event-notice (event)
   "The transcript notice for a queued LISP-MCP/AGENT:IMAGE-EVENT."
-  (declare (ignore event))
-  (%not-implemented 'image-event-notice))
+  (ecase (lt:image-event-kind event)
+    (:debugger
+     (format nil "λ image entered the debugger (thread ~a, level ~a): ~a"
+             (lt:image-event-thread event) (lt:image-event-level event)
+             (%image-first-line (lt:image-event-condition event))))
+    (:job
+     (format nil "λ image: job ~a ~(~a~)"
+             (lt:image-event-job event) (lt:image-event-job-state event)))
+    (:debugger-return nil)))
 
 (defun image-event-message (event)
   "The core event for EVENT: (:image-event …) or (:image-return …)."
-  (declare (ignore event))
-  (%not-implemented 'image-event-message))
+  (if (eq :debugger-return (lt:image-event-kind event))
+      (list :image-return
+            :connection (lt:image-event-connection event)
+            :thread (lt:image-event-thread event)
+            :level (lt:image-event-level event))
+      (list :image-event
+            :kind (lt:image-event-kind event)
+            :connection (lt:image-event-connection event)
+            :thread (lt:image-event-thread event)
+            :level (lt:image-event-level event)
+            :condition (lt:image-event-condition event)
+            :job (lt:image-event-job event)
+            :notice (image-event-notice event))))
 
 (defun image-banner-text (state)
   "NIL, or \"λ image is in the debugger: <condition> (thread T)\" for the
 newest debugger of STATE-IMAGE, with \" (+K more)\" when K more wait."
-  (declare (ignore state))
-  (%not-implemented 'image-banner-text))
+  (let ((debuggers (getf (state-image state) :debuggers)))
+    (when debuggers
+      (let ((newest (first debuggers)))
+        (format nil "λ image is in the debugger: ~a (thread ~a)~@[ (+~d more)~]"
+                (%image-first-line (getf newest :condition))
+                (getf newest :thread)
+                (and (rest debuggers) (length (rest debuggers))))))))
 
 (defun %image-marker (state)
   "The status line's image marker: \"λ image\", \"λ image (observe)\",
 \"λ image (debugger)\" or \"λ image (observe, debugger)\"."
-  (declare (ignore state))
-  (%not-implemented '%image-marker))
+  (let ((image (state-image state)))
+    (format nil "λ image~@[ (~{~a~^, ~})~]"
+            (remove nil (list (and (getf image :observe) "observe")
+                              (and (getf image :debuggers) "debugger"))))))
 
 (defun %image-event (state event)
   "The core's H4b events (see interactive.lisp \"H4b\"). → effects."
-  (declare (ignore state event))
-  (%not-implemented '%image-event))
+  (flet ((debuggers () (getf (state-image state) :debuggers))
+         (set-debuggers (value) (setf (getf (state-image state) :debuggers) value))
+         (image-turn ()
+           (setf (state-busy-p state) t)
+           (list (list :image-turn)))
+         (turn-policy-p () (eq :turn (getf (state-image state) :on-debugger))))
+    (destructuring-bind (kind &rest args) event
+      (ecase kind
+        (:image-event
+         (destructuring-bind (&key ((:kind event-kind)) connection thread level condition
+                                   notice &allow-other-keys)
+             args
+           (%add-entry state :kind :notice :text notice)
+           (when (eq event-kind :debugger)
+             (set-debuggers
+              (cons (list :connection connection :thread thread :level level
+                          :condition condition)
+                    (remove-if (lambda (d)
+                                 (and (equal connection (getf d :connection))
+                                      (equal thread (getf d :thread))
+                                      (eql level (getf d :level))))
+                               (debuggers)))))
+           (cond ((state-busy-p state) (list (list :post-image-events)))
+                 ((turn-policy-p) (image-turn))
+                 (t '()))))
+        (:image-return
+         (destructuring-bind (&key connection thread level &allow-other-keys) args
+           (set-debuggers
+            (remove-if (lambda (d)
+                         (and (equal connection (getf d :connection))
+                              (equal thread (getf d :thread))
+                              (realp level) (realp (getf d :level))
+                              (>= (getf d :level) level)))
+                       (debuggers)))
+           '()))
+        (:image-pending
+         (let ((n (first args)))
+           (if (and (not (state-busy-p state)) (integerp n) (plusp n) (turn-policy-p))
+               (image-turn)
+               '())))))))
+
+;;; The image link (private): how the source's ON-IMAGE-EVENT reaches the
+;;; product. One lock covers three states: buffering (no sink yet: before
+;;; the TUI runs), attached (each event goes to the sink) and closed (events
+;;; are dropped). The sink only queues (EVENT:WAKE-CALL or TUI:TUI-SEND), so
+;;; holding the lock while it runs is short; after %LINK-CLOSE returns no sink
+;;; call is in flight and none follows, so the caller may free its event loop.
+;;; Lock order: lisp-mcp calls ON-IMAGE-EVENT outside its own lock, and
+;;; %LINK-CLOSE releases this lock before CLOSE-LISP-TOOLS takes lisp-mcp's.
+
+(defstruct (%image-link (:conc-name %link-) (:constructor %make-image-link ()))
+  (tools nil)                           ; the LISP-TOOLS, once made
+  (lock (bt:make-lock "cl-stack-code image link"))
+  (sink nil)                            ; (lambda (event)), or NIL: buffer
+  (buffer '())                          ; events before the sink, newest first
+  (closed nil))
+
+(defun %link-callback (link)
+  "The source's :ON-IMAGE-EVENT for LINK (a reader or job thread)."
+  (lambda (tools event)
+    (declare (ignore tools))
+    (bt:with-lock-held ((%link-lock link))
+      (cond ((%link-closed link) nil)
+            ((%link-sink link) (funcall (%link-sink link) event))
+            (t (push event (%link-buffer link)))))
+    nil))
+
+(defun %link-attach (link sink)
+  "Deliver LINK's events to SINK from now on; the buffered ones go first, in
+order."
+  (bt:with-lock-held ((%link-lock link))
+    (unless (%link-closed link)
+      (setf (%link-sink link) sink)
+      (dolist (event (reverse (shiftf (%link-buffer link) '())))
+        (funcall sink event))))
+  link)
+
+(defun %link-close (link)
+  "Stop LINK's deliveries, then CLOSE-LISP-TOOLS its tools (a spawned image
+is killed, an attached one keeps running). Idempotent. → NIL"
+  (when link
+    (bt:with-lock-held ((%link-lock link))
+      (setf (%link-closed link) t
+            (%link-sink link) nil
+            (%link-buffer link) '()))
+    (let ((tools (%link-tools link)))
+      (when tools
+        (lt:close-lisp-tools tools))))
+  nil)
+
+(defun %post-if-going (tools run)
+  "POST-IMAGE-EVENTS of TOOLS into RUN while it is going (started, not
+finished); otherwise the events stay queued."
+  (when (and tools run (null (agent:agent-run-finish-reason run)))
+    (lt:post-image-events tools run)))

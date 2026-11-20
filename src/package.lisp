@@ -395,7 +395,3 @@
 
 (defparameter +version+ "0.6.0"
   "The product version, as in the .asd.")
-
-(defun %not-implemented (name)
-  "H4b contract stub."
-  (error "~a is not implemented (H4b contract stub)" name))
