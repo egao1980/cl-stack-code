@@ -484,19 +484,63 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
         (concatenate 'string "~" (subseq dir (1- (length home))))
         dir)))
 
-(defun status-line-text (state)
+(defun %text-width (string)
+  "Display width of STRING in cells."
+  (w:runs-width string))
+
+(defun %elide-directory (dir width)
+  "DIR (a native directory namestring) in at most WIDTH columns: when it does
+not fit, its middle becomes \"…\", keeping its first component (\"~/\", \"/srv/\",
+\"C:\\\") and as many of its last components as fit, at least the last one,
+the project directory (\"/srv/…/demo/app/\"). When that is still too wide the
+head goes too (\"…/app/\"), and the status line cuts what remains."
+  (if (<= (%text-width dir) width)
+      dir
+      (let* ((seps (loop for i from 0 below (length dir)
+                         when (member (char dir i) '(#\/ #\\)) collect i))
+             (n (length seps)))
+        (if (< n 2)
+            dir
+            (let* ((head-end (1+ (if (and (>= n 3) (zerop (first seps)))
+                                     (second seps)
+                                     (first seps))))
+                   (head (subseq dir 0 head-end)))
+              (flet ((elided (k &optional (head head))
+                       ;; HEAD, "…", then DIR from its K-th separator on.
+                       (concatenate 'string head "…" (subseq dir (nth k seps)))))
+                (or (loop with best = nil
+                          for k from (- n 2) downto 0
+                          while (>= (nth k seps) head-end)
+                          do (let ((candidate (elided k)))
+                               (if (<= (%text-width candidate) width)
+                                   (setf best candidate)
+                                   (loop-finish)))
+                          finally (return best))
+                    (elided (- n 2) ""))))))))
+
+(defun status-line-text (state &optional width)
   "→ (values left right) of the status line:
 left  \" <model> · <permission mode name> · <cwd>\", the cwd as a native
       directory namestring with the user's home directory prefix shown as \"~/\";
-right \"<input> in · <output> out \", the summed input and output tokens."
-  (let ((cwd (state-cwd state)))
-    (values (format nil " ~a · ~a · ~a"
-                    (state-model state)
-                    (permission-mode-name (state-permission-mode state))
-                    (if cwd
-                        (%home-relative (uiop:native-namestring
-                                         (uiop:ensure-directory-pathname cwd)))
-                        ""))
-            (destructuring-bind (input output &rest more) (state-usage state)
-              (declare (ignore more))
-              (format nil "~d in · ~d out " input output)))))
+right \"<input> in · <output> out \", the summed input and output tokens.
+With WIDTH (the status line's columns) a cwd that does not fit loses its
+middle, not its end: the project directory name stays (#4)."
+  (let* ((cwd (state-cwd state))
+         (prefix (format nil " ~a · ~a · "
+                         (state-model state)
+                         (permission-mode-name (state-permission-mode state))))
+         (dir (if cwd
+                  (%home-relative (uiop:native-namestring
+                                   (uiop:ensure-directory-pathname cwd)))
+                  ""))
+         (right (destructuring-bind (input output &rest more) (state-usage state)
+                  (declare (ignore more))
+                  (format nil "~d in · ~d out " input output))))
+    ;; The widget gives the left side WIDTH - right - 1 columns (all of
+    ;; WIDTH when the right side is dropped, at right + 2 > WIDTH).
+    (when (and width (plusp (length dir)))
+      (let* ((rw (%text-width right))
+             (room (- (if (> (+ rw 2) width) width (- width rw 1))
+                      (%text-width prefix))))
+        (setf dir (%elide-directory dir (max 0 room)))))
+    (values (concatenate 'string prefix dir) right)))

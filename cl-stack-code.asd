@@ -1,9 +1,9 @@
 (defsystem "cl-stack-code"
-  :version "0.3.0"
+  :version "0.3.1"
   :description "Coding agent CLI on cl-stack: an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "ai-agent-protocol" "0.13.0")
+  :depends-on ((:version "ai-agent-protocol" "0.14.0")
                (:version "agent-tools" "0.2.0")
                (:version "llm-protocol" "0.5.0")
                (:version "llm-protocol-anthropic" "0.3.0")

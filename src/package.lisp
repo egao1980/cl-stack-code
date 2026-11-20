@@ -225,6 +225,11 @@
    #:session-conflict-actual
    #:session-locked
    #:session-locked-file
+   #:session-lock-error
+   #:session-lock-error-file
+   #:session-lock-error-operation
+   #:session-lock-error-cause
+   #:break-lock
    #:session-turn-not-found
    #:session-turn-not-found-designator
    #:fork-session
@@ -235,5 +240,5 @@
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.3.0"
+(defparameter +version+ "0.3.1"
   "The product version, as in the .asd.")

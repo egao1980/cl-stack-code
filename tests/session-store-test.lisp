@@ -381,6 +381,56 @@
       (ok (not (probe-file lock)))
       (ok (equal '("one" "two") (line-prompts (open-session dir (session-id s))))))))
 
+(defun write-octets (path octets)
+  (ensure-directories-exist path)
+  (with-open-file (out path :direction :output :if-exists :supersede
+                            :element-type '(unsigned-byte 8))
+    (write-sequence (coerce octets '(vector (unsigned-byte 8))) out))
+  path)
+
+(deftest unreadable-session-lock-is-a-typed-error
+  ;; #7: a lock file that cannot be read is a SESSION-LOCK-ERROR (not a wait
+  ;; for SESSION-LOCKED); BREAK-LOCK removes it and the write goes on.
+  (with-sessions-dir (dir)
+    (let* ((s (create-session dir))
+           (lock (progn (commit s "one") (session-file s "lock"))))
+      (write-octets lock '(#xff #xfe #xfd 10))
+      (let* ((*session-lock-timeout* 0.3)
+             (c (failure (commit s "two"))))
+        (ok (typep c 'session-lock-error))
+        (ok (typep c 'session-error) "a session error (exit 1)")
+        (when (typep c 'session-lock-error)
+          (ok (same-path lock (session-lock-error-file c)))
+          (ok (eq :read (session-lock-error-operation c)))
+          (ok (session-lock-error-cause c))
+          (ok (search "lock file" (princ-to-string c)))))
+      (ok (probe-file lock) "nothing was removed")
+      (testing "BREAK-LOCK takes it"
+        (let* ((offered nil)
+               (revision
+                 (handler-bind ((session-lock-error
+                                  (lambda (c)
+                                    (let ((r (find-restart 'break-lock c)))
+                                      (setf offered (and r t))
+                                      (when r (invoke-restart r))))))
+                   (let ((*session-lock-timeout* 0.3))
+                     (commit s "two")))))
+          (ok (rev:revision-p revision))
+          (ok offered "the restart is offered")
+          (ok (not (probe-file lock)) "released after the write")
+          (ok (equal '("one" "two") (line-prompts (open-session dir (session-id s))))))))))
+
+(deftest vanished-session-lock-is-not-an-error
+  ;; #7: the lock file going away between the probe and the read is the
+  ;; expected race: no error, nothing to read.
+  (with-sessions-dir (dir)
+    (let* ((s (create-session dir))
+           (lock (progn (commit s "one") (session-file s "lock"))))
+      (ok (not (probe-file lock)))
+      (ok (null (cl-stack-code::%read-lock-file s lock)))
+      (ok (null (cl-stack-code::%stale-lock-p s lock)))
+      (ok (null (cl-stack-code::%remove-lock-file s lock))))))
+
 (deftest head-cas-is-linearizable-across-stores
   (with-sessions-dir (dir)
     (let* ((s (create-session dir))

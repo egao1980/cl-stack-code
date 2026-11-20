@@ -55,7 +55,9 @@
 ;;; MOVE-REF, TAG-REVISION, DELETE-REF on a SESSION-STORE, and the functions
 ;;; below that use them) runs as: take <id>/lock (create it exclusively;
 ;;; retry for *SESSION-LOCK-TIMEOUT* seconds, then SESSION-LOCKED; a lock whose
-;;; recorded time is more than +STALE-LOCK-SECONDS+ old is removed and taken),
+;;; recorded time is more than +STALE-LOCK-SECONDS+ old is removed and taken;
+;;; a lock file that cannot be read or removed signals SESSION-LOCK-ERROR,
+;;; with the restart BREAK-LOCK while waiting),
 ;;; read the revision and ref files other processes wrote since (SYNC-SESSION),
 ;;; run the in-memory operation, write the new revision files and the changed
 ;;; refs, release the lock (also on a non-local exit). The in-memory ref CAS
@@ -423,20 +425,48 @@ with \".\" (temporary files do). Otherwise SESSION-ERROR, before anything."
   #+sbcl (sb-posix:getpid)
   #-sbcl 0)
 
-(defun %stale-lock-p (file)
-  "True when FILE's recorded universal time (or, unreadable, its write date)
-is more than +STALE-LOCK-SECONDS+ old."
-  (let* ((text (ignore-errors (uiop:read-file-string file)))
+(defun %lock-file-gone-p (file)
+  (handler-case (null (probe-file file))
+    (file-error () nil)))
+
+(defun %lock-io (store file operation thunk)
+  "→ THUNK's value, THUNK reading (OPERATION :READ) or removing (:DELETE) the
+lock FILE; NIL when FILE vanished meanwhile (another process released or
+broke the lock: the expected race). Any other file or stream error →
+SESSION-LOCK-ERROR."
+  (handler-case (funcall thunk)
+    ((or file-error stream-error) (e)
+      (if (%lock-file-gone-p file)
+          nil
+          (error 'session-lock-error :session (and store (session-id store))
+                                     :file file :operation operation :cause e)))))
+
+(defun %read-lock-file (store file)
+  (%lock-io store file :read
+            (lambda () (uiop:read-file-string file :external-format :utf-8))))
+
+(defun %remove-lock-file (store file)
+  (%lock-io store file :delete (lambda () (delete-file file) t)))
+
+(defun %stale-lock-p (store file)
+  "True when lock FILE's recorded universal time (or, when its text is not
+\"<pid> <time>\", its write date) is more than +STALE-LOCK-SECONDS+ old. NIL
+when FILE is gone; SESSION-LOCK-ERROR when it cannot be read."
+  (let* ((text (%read-lock-file store file))
          (words (and text (uiop:split-string (string-trim '(#\Space #\Newline #\Return) text))))
-         (time (or (and (= 2 (length words))
-                        (ignore-errors (parse-integer (second words))))
-                   (ignore-errors (file-write-date file)))))
+         (time (and text
+                    (or (and (= 2 (length words))
+                             (every #'digit-char-p (second words))
+                             (plusp (length (second words)))
+                             (parse-integer (second words)))
+                        (%lock-io store file :read (lambda () (file-write-date file)))))))
     (and time (> (- (get-universal-time) time) +stale-lock-seconds+))))
 
 (defun %acquire-lock (store)
   "Create STORE's lock file exclusively (its directory too). Wait up to
 *SESSION-LOCK-TIMEOUT* seconds, then SESSION-LOCKED; a stale lock is removed.
-→ the token written into it."
+A lock that cannot be read or removed signals SESSION-LOCK-ERROR, with the
+restart BREAK-LOCK while probing. → the token written into it."
   (let* ((file (%lock-file store))
          (deadline (+ (get-internal-real-time)
                       (round (* *session-lock-timeout* internal-time-units-per-second)))))
@@ -452,16 +482,21 @@ is more than +STALE-LOCK-SECONDS+ old."
           (return token)))
       ;; Two breakers of one stale lock may race for a moment; the lock
       ;; assumes one local filesystem and a 30 s dead holder (file header).
-      (when (%stale-lock-p file)
-        (ignore-errors (delete-file file)))
+      (when (restart-case (%stale-lock-p store file)
+              (break-lock ()
+                :report "Remove the session's lock file and take the lock (no other process may hold it)"
+                t))
+        (%remove-lock-file store file))
       (when (> (get-internal-real-time) deadline)
         (error 'session-locked :session (session-id store) :file file))
       (sleep 0.01))))
 
 (defun %release-lock (store token)
+  "Remove STORE's lock file when it still holds TOKEN (ours). A lock file
+that cannot be read or removed → SESSION-LOCK-ERROR."
   (let ((file (%lock-file store)))
-    (when (equal token (ignore-errors (uiop:read-file-string file :external-format :utf-8)))
-      (ignore-errors (delete-file file)))))
+    (when (equal token (%read-lock-file store file))
+      (%remove-lock-file store file))))
 
 ;;; Sync and persist. *%WRITING* lists the stores this thread is inside a
 ;;; write (or sync) of: their nested store calls run the in-memory methods

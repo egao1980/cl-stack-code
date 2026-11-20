@@ -34,6 +34,18 @@
         (ok (every (lambda (row) (string= "" (trimmed row))) (subseq rows 0 9))
             "an empty transcript")))))
 
+(deftest program-status-line-keeps-the-project-directory
+  ;; #4: at 60 columns the temp project path does not fit; its end stays.
+  (with-project (project config) '()
+    (with-code-tui (tui program backend :cols 60 :rows 8) (project config)
+      (ok (wait-screen tui "Message, @file"))
+      (let ((status (trimmed (nth 7 (screen tui)))))
+        (ok (uiop:string-prefix-p " mock · default · " status))
+        (ok (search (format nil "project~c" (char (native project) (1- (length (native project)))))
+                    status)
+            "the project directory name is on the status line")
+        (ok (search " in · " status) "usage still shown")))))
+
 (deftest program-layout-follows-resize
   (with-project (project config) '()
     (with-code-tui (tui program backend :cols 100 :rows 20) (project config)

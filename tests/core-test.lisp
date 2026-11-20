@@ -306,3 +306,28 @@
       ;; "~", then the native namestring from the home's final separator on
       (ok (equal (format nil " mock · default · ~~~a" (subseq (native dir) (1- (length home))))
                  (status-line-text s))))))
+
+(deftest core-status-line-elides-a-long-cwd
+  ;; #4: a cwd that does not fit loses its middle; the project directory stays.
+  (let* ((dir #p"/private/var/folders/z7/7gcqc88j6hxd63ltgkgq0000gn/T/cl-stack-code-demo-1x2y3z/tui-mention/")
+         (s (fresh-state :cwd dir))
+         (native-dir (native dir))
+         (sep (char native-dir (1- (length native-dir)))))
+    (multiple-value-bind (left right) (status-line-text s 90)
+      (ok (equal "0 in · 0 out " right))
+      (ok (uiop:string-prefix-p " mock · default · " left) "model and mode stay whole")
+      (ok (<= (length left) (- 90 (length right) 1)) "the left side fits")
+      (ok (search (format nil "tui-mention~c" sep) left) "the project directory stays")
+      (ok (search "…" left) "the middle is elided")
+      (ok (search (format nil "cl-stack-code-demo-1x2y3z~ctui-mention~c" sep sep) left)
+          "as many trailing components as fit"))
+    (testing "without a width the whole path"
+      (ok (search native-dir (status-line-text s))))
+    (testing "a cwd that fits is unchanged"
+      (let ((s (fresh-state :cwd #p"/srv/project/")))
+        (ok (equal (format nil " mock · default · ~a" (native #p"/srv/project/"))
+                   (status-line-text s 80)))))
+    (testing "very narrow: only …/<project>/ is left"
+      (let ((left (status-line-text s 50)))
+        (ok (search (format nil "…~ctui-mention~c" sep sep) left))
+        (ok (not (search "private" left)))))))

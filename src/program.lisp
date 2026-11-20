@@ -361,7 +361,9 @@ in it becomes an :error message."
   "A terminal turn end: steering not taken stays with the core (it becomes a
 follow-up or goes back to the input), so the run must not take it later."
   (when run
-    (setf (agent:agent-run-inbox run) nil))
+    ;; Atomic with AGENT-RUN-POST (ai-agent-protocol 0.14, #33): CONTINUE
+    ;; would deliver what is left, and the core already sends it.
+    (agent:drain-agent-run-inbox run))
   (setf (%cp-posted program) '()))
 
 (defun %commit-run (program run finish)
@@ -866,7 +868,7 @@ goes back to the input)."
     (when (or (zerop width) (zerop height))
       (return-from tui:tui-view nil))
     (setf (%cp-width program) width)
-    (multiple-value-bind (left right) (status-line-text state)
+    (multiple-value-bind (left right) (status-line-text state width)
       (setf (w:status-line-left status) left
             (w:status-line-right status) right))
     (w:widget-view status (tui:sub-canvas canvas 0 (1- height) width 1))
