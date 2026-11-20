@@ -13,7 +13,7 @@
                (:version "cli-backend-clingon" "0.2.0")
                "json-protocol"
                "json-backend-jzon"
-               (:version "cl-stack-pathlib" "0.7.0")
+               (:version "cl-stack-pathlib" "0.8.0")
                (:version "diff-protocol" "0.3.0")
                (:version "revision-protocol" "0.4.0")
                (:version "revision-backend-git" "0.5.1")
