@@ -43,19 +43,8 @@
 
 (defmethod condition-exit-code ((condition %run-interrupted)) 130)
 
-;;; JSON output.
-
-(defun %json-object (&rest keys-and-values)
-  "A json-protocol object (EQUAL hash table) from alternating string keys and
-values."
-  (let ((object (make-hash-table :test #'equal)))
-    (loop for (key value) on keys-and-values by #'cddr
-          do (setf (gethash key object) value))
-    object))
-
-(defun %session-id ()
-  "32 lowercase hex characters, random per run."
-  (format nil "~(~32,'0x~)" (random (ash 1 128) (make-random-state t))))
+;;; JSON output (%JSON-OBJECT, %USAGE-OBJECT and %SESSION-ID are in
+;;; sessions.lisp, which the views share).
 
 (defun %usage-counts (usage)
   "(input output cache-read cache-write) of an LLM-USAGE (or NIL); a missing
@@ -66,11 +55,6 @@ count is 0."
             (or (llm:llm-usage-cache-read-tokens usage) 0)
             (or (llm:llm-usage-cache-write-tokens usage) 0))
       (list 0 0 0 0)))
-
-(defun %usage-object (counts)
-  (destructuring-bind (input output cache-read cache-write) counts
-    (%json-object "input_tokens" input "output_tokens" output
-                  "cache_read_tokens" cache-read "cache_write_tokens" cache-write)))
 
 (defun %finish-reason-name (reason)
   ":TOOL-USE → \"tool_use\"; NIL → \"stop\"."
@@ -234,6 +218,71 @@ environment is never modified."
       (let ((entry (assoc name env :test #'string=)))
         (if entry (cdr entry) (funcall getenv name))))))
 
+;;; H3c: the session of a run (shared with MAKE-CODE-PROGRAM).
+
+(defun %sessions-dir (cwd data-dir getenv)
+  (sessions-directory cwd :data-dir (or data-dir (user-data-directory :getenv getenv))))
+
+(defun %session-source (inv sessions-dir)
+  "→ the session INV resumes (--continue or --resume), or NIL. A missing one
+→ SESSION-NOT-FOUND; a --session-id that names an existing session →
+CODE-USAGE-ERROR."
+  (check-session-flags inv)
+  (let ((new-id (and (invocation-session-id inv)
+                     (normalize-session-id (invocation-session-id inv)))))
+    (when (and new-id (%session-exists-p sessions-dir new-id))
+      (error 'code-usage-error
+             :message (format nil "session ~a already exists: use --resume ~a" new-id new-id)))
+    (cond ((invocation-continue-p inv)
+           (or (last-session sessions-dir)
+               (error 'session-not-found)))
+          ((invocation-resume inv)
+           (open-session sessions-dir (invocation-resume inv)))
+          (t nil))))
+
+(defun %session-model (inv source settings)
+  "The model designator: --model, else SOURCE's head record model, else the
+settings files, else +DEFAULT-MODEL+."
+  (or (settings-model (invocation-settings inv))
+      (let ((head (and source (session-head source))))
+        (and head (record-model (revision-record head))))
+      (settings-model settings)
+      +default-model+))
+
+(defun %session-for-run (inv source sessions-dir project-dir)
+  "→ the store the run's turns go to: a clone of SOURCE (--fork-session),
+SOURCE, or a new session (--session-id or a random id)."
+  (cond ((and source (invocation-fork-session-p inv))
+         (clone-session source :id (invocation-session-id inv)))
+        (source source)
+        (t (create-session sessions-dir :id (invocation-session-id inv)
+                                        :project-dir project-dir))))
+
+(defun %commit-forking (store record)
+  "COMMIT-TURN RECORD on STORE; a SESSION-CONFLICT takes FORK-SESSION. →
+(values revision store-it-went-to)."
+  (handler-bind ((session-conflict
+                   (lambda (c)
+                     (let ((restart (find-restart 'fork-session c)))
+                       (when restart (invoke-restart restart))))))
+    (commit-turn store record)))
+
+(defun %run-finish (run failure interrupted)
+  "The turn record FINISH of a run that started."
+  (let ((reason (and run (agent:agent-run-finish-reason run))))
+    (cond (failure :failed)
+          ((or interrupted (eq reason :canceled)) :canceled)
+          ((eq reason :max-steps) :max-steps)
+          ((member reason '(:approval :deferred)) :failed)
+          (t :stop))))
+
+(defun %new-turns (run history)
+  "RUN's turns past HISTORY (compared by identity), without :system turns."
+  (remove-if (lambda (turn)
+               (or (eq :system (llm:llm-turn-role turn))
+                   (member turn history :test #'eq)))
+             (agent:agent-run-turns run)))
+
 ;;; The run.
 
 (defun %agent-settings (cwd settings)
@@ -328,19 +377,45 @@ on success."
              :message "no prompt: give it as arguments or on standard input"))
     prompt))
 
-(defun %run-headless (inv &key output input providers user-config-dir getenv start data-dir)
+(defun %commit-headless-turn (report store prompt history failure interrupted
+                              designator mode error-output)
+  "Commit the turn of the run REPORT saw start, before its result is written.
+A conflict forks the turn into a new session: one stderr line, and the
+report's session id becomes the new one."
+  (let ((run (%report-run report)))
+    (when run
+      (let ((record (make-turn-record :prompt prompt
+                                      :turns (%new-turns run history)
+                                      :finish (%run-finish run (or (%report-failure report) failure)
+                                                           interrupted)
+                                      :model designator
+                                      :permission-mode mode
+                                      :usage (copy-list (%report-usage report)))))
+        (multiple-value-bind (revision went-to) (%commit-forking store record)
+          (declare (ignore revision))
+          (unless (eq went-to store)
+            (format error-output "cl-stack-code: session ~a changed in another process; this turn was saved as session ~a~%"
+                    (session-id store) (session-id went-to))
+            (force-output error-output)
+            (setf (%report-session report) (session-id went-to))))))))
+
+(defun %run-headless (inv &key output input providers user-config-dir getenv start data-dir
+                               (error-output *error-output*))
   "The -p run of INV. Configuration errors signal before anything is written
-to OUTPUT; a run that started writes its result, then signals its failure."
-  (declare (ignore data-dir))           ; H3c: see the file header
+to OUTPUT; a run that started is committed to its session, writes its
+result, then signals its failure."
   (unless (invocation-print-p inv)
     (error 'code-usage-error
            :message "-p (--print) is required: cl-stack-code 0.1 runs headless only (the interactive mode arrives in H3b)"))
+  (check-session-flags inv)
   (let* ((prompt (%read-prompt inv input))
          (cwd (%resolve-cwd (invocation-cwd inv)))
          (config (or user-config-dir (user-config-directory :getenv getenv)))
          (settings (load-settings cwd :user-config-dir config
                                       :cli (invocation-settings inv)))
-         (designator (or (settings-model settings) +default-model+))
+         (sessions-dir (%sessions-dir cwd data-dir getenv))
+         (source (%session-source inv sessions-dir))
+         (designator (%session-model inv source settings))
          (resolved (multiple-value-list
                     (resolve-model designator :providers providers
                                               :env (%env-lookup settings getenv))))
@@ -348,7 +423,10 @@ to OUTPUT; a run that started writes its result, then signals its failure."
          (model (third resolved))
          (mode (or (settings-permission-mode settings) :default))
          (max-turns (or (settings-max-turns settings) +default-max-turns+))
-         (report (make-%report :format (invocation-output-format inv) :output output))
+         (store (%session-for-run inv source sessions-dir (or (find-project-root cwd) cwd)))
+         (history (session-turns store))
+         (report (make-%report :format (invocation-output-format inv) :output output
+                               :session (session-id store)))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (sources nil))
@@ -389,11 +467,22 @@ to OUTPUT; a run that started writes its result, then signals its failure."
                               "tools" (coerce offered 'vector)
                               "instructions" (map 'vector #'uiop:native-namestring files))
                  (multiple-value-bind (run failure interrupted)
-                     (%drive agent prompt report mode)
+                     (%drive agent (append history (list (llm:user-turn prompt))) report mode)
+                   (%commit-headless-turn report store prompt history failure interrupted
+                                          designator mode error-output)
                    (%report-run-end report run failure interrupted max-turns start))))))
       (when (second sources)
         (tools:close-shell-tools (second sources)))
       (event:close-event-loop event-backend event-loop))))
+
+(defun %list-sessions (inv &key output getenv data-dir)
+  "--list-sessions: this project's SESSION-SUMMARY-LINES on OUTPUT. → 0."
+  (check-session-flags inv)
+  (let ((cwd (%resolve-cwd (invocation-cwd inv))))
+    (dolist (line (session-summary-lines (%sessions-dir cwd data-dir getenv)))
+      (write-line line output))
+    (force-output output)
+    0))
 
 (defun run-cli (argv &key (output *standard-output*) (error-output *error-output*)
                        (input *standard-input*) providers user-config-dir
@@ -413,6 +502,8 @@ USER-DATA-DIRECTORY: sessions live under it."
                 ((invocation-version-p inv)
                  (format output "cl-stack-code ~a~%" +version+)
                  0)
+                ((invocation-list-sessions-p inv)
+                 (%list-sessions inv :output output :getenv getenv :data-dir data-dir))
                 ((not (invocation-print-p inv))
                  (%run-interactive inv :output output :input input :providers providers
                                        :user-config-dir user-config-dir :getenv getenv
@@ -420,7 +511,8 @@ USER-DATA-DIRECTORY: sessions live under it."
                 (t
                  (%run-headless inv :output output :input input :providers providers
                                     :user-config-dir user-config-dir :getenv getenv
-                                    :start start :data-dir data-dir))))
+                                    :start start :data-dir data-dir
+                                    :error-output error-output))))
       (error (c)
         (format error-output "cl-stack-code: ~a~%" c)
         (force-output error-output)

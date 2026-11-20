@@ -161,5 +161,26 @@ are present is checked by RUN-CLI, not here."
   --list-sessions with any of --continue, --resume, --session-id, --fork-session
                                           → \"--list-sessions cannot be combined with --continue, --resume, --session-id or --fork-session\"
 Whether the sessions exist is checked later (SESSION-NOT-FOUND)."
-  (declare (ignore invocation))
-  (%not-implemented 'check-session-flags))
+  (let ((continue-p (invocation-continue-p invocation))
+        (resume (invocation-resume invocation))
+        (session-id (invocation-session-id invocation))
+        (fork-p (invocation-fork-session-p invocation)))
+    (flet ((bad-id (text)
+             (%usage-fail "bad session id ~s: use 32 hex digits or a UUID" text)))
+      (when (and (invocation-list-sessions-p invocation)
+                 (or continue-p resume session-id fork-p))
+        (%usage-fail "--list-sessions cannot be combined with --continue, --resume, --session-id or --fork-session"))
+      (when (and continue-p resume)
+        (%usage-fail "--continue and --resume cannot be used together"))
+      (when (and fork-p (not (or continue-p resume)))
+        (%usage-fail "--fork-session needs --resume or --continue"))
+      (when (and session-id (or continue-p resume) (not fork-p))
+        (%usage-fail "--session-id with --resume or --continue needs --fork-session"))
+      (when (and session-id (not (normalize-session-id session-id)))
+        (bad-id session-id))
+      (when (and resume
+                 (not (normalize-session-id resume))
+                 (not (and (<= 4 (length resume) 32)
+                           (every (lambda (c) (digit-char-p c 16)) resume))))
+        (bad-id resume))
+      t)))

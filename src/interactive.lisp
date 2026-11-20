@@ -211,14 +211,75 @@ not taken yet, oldest first.")
   "H3c: run the session command COMMAND (\"/session\" \"/tree\" \"/fork\"
 \"/rewind\" \"/clone\" \"/export\" \"/steer\") with ARGUMENT (trimmed, \"\" when
 none). → effects (see the file header)."
-  (declare (ignore state command argument))
-  (%not-implemented 'session-commands))
+  (flet ((fail (text)
+           (%add-entry state :kind :error :text text)
+           '()))
+    (cond
+      ((and (state-busy-p state)
+            (member command '("/fork" "/rewind" "/clone" "/export") :test #'string=))
+       (fail (format nil "~a is not available while a turn runs (Esc interrupts it)" command)))
+      ((string= command "/session")
+       (%add-entry state :kind :notice
+                         :text (format nil "session ~a" (state-session-id state)))
+       '())
+      ((string= command "/tree") (list (list :tree)))
+      ((string= command "/fork")
+       (list (list :fork (if (zerop (length argument)) nil argument))))
+      ((string= command "/rewind")
+       (let ((n (cond ((zerop (length argument)) 1)
+                      ((every #'digit-char-p argument) (parse-integer argument))
+                      (t nil))))
+         (if (and n (plusp n))
+             (list (list :rewind n))
+             (fail "usage: /rewind [N], N a positive number of turns"))))
+      ((string= command "/clone") (list (list :clone)))
+      ((string= command "/export")
+       (if (zerop (length argument))
+           (fail "usage: /export FILE (.md or .json)")
+           (list (list :export argument))))
+      ((string= command "/steer")
+       (if (zerop (length argument))
+           (fail "usage: /steer MESSAGE")
+           (%session-event state (list :steer argument))))
+      (t (fail (format nil "unknown command ~a: try /help" command))))))
+
+(defun %remove-first (item list)
+  "LIST without its first element EQUAL to ITEM."
+  (let ((pos (position item list :test #'equal)))
+    (if pos
+        (append (subseq list 0 pos) (nthcdr (1+ pos) list))
+        list)))
 
 (defun %session-event (state event)
   "H3c: apply EVENT, one of (:steer …) (:steered …) (:session …)
 (:session-reset …). → effects (see the file header)."
-  (declare (ignore state event))
-  (%not-implemented 'session-events))
+  (destructuring-bind (kind &rest args) event
+    (ecase kind
+      (:steer
+       (let ((text (first args)))
+         (cond ((%blank-text-p text) '())
+               ((or (not (state-busy-p state))
+                    (char= #\/ (char (string-left-trim '(#\Space #\Tab #\Newline #\Return) text) 0)))
+                (%submit state text))
+               (t
+                (setf (state-steering state) (append (state-steering state) (list text)))
+                (list (list :steer text))))))
+      (:steered
+       (dolist (text (first args))
+         (setf (state-steering state) (%remove-first text (state-steering state)))
+         (%add-entry state :kind :user :text text))
+       '())
+      (:session
+       (setf (state-session-id state) (first args))
+       '())
+      (:session-reset
+       (destructuring-bind (&key entries input notice) args
+         (setf (state-transcript state) (copy-list entries)
+               (state-queue state) '()
+               (state-steering state) '())
+         (when notice
+           (%add-entry state :kind :notice :text notice))
+         (and input (list (list :restore-input input))))))))
 
 (defun state-approvals (state)
   "→ the invocations still waiting for an answer, oldest first: the pending
@@ -360,6 +421,9 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
            (%state-answered state) '())
      (when (and (eq reason :max-steps) message)
        (%add-entry state :kind :notice :text message))
+     ;; Steering the turn did not take is the first follow-up.
+     (setf (state-queue state) (append (shiftf (state-steering state) '())
+                                       (state-queue state)))
      (let ((next (pop (state-queue state))))
        (if next (%core-start-turn state next) '())))
     ((:canceled :failed)
@@ -369,7 +433,8 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
      (if (eq reason :canceled)
          (%add-entry state :kind :notice :text "interrupted")
          (%add-entry state :kind :error :text (or message "the turn failed")))
-     (let ((queued (shiftf (state-queue state) '())))
+     (let ((queued (append (shiftf (state-steering state) '())
+                           (shiftf (state-queue state) '()))))
        (when queued
          (list (list :restore-input (format nil "~{~a~^~%~}" queued))))))))
 
