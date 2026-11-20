@@ -191,7 +191,7 @@ pathlib for :copy, git show / jj file show for :git / :jj), or NIL when absent."
          (and entry (octets-ascii (p:snapshot-store-get blobs (p:snapshot-entry-hash entry))))))
       (:git (handler-case (git project "show" (format nil "~a:~a" id rel))
               (error () nil)))
-      (:jj (handler-case (jj project "--ignore-working-copy" "file" "show" "-r" id rel)
+      (:jj (handler-case (jj project "--ignore-working-copy" "file" "show" "-r" id (format nil "root:~s" rel))
              (error () nil))))))
 
 (defun trim (string)

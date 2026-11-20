@@ -620,10 +620,11 @@
       (ok (equal (list (format nil "● ~a first question" (short-id r1))
                        (format nil "● ~a second question ◆  (head)" (short-id r2)))
                  (session-tree-lines s :marked (list (rev:revision-id r2)))))
-      (ok (equal (list (format nil "● ~a first question" (short-id r1))
-                       (format nil "● ~a se… ◆  (head)" (short-id r2)))
-                 (session-tree-lines s :width 24 :marked (list (rev:revision-id r2))))
-          "the marker is never cut"))))
+      (let ((lines (session-tree-lines s :width 24 :marked (list (rev:revision-id r2)))))
+        (ok (equal (format nil "● ~a se… ◆  (head)" (short-id r2)) (second lines))
+            "the marker is never cut")
+        (ok (every (lambda (line) (<= (length line) 24)) lines)
+            "every line fits the width (H3c's cut rule)")))))
 
 ;;; Plan mode.
 
