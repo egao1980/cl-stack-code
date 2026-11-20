@@ -142,8 +142,6 @@ header)."
 (defun session-tree-lines (store &key (width 80) marked)
   "→ the /tree lines of STORE (strings; see the file header). MARKED (H5b):
 revision ids whose rows end their message with \" ◆\"."
-  (when marked
-    (%not-implemented "session-tree-lines :marked"))
   (let* ((all (%all-revisions store))
          (positions (make-hash-table :test 'equal))
          (on-line (make-hash-table :test 'equal))
@@ -163,7 +161,9 @@ revision ids whose rows end their message with \" ◆\"."
                       (fixed (format nil "~a~a ~a " prefix
                                      (if (gethash id on-line) "●" "○")
                                      (subseq id 0 (min 8 (length id)))))
-                      (suffix (if (equal id head-id) "  (head)" ""))
+                      (suffix (concatenate 'string
+                                      (if (member id marked :test #'equal) " ◆" "")
+                                      (if (equal id head-id) "  (head)" "")))
                       (message (or (rev:revision-message r) ""))
                       (line (concatenate 'string fixed message suffix)))
                  (if (> (length line) width)

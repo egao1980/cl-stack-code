@@ -288,5 +288,28 @@ Without any rewind flag → T. Whether the session and the turn exist is
 checked later (SESSION-NOT-FOUND, SESSION-TURN-NOT-FOUND,
 CHECKPOINT-NOT-FOUND). RUN-CLI refuses --rewind without -p itself (\"--rewind
 needs -p (use /rewind in the interactive mode)\")."
-  (declare (ignore invocation))
-  (%not-implemented 'check-rewind-flags))
+  (let* ((rewind (invocation-rewind invocation))
+         (listp (invocation-list-checkpoints-p invocation))
+         (prompt (invocation-prompt invocation))
+         (resumed (or (invocation-continue-p invocation) (invocation-resume invocation))))
+    (when (and (invocation-rewind-mode invocation) (not rewind))
+      (%usage-fail "--rewind-mode needs --rewind"))
+    (when (and (or rewind listp) (invocation-fork-session-p invocation))
+      (%usage-fail "--rewind and --list-checkpoints cannot be combined with --fork-session"))
+    (when rewind
+      (when (or (invocation-apply-p invocation) (invocation-reject-p invocation))
+        (%usage-fail "--rewind cannot be combined with --apply or --reject"))
+      (when (or prompt (not resumed))
+        (%usage-fail "--rewind needs --resume or --continue and no prompt"))
+      (unless (and (stringp rewind)
+                   (plusp (length rewind))
+                   (or (every #'digit-char-p rewind)
+                       (and (>= (length rewind) rev:+minimum-id-prefix+)
+                            (every (lambda (c) (digit-char-p c 16)) rewind))))
+        (%usage-fail "bad --rewind ~s: use a turn number or a turn id from /tree" rewind)))
+    (when listp
+      (when (or rewind prompt)
+        (%usage-fail "--list-checkpoints cannot be combined with --rewind or a prompt"))
+      (unless resumed
+        (%usage-fail "--list-checkpoints needs --resume or --continue")))
+    t))

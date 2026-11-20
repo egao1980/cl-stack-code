@@ -862,11 +862,85 @@ its one word is a PART."
 
 (defun %rewind-command (state argument)
   "/rewind with a PART (or extra words): → effects."
-  (declare (ignore state argument))
-  (%not-implemented '%rewind-command))
+  (flet ((fail (text)
+           (%add-entry state :kind :error :text text)
+           '()))
+    (let* ((words (remove "" (uiop:split-string argument :separator '(#\Space #\Tab))
+                          :test #'string=))
+           (usage "usage: /rewind [N] [conversation|files|both]"))
+      (when (> (length words) 2)
+        (return-from %rewind-command (fail usage)))
+      (let* ((n-word (and (rest words) (first words)))
+             (part (car (last words)))
+             (n (cond ((null n-word) 1)
+                      ((every #'digit-char-p n-word) (parse-integer n-word))
+                      (t nil))))
+        (cond
+          ((not (and n (plusp n)))
+           (fail "usage: /rewind [N], N a positive number of turns"))
+          ((not (member part +rewind-part-names+ :test #'string=))
+           (fail usage))
+          (t
+           (let ((parts (cond ((string= part "conversation") (list :conversation))
+                              ((string= part "files") (list :files))
+                              (t (copy-list +rewind-parts+)))))
+             (if (and (member :files parts) (state-plan state))
+                 (fail (format nil "plan ~a is open: /approve or /reject it first"
+                               (%plan-id8 state)))
+                 (progn
+                   (setf (state-rewind state) (list :n n :parts parts))
+                   (list (list :rewind n :parts parts)))))))))))
+
+(defun %rewind-reply (state choice)
+  "Answer the rewind or its drift dialog with CHOICE. → effects."
+  (let ((prompt (shiftf (state-rewind-prompt state) nil))
+        (rewind (state-rewind state)))
+    (flet ((notice (text)
+             (setf (state-rewind state) nil)
+             (%add-entry state :kind :notice :text text)
+             '())
+           (run (parts &rest more)
+             (setf (getf (state-rewind state) :parts) parts)
+             (list (list* :rewind (getf rewind :n) :parts parts more))))
+      (ecase prompt
+        (:rewind
+         (ecase choice
+           (:both (run (copy-list +rewind-parts+)))
+           (:conversation (run (list :conversation)))
+           (:files (run (list :files)))
+           (:cancel (notice "rewind canceled"))))
+        (:drift
+         (ecase choice
+           ((:rebase :overwrite) (run (getf rewind :parts) :on-drift choice))
+           (:abort (notice "nothing restored"))))))))
 
 (defun %rewind-event (state event)
   "Apply EVENT, one of (:rewind-prompt …) (:rewind-drift …) (:rewound …), or a
 (:reply …) / (:interrupt) answering the rewind prompt. → effects."
-  (declare (ignore state event))
-  (%not-implemented '%rewind-event))
+  (destructuring-bind (kind &rest args) event
+    (ecase kind
+      (:rewind-prompt
+       (destructuring-bind (&key n turn paths &allow-other-keys) args
+         (setf (state-rewind state) (list :n n :turn turn :paths (copy-list paths))
+               (state-rewind-prompt state) :rewind)
+         '()))
+      (:rewind-drift
+       (destructuring-bind (&key paths &allow-other-keys) args
+         (setf (state-rewind-prompt state) :drift
+               (getf (state-rewind state) :paths) (copy-list paths))
+         (%add-entry state :kind :error
+                           :text (format nil "the working copy changed since the last checkpoint: ~{~a~^, ~}"
+                                         paths))
+         '()))
+      (:rewound
+       (setf (state-rewind state) nil
+             (state-rewind-prompt state) nil)
+       (%add-entry state :kind :notice
+                         :text (if (eq :aborted (getf args :files))
+                                   "nothing restored"
+                                   (format nil "rewound to turn ~a: ~a"
+                                           (getf args :turn) (rewind-description args))))
+       '())
+      (:reply (%rewind-reply state (first args)))
+      (:interrupt
+       (%rewind-reply state (if (eq :drift (state-rewind-prompt state)) :abort :cancel))))))

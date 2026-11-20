@@ -211,7 +211,10 @@ count is 0."
   ;; H5a
   (plan nil)                                  ; the result's "plan" object, or NIL
   (plan-text nil)                             ; text mode: the diff after the answer
-  (plan-failure nil))                         ; a condition that fails a finished run
+  (plan-failure nil)                          ; a condition that fails a finished run
+  ;; H5b
+  (plan-pre nil)                              ; --apply: APPROVE-PLAN's PRE, recorded after the commit
+  (rewind nil))                               ; the result's "rewind" object, or NIL
 
 (defun %write-json-line (report object)
   (let ((out (%report-output report)))
@@ -321,9 +324,14 @@ the run is canceled and the error fails the run afterwards."
                 "permission_denials" (coerce (reverse (%report-denials report)) 'vector)
                 "session_id" (%report-session report)
                 ;; H5a: only in plan mode, so the other shapes are unchanged.
-                (if (%report-plan report)
-                    (list "plan" (%report-plan report))
-                    '())))
+                (append
+                 (if (%report-plan report)
+                     (list "plan" (%report-plan report))
+                     '())
+                 ;; H5b: only in rewind actions.
+                 (if (%report-rewind report)
+                     (list "rewind" (%report-rewind report))
+                     '()))))
 
 ;;; Working directory, environment, HTTP.
 
@@ -521,7 +529,8 @@ on success."
                               designator mode error-output &optional plan)
   "Commit the turn of the run REPORT saw start, before its result is written.
 A conflict forks the turn into a new session: one stderr line, and the
-report's session id becomes the new one."
+report's session id becomes the new one. → (values revision store-it-went-to),
+or NIL when no run started."
   (let ((run (%report-run report)))
     (when run
       (let ((record (make-turn-record :prompt prompt
@@ -533,12 +542,13 @@ report's session id becomes the new one."
                                       :usage (copy-list (%report-usage report))
                                       :plan (and plan (plan-record plan)))))
         (multiple-value-bind (revision went-to) (%commit-forking store record)
-          (declare (ignore revision))
           (unless (eq went-to store)
             (format error-output "cl-stack-code: session ~a changed in another process; this turn was saved as session ~a~%"
                     (session-id store) (session-id went-to))
             (force-output error-output)
-            (setf (%report-session report) (session-id went-to))))))))
+            (setf (%report-session report) (session-id went-to)))
+          ;; H5b: the checkpoints go to the store the turn went to.
+          (values revision went-to))))))
 
 ;;; H5a: plan mode in -p (see the "H5a" part of the file header).
 
@@ -592,13 +602,14 @@ act on the session's open plan, no run, INPUT not read."
   (format nil "plan ~a: rebased onto the working copy (~:[no conflicts~;conflicts in ~:*~{~a~^, ~}~]); review it and --apply again"
           (plan-id plan) conflicts))
 
-(defun %headless-approve (report plan inv)
+(defun %headless-approve (report plan inv &optional checkpointer)
   "--apply: APPROVE-PLAN with PLAN-DRIFT answered per --on-drift; the
 applied / rebased / drift event; a failure for the report unless the plan
-was applied. → (values status result)."
+was applied. H5b: with CHECKPOINTER, APPROVE-PLAN :CHECKPOINTER, its PRE kept
+in the report for RECORD-PLAN-CHECKPOINTS. → (values status result)."
   (let ((on-drift (or (invocation-on-drift inv) :abort))
         (drift '()))
-    (multiple-value-bind (result status)
+    (multiple-value-bind (result status pre)
         (handler-bind ((plan-drift
                          (lambda (c)
                            (setf drift (plan-drift-paths c))
@@ -608,7 +619,8 @@ was applied. → (values status result)."
                                             (:overwrite 'overwrite-plan)
                                             (:abort 'abort-approval))
                                           c)))))
-          (approve-plan plan))
+          (approve-plan plan :checkpointer checkpointer))
+      (setf (%report-plan-pre report) pre)
       (ecase status
         ((:applied :empty)
          (%emit-event report "plan" "subtype" "applied" "plan_id" (plan-id plan)
@@ -661,7 +673,8 @@ reopened-p)."
                            lost (plan-id plan)))
       (values plan nil))))
 
-(defun %headless-plan-finish (report plan inv run failure interrupted error-output)
+(defun %headless-plan-finish (report plan inv run failure interrupted error-output
+                              &optional checkpointer)
   "After a plan run, before its turn is committed: the projection, --apply,
 the plan events, the result's plan object, the text-mode diff and the
 stderr line (see the file header)."
@@ -673,7 +686,7 @@ stderr line (see the file header)."
                                "changes" (%changes-json changes) "diff" diff)
     (when (and (invocation-apply-p inv)
                (string= "success" (%outcome run failure interrupted 0)))
-      (multiple-value-bind (result-status result) (%headless-approve report plan inv)
+      (multiple-value-bind (result-status result) (%headless-approve report plan inv checkpointer)
         (setf status (case result-status
                        ((:applied :empty) :applied)
                        (:rebased :rebased)
@@ -717,6 +730,14 @@ stderr line (see the file header)."
                                :session (session-id source))))
     (unless plan
       (%usage-fail "session ~a has no open plan" (session-id source)))
+    ;; H5b: the approval's checkpoints belong to the head (the plan's turn).
+    (let ((checkpointer (%make-run-checkpointer settings cwd data-dir getenv)))
+      (unwind-protect
+           (%run-plan-action-1 inv report plan source checkpointer output error-output start)
+        (close-checkpointer checkpointer)))))
+
+(defun %run-plan-action-1 (inv report plan source checkpointer output error-output start)
+  (progn
     (let ((changes '()) (diff "") (status :open) (conflicts '()))
       (cond
         ((invocation-reject-p inv)
@@ -729,7 +750,9 @@ stderr line (see the file header)."
         (t
          (setf changes (plan-changes plan)
                diff (plan-diff-text plan))
-         (multiple-value-bind (result-status result) (%headless-approve report plan inv)
+         (multiple-value-bind (result-status result) (%headless-approve report plan inv checkpointer)
+           (record-plan-checkpoints checkpointer source (%report-plan-pre report)
+                                    (session-head source))
            (case result-status
              ((:applied :empty)
               (setf status :applied)
@@ -756,6 +779,15 @@ stderr line (see the file header)."
         (when failure
           (error failure))
         0))))
+
+(defun %make-run-checkpointer (settings cwd data-dir getenv)
+  "H5b: the run's CHECKPOINTER: the project directory (project root, else CWD),
+CHECKPOINT-SETTINGS and the data directory. An explicit checkpoints.kind that
+does not fit → CHECKPOINT-ERROR."
+  (multiple-value-bind (enabled keep kind) (checkpoint-settings settings)
+    (make-checkpointer (or (find-project-root cwd) cwd)
+                       :kind kind :keep keep :enabled enabled
+                       :data-dir (or data-dir (user-data-directory :getenv getenv)))))
 
 (defun %run-headless (inv &key output input providers user-config-dir getenv start data-dir
                                (error-output *error-output*))
@@ -793,15 +825,20 @@ result, then signals its failure."
          (mode (or (settings-permission-mode settings) :default))
          (max-turns (or (settings-max-turns settings) +default-max-turns+))
          (store (%session-for-run inv source sessions-dir (or (find-project-root cwd) cwd)))
+         ;; H5b: after the session, before anything is written to OUTPUT.
+         (checkpointer (%make-run-checkpointer settings cwd data-dir getenv))
          (history (session-turns store))
          (report (make-%report :format (invocation-output-format inv) :output output
                                :session (session-id store)))
          ;; H5a: plan mode (or a plan flag) opens or reopens the session's plan.
          (plan-and-reopened
            (when (%plan-run-p inv mode)
-             (multiple-value-list
-              (%headless-plan inv mode cwd store source sessions-dir data-dir getenv
-                              error-output))))
+             (handler-bind ((error (lambda (e)
+                                     (declare (ignore e))
+                                     (close-checkpointer checkpointer))))
+               (multiple-value-list
+                (%headless-plan inv mode cwd store source sessions-dir data-dir getenv
+                                error-output)))))
          (plan (first plan-and-reopened))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
@@ -851,17 +888,26 @@ result, then signals its failure."
                                 "kind" (string-downcase (string (plan-kind plan)))
                                 "area" (uiop:native-namestring (plan-root plan))
                                 "base" (plan-base plan)))
-                 (multiple-value-bind (run failure interrupted)
-                     (%drive agent (append history (list (llm:user-turn prompt))) report mode)
-                   (when plan
-                     (%headless-plan-finish report plan inv run
-                                            (or (%report-failure report) failure)
-                                            interrupted error-output))
-                   (%commit-headless-turn report store prompt history failure interrupted
-                                          designator mode error-output plan)
-                   (%report-run-end report run failure interrupted max-turns start))))))
+                 (let ((pre (begin-checkpoint-turn checkpointer store)))
+                   (multiple-value-bind (run failure interrupted)
+                       (%drive agent (append history (list (llm:user-turn prompt))) report mode)
+                     (when plan
+                       (%headless-plan-finish report plan inv run
+                                              (or (%report-failure report) failure)
+                                              interrupted error-output checkpointer))
+                     (multiple-value-bind (revision went-to)
+                         (%commit-headless-turn report store prompt history failure interrupted
+                                                designator mode error-output plan)
+                       ;; H5b: --apply's checkpoints belong to this turn; then
+                       ;; the turn's own (none after an approved plan).
+                       (when revision
+                         (record-plan-checkpoints checkpointer went-to (%report-plan-pre report)
+                                                  revision)
+                         (end-checkpoint-turn checkpointer went-to pre revision)))
+                     (%report-run-end report run failure interrupted max-turns start)))))))
       (when (second sources)
         (tools:close-shell-tools (second sources)))
+      (close-checkpointer checkpointer)
       (event:close-event-loop event-backend event-loop))))
 
 (defun %list-sessions (inv &key output getenv data-dir)
@@ -922,13 +968,100 @@ USER-DATA-DIRECTORY: sessions live under it."
 ;;; H5b: --rewind and --list-checkpoints (see the "H5b" part of the file
 ;;; header).
 
+(defun %keyword-name (keyword)
+  (string-downcase (string keyword)))
+
+(defun %rewind-keys (result)
+  "The rewind object of a REWIND-TO RESULT as alternating keys and values."
+  (let ((k (getf result :checkpoint)))
+    (list "turn" (getf result :turn)
+          "parts" (map 'vector #'%keyword-name (getf result :parts))
+          "conversation" (%keyword-name (getf result :conversation))
+          "files" (%keyword-name (getf result :files))
+          "changes" (%changes-json (getf result :changes))
+          "conflicts" (coerce (getf result :conflicts) 'vector)
+          "drift" (coerce (getf result :drift) 'vector)
+          "checkpoint" (if k (checkpoint-id k) :null))))
+
+(defun %rewind-parts (mode)
+  (ecase (or mode :both)
+    (:both (copy-list +rewind-parts+))
+    (:conversation (list :conversation))
+    (:files (list :files))))
+
 (defun %run-rewind-action (inv &key output getenv data-dir user-config-dir error-output start)
   "--rewind TURN on the resumed session, without a run. → exit code."
-  (declare (ignore inv output getenv data-dir user-config-dir error-output start))
-  (%not-implemented '%run-rewind-action))
+  (check-rewind-flags inv)
+  (let* ((getenv (or getenv #'uiop:getenv))
+         (cwd (%resolve-cwd (invocation-cwd inv)))
+         (config (or user-config-dir (user-config-directory :getenv getenv)))
+         (settings (load-settings cwd :user-config-dir config :cli (invocation-settings inv)))
+         (source (%session-source inv (%sessions-dir cwd data-dir getenv)))
+         (on-drift (or (invocation-on-drift inv) :abort))
+         (report (make-%report :format (invocation-output-format inv) :output output
+                               :session (session-id source)))
+         (checkpointer (%make-run-checkpointer settings cwd data-dir getenv))
+         (diff ""))
+    (unwind-protect
+         (let* ((result
+                  ;; Text mode prints the rewind plan's diff (the merged one
+                  ;; after a rebase).
+                  (let ((*%rewind-diff-hook*
+                          (and (eq :text (%report-format report))
+                               (lambda (plan) (setf diff (plan-diff-text plan))))))
+                    (handler-bind ((plan-drift
+                                     (lambda (c)
+                                       (invoke-restart
+                                        (find-restart (ecase on-drift
+                                                        (:abort 'abort-approval)
+                                                        (:rebase 'rebase-plan)
+                                                        (:overwrite 'overwrite-plan))
+                                                      c)))))
+                      (rewind-to checkpointer source (invocation-rewind inv)
+                                 :parts (%rewind-parts (invocation-rewind-mode inv))))))
+                (files (getf result :files))
+                (failure
+                  (and (eq files :aborted)
+                       (make-condition
+                        'plan-drift
+                        :paths (getf result :drift)
+                        :message (format nil "rewind to turn ~a: the working copy changed at ~{~a~^, ~}; nothing restored (use --on-drift rebase or --on-drift overwrite)"
+                                         (getf result :turn) (getf result :drift)))))
+                (keys (%rewind-keys result))
+                (duration (round (* 1000 (- (get-internal-real-time)
+                                            (or start (get-internal-real-time))))
+                                 internal-time-units-per-second)))
+           (setf (%report-rewind report) (apply #'%json-object keys))
+           (apply #'%emit-event report "rewind" keys)
+           (case (%report-format report)
+             (:text
+              (when (member files '(:applied :merged))
+                (write-string diff output)
+                (force-output output)))
+             (t
+              (%write-json-line report (%result-object report
+                                                       (if failure "error_during_execution" "success")
+                                                       ""
+                                                       (and failure (princ-to-string failure))
+                                                       duration))))
+           (unless failure
+             (format error-output "cl-stack-code: session ~a rewound to turn ~a: ~a~%"
+                     (session-id source) (getf result :turn) (rewind-description result))
+             (force-output error-output))
+           (when failure
+             (error failure))
+           0)
+      (close-checkpointer checkpointer))))
 
 (defun %list-checkpoints (inv &key output getenv data-dir user-config-dir)
   "--list-checkpoints: the resumed session's CHECKPOINT-SUMMARY-LINES on
 OUTPUT. → 0."
-  (declare (ignore inv output getenv data-dir user-config-dir))
-  (%not-implemented '%list-checkpoints))
+  (declare (ignore user-config-dir))
+  (check-session-flags inv)
+  (check-rewind-flags inv)
+  (let* ((cwd (%resolve-cwd (invocation-cwd inv)))
+         (source (%session-source inv (%sessions-dir cwd data-dir (or getenv #'uiop:getenv)))))
+    (dolist (line (checkpoint-summary-lines source))
+      (write-line line output))
+    (force-output output)
+    0))

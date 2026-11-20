@@ -328,6 +328,7 @@
    #:checkpointer-data-dir
    #:close-checkpointer
    #:files-state
+   #:files-state-p
    #:files-state-kind
    #:files-state-id
    #:read-files-state
@@ -369,9 +370,6 @@
    #:+rewind-choices+))
 
 (in-package #:cl-stack-code)
-
-(defun %not-implemented (what)
-  (error "cl-stack-code: ~a is not implemented (H5b contract)" what))
 
 (defparameter +version+ "0.5.0"
   "The product version, as in the .asd.")
