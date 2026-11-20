@@ -17,6 +17,8 @@
 
 (defclass scripted-request ()
   ((turns :initarg :turns :reader request-turns)
+   (model :initarg :model :initform nil :reader request-model
+          :documentation "The :MODEL argument GENERATE / STREAM-GENERATE got.")
    (tool-names :initarg :tool-names :reader request-tool-names)))
 
 (defclass scripted-backend (llm:llm-backend)
@@ -80,10 +82,11 @@
                (setf start end)))
     (nreverse out)))
 
-(defun %respond (backend turns tools on-part)
+(defun %respond (backend turns tools on-part &optional model)
   (let ((n (bt:with-lock-held ((%lock backend))
              (push (make-instance 'scripted-request
                                   :turns (copy-list (llm:coerce-turns turns))
+                                  :model model
                                   :tool-names (mapcar #'llm:llm-tool-name tools))
                    (%requests backend))
              (length (%requests backend)))))
@@ -106,13 +109,13 @@
 
 (defmethod llm:generate ((backend scripted-backend) turns &key model settings tools
                          tool-choice output)
-  (declare (ignore model settings tool-choice output))
-  (%respond backend turns tools nil))
+  (declare (ignore settings tool-choice output))
+  (%respond backend turns tools nil model))
 
 (defmethod llm:stream-generate ((backend scripted-backend) turns &key model settings
                                 tools tool-choice on-part output)
-  (declare (ignore model settings tool-choice output))
-  (%respond backend turns tools on-part))
+  (declare (ignore settings tool-choice output))
+  (%respond backend turns tools on-part model))
 
 ;;; Reading requests.
 

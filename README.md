@@ -4,7 +4,7 @@ A coding agent CLI on [cl-stack](https://github.com/egao1980/cl-stack): an [`ai-
 
 Plan: [HARNESS-PLAN.md](https://github.com/egao1980/cl-workspace/blob/main/docs/HARNESS-PLAN.md), Track H, milestone H3. Brief: [`cl-stack-code.md`](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/cl-stack-code.md).
 
-Version **0.1.0** (in progress): milestone **H3a**, the headless half. Its contract is `cl-stack-code/tests`; until it is implemented, every function signals "not implemented".
+Version **0.1.1**: milestone **H3a**, the headless half (`cl-stack-code -p`). Its contract is `cl-stack-code/tests`.
 
 ```
 cl-stack-code -p "fix the failing test" --output-format stream-json --permission-mode acceptEdits

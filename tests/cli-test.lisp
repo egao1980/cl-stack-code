@@ -88,6 +88,8 @@
   (with-project (project config) '((".cl-stack-code/settings.json" "{\"model\": \"mock:from-settings\"}"))
     (let ((backend (nth-value 3 (code project config '("-p" "hi") :model "mock:big" :steps '("x")))))
       (ok (equal "big" (scripted-model backend)) "the flag beats the settings")
+      (ok (equal "big" (request-model (first-request backend)))
+          "the model reaches GENERATE as :model (agent :model)")
       (ok (= 1 (scripted-factory-calls backend)) "one backend per run"))))
 
 (deftest cli-model-from-settings
@@ -163,5 +165,5 @@
   (with-project (project config) '()
     (multiple-value-bind (exit out err) (code project config '("--version") :cwd nil :model nil)
       (ok (eql 0 exit))
-      (ok (equal (nl "cl-stack-code 0.1.0") out))
+      (ok (equal (nl "cl-stack-code 0.1.1") out))
       (ok (equal "" err)))))

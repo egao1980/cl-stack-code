@@ -203,14 +203,6 @@ environment is never modified."
       (let ((entry (assoc name env :test #'string=)))
         (if entry (cdr entry) (funcall getenv name))))))
 
-(defvar *default-http-backend* nil
-  "The http-backend-async backend runs use when http-protocol:*http-backend*
-is NIL; made once (its constructor loads encodings and TLS).")
-
-(defun %default-http-backend ()
-  (or *default-http-backend*
-      (setf *default-http-backend* (http-backend-async:make-async-backend))))
-
 ;;; The run.
 
 (defun %agent-settings (cwd settings)
@@ -317,8 +309,11 @@ to OUTPUT; a run that started writes its result, then signals its failure."
          (settings (load-settings cwd :user-config-dir config
                                       :cli (invocation-settings inv)))
          (designator (or (settings-model settings) +default-model+))
-         (backend (resolve-model designator :providers providers
-                                            :env (%env-lookup settings getenv)))
+         (resolved (multiple-value-list
+                    (resolve-model designator :providers providers
+                                              :env (%env-lookup settings getenv))))
+         (backend (first resolved))
+         (model (third resolved))
          (mode (or (settings-permission-mode settings) :default))
          (max-turns (or (settings-max-turns settings) +default-max-turns+))
          (report (make-%report :format (invocation-output-format inv) :output output))
@@ -329,7 +324,7 @@ to OUTPUT; a run that started writes its result, then signals its failure."
          (let ((event:*event-backend* event-backend)
                (event:*event-loop* event-loop)
                (http-protocol:*http-backend*
-                 (or http-protocol:*http-backend* (%default-http-backend)))
+                 (or http-protocol:*http-backend* (http-backend-async:make-async-backend)))
                (http-backend-async:*event-backend-maker*
                  (or http-backend-async:*event-backend-maker*
                      #'event-backend-libuv:make-libuv-backend))
@@ -346,6 +341,7 @@ to OUTPUT; a run that started writes its result, then signals its failure."
                (let ((agent (agent:make-ai-agent
                              :name "cl-stack-code"
                              :backend backend
+                             :model model
                              :instructions instructions
                              :tools sources
                              :permissions (%agent-permissions settings)
