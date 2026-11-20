@@ -111,10 +111,12 @@ is not a repository, so :AUTO picks :COPY)."
 
 (defun worktree-paths (project)
   "Worktree directories `git worktree list --porcelain` reports, as native
-namestrings without a trailing separator."
+namestrings without a trailing separator. (Git for Windows prints C:/x/y:
+the separators are made native.)"
   (loop for line in (git-lines project "worktree" "list" "--porcelain")
         when (and (> (length line) 9) (string= "worktree " line :end2 9))
-          collect (subseq line 9)))
+          collect (let ((path (subseq line 9)))
+                    (if (uiop:os-windows-p) (substitute #\\ #\/ path) path))))
 
 (defun dir-native (dir)
   "Native namestring of directory DIR without the trailing separator."
