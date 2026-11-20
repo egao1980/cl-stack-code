@@ -21,25 +21,18 @@ NIL to read the prompt from input (no free argument, or \"-\").")
 (defparameter +output-format-names+ '("text" "json" "stream-json")
   "The --output-format values, in this order.")
 
-(defparameter +value-option-names+
-  '("output-format" "model" "max-turns" "cwd" "allowed-tools" "disallowed-tools"
-    "permission-mode" "append-system-prompt")
-  "Long names of the options that take a value.")
-
 (defun %usage-fail (control &rest args)
   (error 'code-usage-error :message (apply #'format nil control args)))
 
 (defun %make-command (backend)
-  "The cl-stack-code command on the cli-protocol BACKEND. It calls the
-protocol's BACKEND-MAKE-OPTION / BACKEND-MAKE-COMMAND: cli-protocol 0.1.0's
-MAKE-OPTION / MAKE-COMMAND pass their :BACKEND argument on to them, which
-rejects it, and *CLI-BACKEND* is not ours to rebind."
+  "The cl-stack-code command on the cli-protocol BACKEND (*CLI-BACKEND* is not
+ours to rebind, so it goes in as :BACKEND)."
   (flet ((opt (name help &rest keys)
-           (apply #'cli:backend-make-option backend :name name :help help
+           (apply #'cli:make-option :backend backend :name name :help help
                   :key (intern (string-upcase name) :keyword)
                   keys)))
-    (cli:backend-make-command
-     backend
+    (cli:make-command
+     :backend backend
      :name "cl-stack-code"
      :version +version+
      :description "Coding agent on cl-stack. 0.1 runs headless only: -p PROMPT."
@@ -55,23 +48,6 @@ rejects it, and *CLI-BACKEND* is not ours to rebind."
            (opt "disallowed-tools" "Deny rules, same syntax; repeatable" :kind :list)
            (opt "permission-mode" "default, acceptEdits, bypassPermissions or plan")
            (opt "append-system-prompt" "Text appended to the system prompt")))))
-
-(defun %builtin-flag (posix)
-  "→ :HELP, :VERSION or NIL for the normalized argv POSIX. Option values and
-everything after -- are skipped. clingon handles its own --help, --version and
---bash-completions by printing to *standard-output*, so they are taken here."
-  (loop with skip = nil
-        for token in posix
-        do (cond (skip (setf skip nil))
-                 ((string= token "--") (return nil))
-                 ((string= token "--help") (return :help))
-                 ((string= token "--version") (return :version))
-                 ((string= token "--bash-completions")
-                  (%usage-fail "unknown option --bash-completions"))
-                 ((and (uiop:string-prefix-p "--" token)
-                       (not (find #\= token))
-                       (member (subseq token 2) +value-option-names+ :test #'string=))
-                  (setf skip t)))))
 
 (defun %output-format (value)
   (cond ((null value) :text)
@@ -110,19 +86,19 @@ unknown options signal CODE-USAGE-ERROR; a bad --allowed-tools /
 --disallowed-tools rule signals PERMISSION-RULE-ERROR. Whether -p and a prompt
 are present is checked by RUN-CLI, not here."
   (let* ((backend (cli-backend-clingon:make-clingon-backend)) ; *cli-backend* untouched
-         (command (%make-command backend))
-         (flag (%builtin-flag (cli:normalize-argv
-                               argv :options (cli:cli-command-options command)))))
-    (when flag
-      (return-from parse-arguments
-        (make-instance 'invocation :help-p (eq flag :help)
-                                   :version-p (eq flag :version)
-                                   :settings (make-settings))))
+         (command (%make-command backend)))
     (multiple-value-bind (options free)
         (handler-case (cli:parse command argv :backend backend)
           (cli:cli-error (e)
             (%usage-fail "~a" e)))
       (flet ((get-opt (key) (cli:get-option options key)))
+        ;; clingon's built-in --help / --version come back as :HELP / :VERSION
+        ;; (cli-protocol 0.2); the other options are not validated then.
+        (when (or (get-opt :help) (get-opt :version))
+          (return-from parse-arguments
+            (make-instance 'invocation :help-p (and (get-opt :help) t)
+                                       :version-p (and (get-opt :version) t)
+                                       :settings (make-settings))))
         (make-instance
          'invocation
          :print-p (and (get-opt :print) t)

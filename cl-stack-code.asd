@@ -1,5 +1,5 @@
 (defsystem "cl-stack-code"
-  :version "0.1.0"
+  :version "0.1.1"
   :description "Coding agent CLI on cl-stack: headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
@@ -9,15 +9,15 @@
                (:version "llm-protocol-anthropic" "0.3.0")
                (:version "llm-protocol-openai" "0.4.0")
                (:version "steer-protocol" "0.3.0")
-               (:version "cli-protocol" "0.1.0")
-               (:version "cli-backend-clingon" "0.1.0")
+               (:version "cli-protocol" "0.2.1")
+               (:version "cli-backend-clingon" "0.2.0")
                "json-protocol"
                "json-backend-jzon"
                (:version "cl-stack-pathlib" "0.6.0")
                "event-protocol"
                "event-backend-libuv"
                "http-protocol"
-               "http-backend-async")
+               (:version "http-backend-async" "0.2.20"))
   :serial t
   :pathname "src"
   :components ((:file "package")
