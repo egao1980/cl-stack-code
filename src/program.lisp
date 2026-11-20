@@ -76,6 +76,57 @@
 ;;; TTY-BACKEND (which restores the terminal on any exit) and RUN-CLI returns
 ;;; 0 when it quits. A prompt given as arguments is the first message.
 ;;; --output-format without -p is a CODE-USAGE-ERROR naming --output-format.
+;;;
+;;; H3c: sessions and steering.
+;;;   Start            MAKE-CODE-PROGRAM resolves the session as -p does
+;;;                    (src/headless.lisp: --continue, --resume, --session-id,
+;;;                    --fork-session, the same errors, signalled before the
+;;;                    terminal is touched) under :DATA-DIR (default
+;;;                    USER-DATA-DIRECTORY). A resumed session starts with
+;;;                    STATE-TRANSCRIPT = SESSION-ENTRIES, the input history
+;;;                    = the prompts of the head's line (oldest first),
+;;;                    STATE-SESSION-ID = its id, and the model as in -p. The
+;;;                    first :run starts RUN-AI-AGENT-ASYNC on SESSION-TURNS
+;;;                    plus the message.
+;;;   Turns            At every turn end other than :approval the program
+;;;                    commits the turn (COMMIT-TURN: the message as typed,
+;;;                    the run's turns since the last commit without :system
+;;;                    turns, the finish, model, mode, the turn's usage and
+;;;                    the steering it took) on the agent thread, then sends
+;;;                    the :turn-end. A SESSION-CONFLICT takes FORK-SESSION and
+;;;                    sends (:session NEW) and (:notice "session OLD changed
+;;;                    in another process; continuing as session NEW"). Any
+;;;                    other commit error is an (:error M); those turns go
+;;;                    into the next commit.
+;;;   Effects          (:steer T): on the agent thread, when the run is still
+;;;                    going (finish reason NIL, :approval or :deferred),
+;;;                    AGENT-RUN-POST the expanded text; otherwise nothing
+;;;                    (the core makes it a follow-up at the turn end). The
+;;;                    run's :inbox event sends (:steered TEXTS) for the posts
+;;;                    it took, in order. A canceled or failed turn empties the
+;;;                    run's inbox. (:tree) → (:notice) of SESSION-TREE-LINES
+;;;                    at the width of the last frame. (:fork AT) /
+;;;                    (:rewind N) → FORK-TURN / REWIND-SESSION, the run is
+;;;                    dropped, the next :run starts from SESSION-TURNS, and
+;;;                    (:session-reset :entries (SESSION-ENTRIES) …): /fork
+;;;                    with :input = AT's prompt and :notice "forked before
+;;;                    turn <id8>: edit the message and press Enter"; /rewind
+;;;                    with :notice "rewound N turn[s]". (:clone) →
+;;;                    CLONE-SESSION, later turns go to the clone, (:session
+;;;                    NEW) and (:notice "cloned session OLD as NEW").
+;;;                    (:export FILE) → EXPORT-SESSION (FILE relative to the
+;;;                    working directory, parent directories created, an
+;;;                    existing file replaced). :new-conversation
+;;;                    (/clear) also makes a new session (CREATE-SESSION) and
+;;;                    sends (:session NEW). Errors from these are (:error M)
+;;;                    with the condition's text.
+;;;   Keys             Ctrl-T in the input: a non-blank value is taken from
+;;;                    the input (cleared, added to the history as Enter does)
+;;;                    and sent as (:steer TEXT). Enter is unchanged.
+;;;   Layout           Busy and no dialog: above the queued rows, one row per
+;;;                    pending steering message (at most 3) "  steering:
+;;;                    <its first line>", then "  … +N steering" when more
+;;;                    wait.
 
 (defclass code-program ()
   ((state :initarg :state :reader code-program-state
@@ -111,6 +162,26 @@
    (handle :initform nil :accessor %cp-handle
            :documentation "The handle of the last started, continued or resumed turn.")
    (mode :initarg :mode :accessor %cp-mode :documentation "The permission mode.")
+   (data-dir :initarg :data-dir :initform nil :reader %cp-data-dir
+             :documentation "H3c: RUN-CLI's :DATA-DIR, or NIL for USER-DATA-DIRECTORY.")
+   ;; H3c, loop thread only (set up by MAKE-CODE-PROGRAM).
+   (session :initarg :session :accessor %cp-session :documentation "The SESSION-STORE.")
+   (sessions-dir :initarg :sessions-dir :reader %cp-sessions-dir)
+   (project-dir :initarg :project-dir :reader %cp-project-dir)
+   (designator :initarg :designator :accessor %cp-designator
+               :documentation "The model designator turns run with.")
+   (committed :initform (make-hash-table :test 'eq) :accessor %cp-committed
+              :documentation "The run's turns that are in the session already.")
+   (turn-prompt :initform "" :accessor %cp-turn-prompt
+                :documentation "The running turn's message as typed.")
+   (turn-usage :initform (list 0 0 0 0) :accessor %cp-turn-usage
+               :documentation "Usage since the last commit.")
+   (turn-steering :initform '() :accessor %cp-turn-steering
+                  :documentation "Steering texts the run took since the last commit.")
+   (posted :initform '() :accessor %cp-posted
+           :documentation "(turn . typed text) of steering posted and not taken yet.")
+   ;; UI thread only (read on the loop thread for /tree).
+   (width :initform 80 :accessor %cp-width :documentation "The last frame's width.")
    ;; UI thread only.
    (files :initform '() :accessor %cp-files :documentation "The @-completion list.")
    (viewport :initarg :viewport :reader %cp-viewport)
@@ -136,7 +207,7 @@
                      (and program (mention-candidates (%cp-files program) token))))))
 
 (defun make-code-program (invocation &key providers user-config-dir
-                                          (getenv #'uiop:getenv))
+                                          (getenv #'uiop:getenv) data-dir)
   "→ a CODE-PROGRAM for INVOCATION (a parsed command line without -p). The
 configuration errors of -p signal here."
   (let* ((getenv (or getenv #'uiop:getenv))
@@ -144,12 +215,16 @@ configuration errors of -p signal here."
          (config (or user-config-dir (user-config-directory :getenv getenv)))
          (settings (load-settings cwd :user-config-dir config
                                       :cli (invocation-settings invocation)))
-         (designator (or (settings-model settings) +default-model+))
+         (sessions-dir (%sessions-dir cwd data-dir getenv))
+         (source (%session-source invocation sessions-dir))
+         (designator (%session-model invocation source settings))
          (env (%env-lookup settings getenv))
          (resolved (multiple-value-list
                     (resolve-model designator :providers providers :env env)))
          (backend (first resolved))
          (mode (or (settings-permission-mode settings) :default))
+         (project-dir (or (find-project-root cwd) cwd))
+         (session (%session-for-run invocation source sessions-dir project-dir))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (sources nil)
@@ -184,8 +259,11 @@ configuration errors of -p signal here."
                                      :model designator :permission-mode mode :cwd cwd
                                      :rules (append (settings-allow settings)
                                                     (settings-ask settings)
-                                                    (settings-deny settings)))
+                                                    (settings-deny settings))
+                                     :session-id (session-id session))
                              :input (%make-input cell)
+                             :session session :sessions-dir sessions-dir
+                             :project-dir project-dir :designator designator
                              :cwd cwd :settings settings :providers providers :env env
                              :agent agent :sources sources
                              :max-turns (or (settings-max-turns settings) +default-max-turns+)
@@ -194,6 +272,7 @@ configuration errors of -p signal here."
                              :http-backend http-protocol:*http-backend*
                              :event-maker http-backend-async:*event-backend-maker*
                              :mode mode
+                             :data-dir data-dir
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -202,6 +281,11 @@ configuration errors of -p signal here."
                                                     :style (w:text-run-style
                                                             (w:text-run "" :inverse t))))))
                      (setf (car cell) program)
+                     ;; A resumed session: its transcript and its prompts.
+                     (setf (state-transcript (code-program-state program))
+                           (session-entries session)
+                           (w:text-input-history (code-program-input program))
+                           (mapcar #'record-prompt (session-records session)))
                      program))))
            (setf done t)
            program)
@@ -273,10 +357,53 @@ in it becomes an :error message."
     (when files
       (%send program (list :%cp-files files)))))
 
+(defun %end-steering (program run)
+  "A terminal turn end: steering not taken stays with the core (it becomes a
+follow-up or goes back to the input), so the run must not take it later."
+  (when run
+    (setf (agent:agent-run-inbox run) nil))
+  (setf (%cp-posted program) '()))
+
+(defun %commit-run (program run finish)
+  "Loop thread: commit RUN's turns since the last commit as one turn record,
+before the turn end reaches the UI. A conflict forks the session; any other
+error is an (:error M) and the turns go into the next commit."
+  (let* ((committed (%cp-committed program))
+         (new (remove-if (lambda (turn)
+                           (or (eq :system (llm:llm-turn-role turn)) (gethash turn committed)))
+                         (agent:agent-run-turns run))))
+    (when new
+      (handler-case
+          (let ((old (%cp-session program))
+                (record (make-turn-record :prompt (%cp-turn-prompt program)
+                                          :turns new
+                                          :finish finish
+                                          :model (%cp-designator program)
+                                          :permission-mode (or (%cp-mode program) :default)
+                                          :usage (copy-list (%cp-turn-usage program))
+                                          :steering (copy-list (%cp-turn-steering program)))))
+            (multiple-value-bind (revision store) (%commit-forking old record)
+              (declare (ignore revision))
+              (dolist (turn new) (setf (gethash turn committed) t))
+              (setf (%cp-turn-usage program) (list 0 0 0 0)
+                    (%cp-turn-steering program) '())
+              (unless (eq store old)
+                (setf (%cp-session program) store)
+                (%send program (list :session (session-id store)))
+                (%send program (list :notice (format nil "session ~a changed in another process; continuing as session ~a"
+                                                     (session-id old) (session-id store)))))))
+        (error (e) (%send program (list :error (%message-text e))))))))
+
 (defun %turn-callback (program)
   (lambda (run)
     (%refresh-files program)
     (let ((reason (agent:agent-run-finish-reason run)))
+      (unless (member reason '(:approval :deferred))
+        (%end-steering program run)
+        (%commit-run program run (case reason
+                                   (:max-steps :max-steps)
+                                   (:canceled :canceled)
+                                   (t :stop))))
       (%send program
              (case reason
                ((:approval :deferred)
@@ -293,7 +420,24 @@ in it becomes an :error message."
 (defun %turn-error-callback (program)
   (lambda (condition)
     (%refresh-files program)
+    (let ((run (%cp-run program)))
+      (%end-steering program run)
+      (when run
+        (%commit-run program run :failed)))
     (%send program (list :turn-end :reason :failed :message (%message-text condition)))))
+
+(defun %on-inbox (program turns)
+  "The run took TURNS from its inbox: the steering among them, as typed."
+  (let ((texts '()))
+    (dolist (turn turns)
+      (let ((entry (assoc turn (%cp-posted program) :test #'eq)))
+        (when entry
+          (push (cdr entry) texts)
+          (setf (%cp-posted program) (remove entry (%cp-posted program) :test #'eq)))))
+    (when texts
+      (setf texts (nreverse texts)
+            (%cp-turn-steering program) (append (%cp-turn-steering program) texts))
+      (%send program (list :steered texts)))))
 
 (defun %program-agent-event (program)
   (lambda (kind payload)
@@ -303,36 +447,37 @@ in it becomes an :error message."
           (:part (when (and (llm:llm-text-part-p payload)
                             (plusp (length (llm:llm-text-part-text payload))))
                    (%send program (list :part (llm:llm-text-part-text payload)))))
-          (:response (%send program (list :usage (%usage-counts
-                                                  (llm:llm-response-usage payload)))))
+          (:response (let ((counts (%usage-counts (llm:llm-response-usage payload))))
+                       (setf (%cp-turn-usage program)
+                             (mapcar #'+ (%cp-turn-usage program) counts))
+                       (%send program (list :usage counts))))
+          (:inbox (%on-inbox program payload))
           (:invocation (%send program (list :invocation payload))))
       (error (e) (%send program (list :error (%message-text e)))))))
 
-(defun %reopen-run (run)
-  "Make a canceled or failed RUN continuable: CONTINUE-AI-AGENT-ASYNC (0.12.0)
-keeps the handle's cancel flag and a partial assistant turn of a canceled
-generate; both would spoil the next turn."
-  (setf (agent:agent-run-handle-canceled-p (agent:agent-run-handle run)) nil)
-  (let ((turn (agent:agent-run-in-flight-turn run)))
-    (when turn
-      (setf (agent:agent-run-turns run) (remove turn (agent:agent-run-turns run) :test #'eq)
-            (agent:agent-run-in-flight-turn run) nil))))
-
 (defun %loop-start-turn (program text)
-  "Loop thread: send TEXT (mentions expanded) as the next user message."
+  "Loop thread: send TEXT (mentions expanded) as the next user message. A new
+run starts on the session's conversation."
   (let ((ok (%turn-callback program))
         (err (%turn-error-callback program)))
+    (setf (%cp-turn-prompt program) text)
     (handler-case
         (let ((prompt (expand-mentions text (%cp-cwd program)))
               (run (%cp-run program)))
           (setf (%cp-handle program)
                 (if run
-                    (progn (%reopen-run run)
-                           (agent:continue-ai-agent-async run prompt
-                                                          :callback ok :error-callback err))
-                    (agent:run-ai-agent-async (%cp-agent program) prompt
-                                              :on-event (%program-agent-event program)
-                                              :callback ok :error-callback err))))
+                    (agent:continue-ai-agent-async run prompt
+                                                   :callback ok :error-callback err)
+                    (let ((history (session-turns (%cp-session program)))
+                          (committed (make-hash-table :test 'eq)))
+                      (dolist (turn history) (setf (gethash turn committed) t))
+                      (setf (%cp-committed program) committed
+                            (%cp-turn-usage program) (list 0 0 0 0)
+                            (%cp-turn-steering program) '())
+                      (agent:run-ai-agent-async (%cp-agent program)
+                                                (append history (list (llm:user-turn prompt)))
+                                                :on-event (%program-agent-event program)
+                                                :callback ok :error-callback err)))))
       (error (e) (funcall err e)))))
 
 (defun %proposed-p (inv)
@@ -378,7 +523,8 @@ generate; both would spoil the next turn."
         (declare (ignore name))
         (let ((agent (%cp-agent program)))
           (setf (agent:ai-agent-backend agent) backend
-                (agent:ai-agent-model agent) model))
+                (agent:ai-agent-model agent) model
+                (%cp-designator program) designator))
         (%send program (list :model-set designator)))
     (model-not-found (c)
       (%send program (list :error (%message-text c))))))
@@ -393,6 +539,67 @@ generate; both would spoil the next turn."
           ;; The run's settings are this object (RUN-AI-AGENT-ASYNC without
           ;; :settings uses the agent's), read on every permission check.
           (settings-permission-policy settings))))
+
+;;; H3c session effects (loop thread).
+
+(defun %steer (program text)
+  "Post TEXT (mentions expanded) into the running turn, when it still runs."
+  (let ((run (%cp-run program)))
+    (when (and run (member (agent:agent-run-finish-reason run) '(nil :approval :deferred)))
+      (let ((turn (llm:user-turn (expand-mentions text (%cp-cwd program)))))
+        (setf (%cp-posted program) (append (%cp-posted program) (list (cons turn text))))
+        (agent:agent-run-post run turn)))))
+
+(defun %drop-run (program)
+  (setf (%cp-run program) nil
+        (%cp-handle program) nil))
+
+(defun %session-reset (program &rest keys)
+  (%send program (list* :session-reset :entries (session-entries (%cp-session program)) keys)))
+
+(defun %fork (program at)
+  (let* ((session (%cp-session program))
+         (revision (if at
+                       (resolve-turn session at)
+                       (or (session-head session)
+                           (error 'session-turn-not-found :session (session-id session)))))
+         (id (rev:revision-id revision)))
+    (multiple-value-bind (head prompt) (fork-turn session id)
+      (declare (ignore head))
+      (%drop-run program)
+      (%session-reset program :input prompt
+                              :notice (format nil "forked before turn ~a: edit the message and press Enter"
+                                              (subseq id 0 (min 8 (length id))))))))
+
+(defun %rewind (program n)
+  (rewind-session (%cp-session program) n)
+  (%drop-run program)
+  (%session-reset program :notice (format nil "rewound ~d turn~:p" n)))
+
+(defun %clone (program)
+  (let* ((old (%cp-session program))
+         (new (clone-session old)))
+    (setf (%cp-session program) new)
+    (%send program (list :session (session-id new)))
+    (%send program (list :notice (format nil "cloned session ~a as ~a"
+                                         (session-id old) (session-id new))))))
+
+(defun %export (program file)
+  (let* ((path (uiop:merge-pathnames* (uiop:parse-native-namestring file) (%cp-cwd program)))
+         (format (if (string-equal "json" (pathname-type path)) :json :markdown))
+         (n 0)
+         (text (with-output-to-string (s)
+                 (setf n (export-session (%cp-session program) s :format format)))))
+    (p:write-text path text :atomic t)
+    (%send program (list :notice (format nil "exported ~d turn~:p to ~a"
+                                         n (uiop:native-namestring path))))))
+
+(defun %new-session (program)
+  (%drop-run program)
+  (let ((session (create-session (%cp-sessions-dir program)
+                                 :project-dir (%cp-project-dir program))))
+    (setf (%cp-session program) session)
+    (%send program (list :session (session-id session)))))
 
 ;;; Effects (UI thread).
 
@@ -409,13 +616,29 @@ generate; both would spoil the next turn."
                (%on-loop program (lambda () (%deny program inv feedback all)))))
       (:resume (%on-loop program (lambda () (%maybe-resume program))))
       (:restore-input (setf (w:text-input-value (code-program-input program)) (first args)))
-      (:new-conversation (%on-loop program (lambda () (setf (%cp-run program) nil
-                                                            (%cp-handle program) nil))))
+      (:new-conversation (%on-loop program (lambda () (%new-session program))))
       (:set-model (let ((designator (first args)))
                     (%on-loop program (lambda () (%set-model program designator)))))
       (:set-permission-mode (let ((mode (first args)))
                               (%on-loop program
                                         (lambda () (%set-permission-mode program mode)))))
+      (:steer (let ((text (first args)))
+                (%on-loop program (lambda () (%steer program text)))))
+      (:tree (let ((width (%cp-width program)))
+               (%on-loop program
+                         (lambda ()
+                           (%send program
+                                  (list :notice
+                                        (format nil "~{~a~^~%~}"
+                                                (session-tree-lines (%cp-session program)
+                                                                    :width width))))))))
+      (:fork (let ((at (first args)))
+               (%on-loop program (lambda () (%fork program at)))))
+      (:rewind (let ((n (first args)))
+                 (%on-loop program (lambda () (%rewind program n)))))
+      (:clone (%on-loop program (lambda () (%clone program))))
+      (:export (let ((file (first args)))
+                 (%on-loop program (lambda () (%export program file)))))
       (:quit nil))))
 
 (defun %interrupt-wins (program event)
@@ -506,6 +729,16 @@ goes back to the input)."
       ((and ctrl (eq key :d))
        (when (and (null dialog) (string= "" (w:text-input-value input)))
          (%apply-event program '(:quit))))
+      ((and ctrl (eq key :t) (null dialog))
+       ;; Steering: the input's value goes into the running turn (idle: as Enter).
+       (let ((text (w:text-input-value input)))
+         (unless (%blank-text-p text)
+           (unless (equal text (car (last (w:text-input-history input))))
+             (setf (w:text-input-history input)
+                   (append (w:text-input-history input) (list text))))
+           (setf (w:text-input-value input) "")
+           (%apply-event program (list :steer text))))
+       nil)
       ((member key '(:page-up :page-down))
        (w:widget-update (%cp-viewport program) message)
        nil)
@@ -593,6 +826,14 @@ goes back to the input)."
             (when (plusp more)
               (list (format nil "  … +~d queued" more))))))
 
+(defun %steering-rows (state)
+  (let* ((steering (state-steering state))
+         (shown (subseq steering 0 (min 3 (length steering))))
+         (more (- (length steering) (length shown))))
+    (append (mapcar (lambda (text) (format nil "  steering: ~a" (%first-line text))) shown)
+            (when (plusp more)
+              (list (format nil "  … +~d steering" more))))))
+
 (defun %viewport-lines (program width)
   "Give the viewport the transcript lines for WIDTH when they changed."
   (let* ((state (code-program-state program))
@@ -617,11 +858,14 @@ goes back to the input)."
                             (min 8 (+ (%input-rows input width) (%menu-rows input))))))
          (bottom-y (- height 1 bottom))
          (rule-y (1- bottom-y))
-         (extra (if (and busy (not dialog)) (%queued-rows state) '()))
+         (extra (if (and busy (not dialog))
+                    (append (%steering-rows state) (%queued-rows state))
+                    '()))
          (spinner-y (and busy (not dialog) (1- rule-y)))
          (top (max 0 (- rule-y (if spinner-y 1 0) (length extra)))))
     (when (or (zerop width) (zerop height))
       (return-from tui:tui-view nil))
+    (setf (%cp-width program) width)
     (multiple-value-bind (left right) (status-line-text state)
       (setf (w:status-line-left status) left
             (w:status-line-right status) right))
@@ -672,13 +916,14 @@ goes back to the input)."
         (event:close-event-loop eb el))))
   nil)
 
-(defun %run-interactive (inv &key output input providers user-config-dir getenv)
+(defun %run-interactive (inv &key output input providers user-config-dir getenv data-dir)
   "RUN-CLI without -p (see the file header). → exit code."
   (when (invocation-output-format-given-p inv)
     (error 'code-usage-error
            :message "--output-format needs -p (--print): the interactive mode has no output format"))
   (let ((program (make-code-program inv :providers providers :user-config-dir user-config-dir
-                                        :getenv (or getenv #'uiop:getenv))))
+                                        :getenv (or getenv #'uiop:getenv)
+                                        :data-dir data-dir)))
     (unwind-protect
          (progn
            (unless (and (eq input *standard-input*)

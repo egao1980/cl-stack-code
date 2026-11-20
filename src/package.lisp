@@ -13,7 +13,9 @@
                     (#:tui #:tui-protocol)
                     (#:w #:tui-protocol/widgets)
                     (#:md #:tui-markdown)
-                    (#:tty #:tui-backend-tty))
+                    (#:tty #:tui-backend-tty)
+                    (#:rev #:revision-protocol)
+                    (#:dt #:datetime-protocol))
   (:export
    ;; entry
    #:run-cli
@@ -146,9 +148,92 @@
    #:close-code-program
    #:code-program-state
    #:code-program-input
-   #:code-program-dialog))
+   #:code-program-dialog
+
+   ;; H3c: the command line
+   #:invocation-continue-p
+   #:invocation-resume
+   #:invocation-session-id
+   #:invocation-fork-session-p
+   #:invocation-list-sessions-p
+   #:check-session-flags
+
+   ;; H3c: where sessions live
+   #:user-data-directory
+   #:sessions-directory
+   #:project-session-key
+   #:normalize-session-id
+
+   ;; H3c: turn records
+   #:turn-record
+   #:make-turn-record
+   #:turn-record-p
+   #:record-prompt
+   #:record-turns
+   #:record-replace-p
+   #:record-finish
+   #:record-model
+   #:record-permission-mode
+   #:record-usage
+   #:record-steering
+   #:record-version
+   #:record-content
+   #:content-record
+   #:revision-record
+
+   ;; H3c: the session store
+   #:session-store
+   #:session-store-p
+   #:session-id
+   #:session-directory
+   #:session-project-dir
+   #:session-cloned-from
+   #:session-base
+   #:+head-ref+
+   #:+session-format+
+   #:*session-lock-timeout*
+   #:+stale-lock-seconds+
+   #:create-session
+   #:open-session
+   #:sync-session
+   #:list-sessions
+   #:last-session
+   #:session-head
+   #:session-line
+   #:session-records
+   #:session-turns
+   #:commit-turn
+   #:resolve-turn
+   #:move-session-head
+   #:rewind-session
+   #:fork-turn
+   #:clone-session
+
+   ;; H3c: views
+   #:session-entries
+   #:session-tree-lines
+   #:session-summary-lines
+   #:export-session
+
+   ;; H3c: conditions and restarts
+   #:session-error
+   #:session-error-session
+   #:session-not-found
+   #:session-not-found-designator
+   #:session-conflict
+   #:session-conflict-expected
+   #:session-conflict-actual
+   #:session-locked
+   #:session-locked-file
+   #:session-turn-not-found
+   #:session-turn-not-found-designator
+   #:fork-session
+
+   ;; H3c: the interactive core
+   #:state-steering
+   #:state-session-id))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.2.0"
+(defparameter +version+ "0.3.0"
   "The product version, as in the .asd.")

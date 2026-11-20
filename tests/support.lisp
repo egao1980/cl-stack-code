@@ -73,11 +73,17 @@ PROJECT holds ENTRIES (see MAKE-TREE) and a .git/ directory when GIT."
 
 ;;; One run-cli call.
 
+(defun data-dir-of (config)
+  "The private data directory beside CONFIG (H3c: <base>/data/)."
+  (uiop:merge-pathnames* "data/" (uiop:pathname-parent-directory-pathname config)))
+
 (defun code (project config argv &key steps backend (model "mock") (input "")
-                                      getenv (cwd t) providers)
+                                      getenv (cwd t) providers
+                                      (data-dir (data-dir-of config)))
   "Run RUN-CLI with ARGV in PROJECT. MODEL (unless NIL) adds --model; CWD T
 adds --cwd PROJECT. The scripted BACKEND (or one made from STEPS) is provider
-\"mock\". → (values exit-code stdout stderr backend)."
+\"mock\". Sessions go to DATA-DIR (default <base>/data/), never the real
+data directory. → (values exit-code stdout stderr backend)."
   (let* ((backend (or backend (make-scripted-backend steps)))
          (argv (append (and cwd (list "--cwd" (native project)))
                        (and model (list "--model" model))
@@ -92,6 +98,7 @@ adds --cwd PROJECT. The scripted BACKEND (or one made from STEPS) is provider
                                     :providers (append providers
                                                        (list (cons "mock" (scripted-provider backend))))
                                     :user-config-dir config
+                                    :data-dir data-dir
                                     :getenv (or getenv (env-lookup)))))))
     (values exit out (get-output-stream-string err) backend)))
 

@@ -55,22 +55,26 @@
           (and model (list "--model" model))
           argv))
 
-(defun make-program (project config &key steps backend argv providers (model "mock") getenv)
+(defun make-program (project config &key steps backend argv providers (model "mock") getenv
+                                         (data-dir (data-dir-of config)))
   "→ (values program backend): MAKE-CODE-PROGRAM with the scripted BACKEND (or
-one made from STEPS) as provider \"mock\"."
+one made from STEPS) as provider \"mock\", sessions under DATA-DIR."
   (let ((backend (or backend (make-scripted-backend steps))))
     (values (make-code-program (parse-arguments (program-argv project argv model))
                                :providers (append providers
                                                   (list (cons "mock" (scripted-provider backend))))
                                :user-config-dir config
+                               :data-dir data-dir
                                :getenv (or getenv (env-lookup)))
             backend)))
 
 (defun call-with-code-tui (project config fn &key steps backend argv providers (model "mock")
-                                                  getenv gates (cols 80) (rows 24))
+                                                  getenv gates (cols 80) (rows 24)
+                                                  (data-dir (data-dir-of config)))
   (multiple-value-bind (program backend)
       (make-program project config :steps steps :backend backend :argv argv
-                                   :providers providers :model model :getenv getenv)
+                                   :providers providers :model model :getenv getenv
+                                   :data-dir data-dir)
     (let ((tui nil))
       (unwind-protect
            (progn
@@ -84,7 +88,7 @@ one made from STEPS) as provider \"mock\"."
 (defmacro with-code-tui ((tui program backend &rest keys) (project config) &body body)
   "Run BODY with TUI (a headless TUI) on PROGRAM (MAKE-CODE-PROGRAM in
 PROJECT) and its scripted BACKEND. KEYS: :steps :backend :argv :providers
-:model :getenv :gates (opened on exit) :cols :rows."
+:model :getenv :gates (opened on exit) :cols :rows :data-dir."
   `(call-with-code-tui ,project ,config
                        (lambda (,tui ,program ,backend)
                          (declare (ignorable ,tui ,program ,backend))

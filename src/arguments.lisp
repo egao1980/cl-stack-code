@@ -18,7 +18,20 @@ NIL to read the prompt from input (no free argument, or \"-\").")
    (help-p :initarg :help-p :reader invocation-help-p :initform nil)
    (version-p :initarg :version-p :reader invocation-version-p :initform nil)
    (settings :initarg :settings :reader invocation-settings
-             :documentation "The flag layer: a SETTINGS."))
+             :documentation "The flag layer: a SETTINGS.")
+   ;; H3c
+   (continue-p :initarg :continue-p :reader invocation-continue-p :initform nil
+               :documentation "-c / --continue: the last session of this project.")
+   (resume :initarg :resume :reader invocation-resume :initform nil
+           :documentation "-r / --resume ID as given (an id, a prefix or a UUID), or NIL.")
+   (session-id :initarg :session-id :reader invocation-session-id :initform nil
+               :documentation "--session-id ID as given, or NIL.")
+   (fork-session-p :initarg :fork-session-p :reader invocation-fork-session-p
+                   :initform nil
+                   :documentation "--fork-session: resume into a new session.")
+   (list-sessions-p :initarg :list-sessions-p :reader invocation-list-sessions-p
+                    :initform nil
+                    :documentation "--list-sessions: print this project's sessions."))
   (:documentation "One parsed command line."))
 
 (defparameter +output-format-names+ '("text" "json" "stream-json")
@@ -50,7 +63,13 @@ ours to rebind, so it goes in as :BACKEND)."
                 :kind :list)
            (opt "disallowed-tools" "Deny rules, same syntax; repeatable" :kind :list)
            (opt "permission-mode" "default, acceptEdits, bypassPermissions or plan")
-           (opt "append-system-prompt" "Text appended to the system prompt")))))
+           (opt "append-system-prompt" "Text appended to the system prompt")
+           ;; H3c
+           (opt "continue" "Continue the last session of this project" :short #\c :kind :flag)
+           (opt "resume" "Resume the session with this id (or a unique prefix of it)" :short #\r)
+           (opt "session-id" "Id for the new session (32 hex digits or a UUID)")
+           (opt "fork-session" "With --resume or --continue: continue in a new session" :kind :flag)
+           (opt "list-sessions" "Print this project's sessions, newest first" :kind :flag)))))
 
 (defun %output-format (value)
   (cond ((null value) :text)
@@ -109,6 +128,11 @@ are present is checked by RUN-CLI, not here."
          :output-format (%output-format (get-opt :output-format))
          :output-format-given-p (and (get-opt :output-format) t)
          :cwd (get-opt :cwd)
+         :continue-p (and (get-opt :continue) t)
+         :resume (get-opt :resume)
+         :session-id (get-opt :session-id)
+         :fork-session-p (and (get-opt :fork-session) t)
+         :list-sessions-p (and (get-opt :list-sessions) t)
          :settings (make-settings
                     :model (get-opt :model)
                     :max-turns (%max-turns (get-opt :max-turns))
@@ -121,3 +145,42 @@ are present is checked by RUN-CLI, not here."
   "Write the --help text to STREAM."
   (let ((backend (cli-backend-clingon:make-clingon-backend)))
     (cli:format-usage (%make-command backend) :stream stream :backend backend)))
+
+;;; H3c: session flags.
+
+(defun check-session-flags (invocation)
+  "→ T when INVOCATION's session flags go together; otherwise CODE-USAGE-ERROR:
+  --continue with --resume                → \"--continue and --resume cannot be used together\"
+  --fork-session without either           → \"--fork-session needs --resume or --continue\"
+  --session-id with either, no --fork-session
+                                          → \"--session-id with --resume or --continue needs --fork-session\"
+  --session-id that NORMALIZE-SESSION-ID refuses
+                                          → \"bad session id \\\"X\\\": use 32 hex digits or a UUID\"
+  --resume X that is neither a hex prefix of at least 4 characters nor a UUID
+                                          → \"bad session id \\\"X\\\": …\" (the same text)
+  --list-sessions with any of --continue, --resume, --session-id, --fork-session
+                                          → \"--list-sessions cannot be combined with --continue, --resume, --session-id or --fork-session\"
+Whether the sessions exist is checked later (SESSION-NOT-FOUND)."
+  (let ((continue-p (invocation-continue-p invocation))
+        (resume (invocation-resume invocation))
+        (session-id (invocation-session-id invocation))
+        (fork-p (invocation-fork-session-p invocation)))
+    (flet ((bad-id (text)
+             (%usage-fail "bad session id ~s: use 32 hex digits or a UUID" text)))
+      (when (and (invocation-list-sessions-p invocation)
+                 (or continue-p resume session-id fork-p))
+        (%usage-fail "--list-sessions cannot be combined with --continue, --resume, --session-id or --fork-session"))
+      (when (and continue-p resume)
+        (%usage-fail "--continue and --resume cannot be used together"))
+      (when (and fork-p (not (or continue-p resume)))
+        (%usage-fail "--fork-session needs --resume or --continue"))
+      (when (and session-id (or continue-p resume) (not fork-p))
+        (%usage-fail "--session-id with --resume or --continue needs --fork-session"))
+      (when (and session-id (not (normalize-session-id session-id)))
+        (bad-id session-id))
+      (when (and resume
+                 (not (normalize-session-id resume))
+                 (not (and (<= 4 (length resume) 32)
+                           (every (lambda (c) (digit-char-p c 16)) resume))))
+        (bad-id resume))
+      t)))
