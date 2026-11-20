@@ -48,7 +48,10 @@ NIL to read the prompt from input (no free argument, or \"-\").")
                 :documentation "--rewind-mode: :BOTH, :CONVERSATION or :FILES, or NIL (not given).")
    (list-checkpoints-p :initarg :list-checkpoints-p :reader invocation-list-checkpoints-p
                        :initform nil
-                       :documentation "--list-checkpoints: print the resumed session's checkpoints."))
+                       :documentation "--list-checkpoints: print the resumed session's checkpoints.")
+   ;; H3d
+   (rpc-p :initarg :rpc-p :reader invocation-rpc-p :initform nil
+          :documentation "--rpc: serve JSON-RPC 2.0 on standard input and output."))
   (:documentation "One parsed command line."))
 
 (defparameter +output-format-names+ '("text" "json" "stream-json")
@@ -102,6 +105,9 @@ ours to rebind, so it goes in as :BACKEND)."
            ;; H4b
            (opt "lisp-image" "Live Lisp image for the lisp tools: spawn, attach:[HOST:]PORT or off")
            (opt "lisp-observe" "With --lisp-image attach:…: the lisp tools only observe the image"
+                :kind :flag)
+           ;; H3d
+           (opt "rpc" "Serve JSON-RPC 2.0 on stdin/stdout (sessions, turns, approvals; see the docs)"
                 :kind :flag)))))
 
 (defun %lisp-image-flag (value observe)
@@ -199,6 +205,7 @@ are present is checked by RUN-CLI, not here."
          :rewind (get-opt :rewind)
          :rewind-mode (%choice-flag "--rewind-mode" (get-opt :rewind-mode) +rewind-mode-names+)
          :list-checkpoints-p (and (get-opt :list-checkpoints) t)
+         :rpc-p (and (get-opt :rpc) t)
          :settings (make-settings
                     :model (get-opt :model)
                     :max-turns (%max-turns (get-opt :max-turns))
@@ -330,3 +337,24 @@ needs -p (use /rewind in the interactive mode)\")."
       (unless resumed
         (%usage-fail "--list-checkpoints needs --resume or --continue")))
     t))
+
+
+;;; H3d: --rpc.
+
+(defun check-rpc-flags (invocation)
+  "→ T when INVOCATION's flags go with --rpc (or --rpc is not given);
+otherwise CODE-USAGE-ERROR, checked in this order:
+  --rpc with -p                → \"--rpc and -p cannot be used together\"
+  --rpc with a prompt          → \"--rpc takes no prompt (send turn/start)\"
+  --rpc with --output-format   → \"--rpc writes JSON-RPC; --output-format is for -p\"
+  --rpc with any of --continue, --resume, --session-id, --fork-session,
+  --list-sessions              → \"--rpc opens sessions with session/new and session/resume, not --continue, --resume, --session-id, --fork-session or --list-sessions\"
+  --rpc with any of --apply, --reject, --on-drift, --rewind, --rewind-mode,
+  --list-checkpoints           → \"--rpc approves plans and rewinds with plan/approve, plan/reject and rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints\"
+Every other flag goes with --rpc: --cwd (the default working directory of
+new sessions), --model, --max-turns, --permission-mode, --allowed-tools,
+--disallowed-tools, --append-system-prompt, --lisp-image, --lisp-observe
+(the flag layer of every session) and --plan-area (the area kind of plan
+sessions, whatever the mode)."
+  (declare (ignore invocation))
+  (%not-implemented 'check-rpc-flags))

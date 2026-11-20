@@ -983,6 +983,11 @@ USER-DATA-DIRECTORY: sessions live under it."
                 ((invocation-version-p inv)
                  (format output "cl-stack-code ~a~%" +version+)
                  0)
+                ;; H3d: a JSON-RPC server until INPUT ends (src/rpc.lisp).
+                ((invocation-rpc-p inv)
+                 (%run-rpc inv :output output :input input :error-output error-output
+                               :providers providers :user-config-dir user-config-dir
+                               :getenv getenv :data-dir data-dir))
                 ;; H5b
                 ((invocation-list-checkpoints-p inv)
                  (%list-checkpoints inv :output output :getenv getenv :data-dir data-dir
