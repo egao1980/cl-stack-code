@@ -231,5 +231,19 @@ permission mode (flags over settings); otherwise CODE-USAGE-ERROR:
                                           → \"--apply and --plan-area need --permission-mode plan\"
 An action-only invocation (--apply or --reject, --resume or --continue, no
 prompt) does not need plan mode; it acts on the session's open plan."
-  (declare (ignore invocation mode))
-  (%not-implemented 'check-plan-flags))
+  (let* ((apply-p (invocation-apply-p invocation))
+         (reject-p (invocation-reject-p invocation))
+         (prompt (invocation-prompt invocation))
+         (resumed (or (invocation-continue-p invocation) (invocation-resume invocation)))
+         (plan-mode-p (eq mode :plan)))
+    (when (and apply-p reject-p)
+      (%usage-fail "--apply and --reject cannot be used together"))
+    (when (and reject-p (or prompt (not resumed)))
+      (%usage-fail "--reject needs --resume or --continue and no prompt"))
+    (when (and (invocation-on-drift invocation) (not apply-p))
+      (%usage-fail "--on-drift needs --apply"))
+    (when (and (not plan-mode-p)
+               (or (and apply-p (or prompt (not resumed)))
+                   (invocation-plan-area invocation)))
+      (%usage-fail "--apply and --plan-area need --permission-mode plan"))
+    t))

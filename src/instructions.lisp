@@ -102,8 +102,16 @@ project root (else the filesystem root) down to CWD. Blank files are left out."
   - Permission mode: <mode name>
   - Plan: <id> (<copy|git>), a copy of <native PLAN-PROJECT-DIR>
 then, as its own section, +PLAN-MODE-FEEDBACK+. → list of two strings."
-  (declare (ignore cwd plan settings))
-  (%not-implemented '%plan-environment-sections))
+  (let ((cwd (%truename-directory cwd)))
+    (list (format nil "# Environment~%- Working directory: ~a~%- Project root: ~a~%- Platform: ~a~%- Permission mode: ~a~%- Plan: ~a (~(~a~)), a copy of ~a"
+                  (uiop:native-namestring (plan-tool-root plan cwd))
+                  (if (find-project-root cwd) (uiop:native-namestring (plan-root plan)) "none")
+                  (%platform-name)
+                  (permission-mode-name (settings-permission-mode settings))
+                  (plan-id plan)
+                  (plan-kind plan)
+                  (uiop:native-namestring (plan-project-dir plan)))
+          +plan-mode-feedback+)))
 
 (defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan)
   "→ (values prompt files). Sections joined by one blank line: steer's

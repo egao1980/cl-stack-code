@@ -324,8 +324,17 @@ the others."
 
 (defun %plan-entry-lines (entry width)
   "H5a: the lines of a :plan ENTRY (see the file header)."
-  (declare (ignore entry width))
-  (%not-implemented '%plan-entry-lines))
+  (let* ((id (or (entry-id entry) ""))
+         (n (length (entry-input entry)))
+         (header (w:truncate-runs
+                  (list (w:text-run (format nil "● plan ~a: ~d file~:p changed"
+                                            (subseq id 0 (min 8 (length id))) n)
+                                    :bold t))
+                  width))
+         (text (or (entry-text entry) "")))
+    (cons header
+          (and (plusp (length text))
+               (%prefixed "  " (md:render-diff-lines text (max 1 (- width 2))))))))
 
 (defun transcript-lines (entries width &key streaming)
   "→ lines of runs showing ENTRIES at WIDTH (see the file header)."

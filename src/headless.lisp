@@ -503,24 +503,204 @@ act on the session's open plan, no run, INPUT not read."
            (invocation-on-drift inv) (invocation-plan-area inv))
        t))
 
+(defun %plans-dir (cwd data-dir getenv)
+  (plans-directory cwd :data-dir (or data-dir (user-data-directory :getenv getenv))))
+
+(defun %head-plan-entry (source)
+  "The PLAN of SOURCE's head record (a plist), or NIL."
+  (let ((head (and source (session-head source))))
+    (and head (record-plan (revision-record head)))))
+
+(defun %change-kind-name (kind)
+  (substitute #\_ #\- (string-downcase (string kind))))
+
+(defun %changes-json (changes)
+  (map 'vector (lambda (c)
+                 (%json-object "path" (second c) "kind" (%change-kind-name (first c))))
+       changes))
+
+(defun %plan-object (plan status changes diff conflicts)
+  "The result's \"plan\" object."
+  (%json-object "id" (plan-id plan)
+                "kind" (string-downcase (string (plan-kind plan)))
+                "status" (string-downcase (string status))
+                "area" (uiop:native-namestring (plan-root plan))
+                "base" (plan-base plan)
+                "changes" (%changes-json changes)
+                "diff" diff
+                "conflicts" (coerce conflicts 'vector)))
+
+(defun %files-count (n)
+  (format nil "~d file~:p" n))
+
+(defun %rebase-line (plan conflicts)
+  (format nil "plan ~a: rebased onto the working copy (~:[no conflicts~;conflicts in ~:*~{~a~^, ~}~]); review it and --apply again"
+          (plan-id plan) conflicts))
+
+(defun %headless-approve (report plan inv)
+  "--apply: APPROVE-PLAN with PLAN-DRIFT answered per --on-drift; the
+applied / rebased / drift event; a failure for the report unless the plan
+was applied. → (values status result)."
+  (let ((on-drift (or (invocation-on-drift inv) :abort))
+        (drift '()))
+    (multiple-value-bind (result status)
+        (handler-bind ((plan-drift
+                         (lambda (c)
+                           (setf drift (plan-drift-paths c))
+                           (invoke-restart
+                            (find-restart (ecase on-drift
+                                            (:rebase 'rebase-plan)
+                                            (:overwrite 'overwrite-plan)
+                                            (:abort 'abort-approval))
+                                          c)))))
+          (approve-plan plan))
+      (ecase status
+        ((:applied :empty)
+         (%emit-event report "plan" "subtype" "applied" "plan_id" (plan-id plan)
+                                    "changes" (%changes-json result)))
+        (:rebased
+         (%emit-event report "plan" "subtype" "rebased" "plan_id" (plan-id plan)
+                                    "conflicts" (coerce result 'vector))
+         (setf (%report-plan-failure report)
+               (make-condition 'plan-error :plan plan :message (%rebase-line plan result))))
+        (:aborted
+         (%emit-event report "plan" "subtype" "drift" "plan_id" (plan-id plan)
+                                    "paths" (coerce drift 'vector))
+         (setf (%report-plan-failure report)
+               (make-condition 'plan-drift
+                               :plan plan :paths drift
+                               :message (format nil "plan ~a: the working copy changed at ~{~a~^, ~}; nothing applied (use --on-drift rebase or --on-drift overwrite)"
+                                                (plan-id plan) drift)))))
+      (values status result))))
+
+(defun %plan-stderr-line (error-output control &rest args)
+  (format error-output "cl-stack-code: ~?~%" control args)
+  (force-output error-output))
+
 (defun %headless-plan (inv mode cwd store source sessions-dir data-dir getenv error-output)
   "Before a plan run: CHECK-PLAN-FLAGS, then the plan. → (values plan
 reopened-p)."
-  (declare (ignore inv mode cwd store source sessions-dir data-dir getenv error-output))
-  (%not-implemented '%headless-plan))
+  (declare (ignore sessions-dir))
+  (check-plan-flags inv mode)
+  (let ((plans-dir (%plans-dir cwd data-dir getenv))
+        (entry (%head-plan-entry source))
+        (lost nil))
+    (when (and entry (eq :open (getf entry :status)))
+      (handler-case
+          (return-from %headless-plan (values (reopen-plan plans-dir (getf entry :id)) t))
+        (plan-not-found ()
+          (setf lost (getf entry :id)))))
+    (let* ((project (or (find-project-root cwd) cwd))
+           (kind (or (invocation-plan-area inv) :auto))
+           (plan (handler-case
+                     (open-plan project :kind kind
+                                        :data-dir (or data-dir (user-data-directory :getenv getenv))
+                                        :session-id (session-id store))
+                   (plan-error (e)
+                     (if (eq kind :git)
+                         (%usage-fail "--plan-area git: ~a is not a git worktree"
+                                      (uiop:native-namestring project))
+                         (error e))))))
+      (when lost
+        (%plan-stderr-line error-output "plan ~a is no longer open; opened plan ~a"
+                           lost (plan-id plan)))
+      (values plan nil))))
 
 (defun %headless-plan-finish (report plan inv run failure interrupted error-output)
   "After a plan run, before its turn is committed: the projection, --apply,
 the plan events, the result's plan object, the text-mode diff and the
 stderr line (see the file header)."
-  (declare (ignore report plan inv run failure interrupted error-output))
-  (%not-implemented '%headless-plan-finish))
+  (let* ((changes (plan-changes plan))
+         (diff (plan-diff-text plan))
+         (status :open)
+         (conflicts '()))
+    (%emit-event report "plan" "subtype" "projected" "plan_id" (plan-id plan)
+                               "changes" (%changes-json changes) "diff" diff)
+    (when (and (invocation-apply-p inv)
+               (string= "success" (%outcome run failure interrupted 0)))
+      (multiple-value-bind (result-status result) (%headless-approve report plan inv)
+        (setf status (case result-status
+                       ((:applied :empty) :applied)
+                       (:rebased :rebased)
+                       (t :open)))
+        (when (eq result-status :rebased)
+          (setf conflicts result))))
+    (setf (%report-plan report) (%plan-object plan status changes diff conflicts)
+          (%report-plan-text report) (if changes diff ""))
+    (case status
+      (:applied
+       (if changes
+           (%plan-stderr-line error-output "plan ~a: applied ~a" (plan-id plan)
+                              (%files-count (length changes)))
+           (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))
+      (:open
+       (unless (%report-plan-failure report)
+         (if changes
+             (%plan-stderr-line error-output
+                                "plan ~a: ~a changed, not applied (cl-stack-code -p --resume ~a --apply applies it)"
+                                (plan-id plan) (%files-count (length changes))
+                                (%report-session report))
+             (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))))
+    plan))
 
 (defun %run-plan-action (inv &key output getenv data-dir user-config-dir error-output start)
   "--apply / --reject on the resumed session's open plan, without a run.
 → exit code."
-  (declare (ignore inv output getenv data-dir user-config-dir error-output start))
-  (%not-implemented '%run-plan-action))
+  (let* ((getenv (or getenv #'uiop:getenv))
+         (cwd (%resolve-cwd (invocation-cwd inv)))
+         (config (or user-config-dir (user-config-directory :getenv getenv)))
+         (settings (load-settings cwd :user-config-dir config :cli (invocation-settings inv)))
+         (mode (or (settings-permission-mode settings) :default))
+         (sessions-dir (%sessions-dir cwd data-dir getenv))
+         (source (progn (check-plan-flags inv mode)
+                        (%session-source inv sessions-dir)))
+         (entry (%head-plan-entry source))
+         (plan (and entry (eq :open (getf entry :status))
+                    (handler-case (reopen-plan (%plans-dir cwd data-dir getenv) (getf entry :id))
+                      (plan-not-found () nil))))
+         (report (make-%report :format (invocation-output-format inv) :output output
+                               :session (session-id source))))
+    (unless plan
+      (%usage-fail "session ~a has no open plan" (session-id source)))
+    (let ((changes '()) (diff "") (status :open) (conflicts '()))
+      (cond
+        ((invocation-reject-p inv)
+         (setf changes (plan-changes plan)
+               diff (plan-diff-text plan))
+         (reject-plan plan)
+         (setf status :discarded)
+         (%emit-event report "plan" "subtype" "discarded" "plan_id" (plan-id plan))
+         (%plan-stderr-line error-output "plan ~a: discarded" (plan-id plan)))
+        (t
+         (setf changes (plan-changes plan)
+               diff (plan-diff-text plan))
+         (multiple-value-bind (result-status result) (%headless-approve report plan inv)
+           (case result-status
+             ((:applied :empty)
+              (setf status :applied)
+              (if changes
+                  (%plan-stderr-line error-output "plan ~a: applied ~a" (plan-id plan)
+                                     (%files-count (length changes)))
+                  (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))
+             (:rebased (setf status :rebased conflicts result))))))
+      (setf (%report-plan report) (%plan-object plan status changes diff conflicts))
+      (let ((failure (%report-plan-failure report))
+            (duration (round (* 1000 (- (get-internal-real-time) (or start (get-internal-real-time))))
+                             internal-time-units-per-second)))
+        (case (%report-format report)
+          (:text
+           (when (and (null failure) (eq status :applied))
+             (write-string diff output)
+             (force-output output)))
+          (t
+           (%write-json-line report (%result-object report
+                                                    (if failure "error_during_execution" "success")
+                                                    ""
+                                                    (and failure (princ-to-string failure))
+                                                    duration))))
+        (when failure
+          (error failure))
+        0))))
 
 (defun %run-headless (inv &key output input providers user-config-dir getenv start data-dir
                                (error-output *error-output*))

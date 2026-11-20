@@ -456,12 +456,15 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
                 (%add-entry state :kind :notice :text (%permissions-notice state))
                 '())
                ((parse-permission-mode argument)
-                (let ((mode (parse-permission-mode argument)))
+                (let* ((mode (parse-permission-mode argument))
+                       ;; H5a: /permissions plan with a plan open stays in plan mode.
+                       (stays (and (state-plan state) (eq mode (state-permission-mode state)))))
                   (setf (state-permission-mode state) mode)
                   (%add-entry state :kind :notice
                                     :text (format nil "permission mode: ~a"
                                                   (permission-mode-name mode)))
-                  (list (list :set-permission-mode mode))))
+                  (unless stays
+                    (list (list :set-permission-mode mode)))))
                (t
                 (%add-entry state :kind :error
                                   :text (format nil "unknown permission mode ~s: use ~{~a~^, ~}"
@@ -644,15 +647,107 @@ middle, not its end: the project directory name stays (#4)."
 
 ;;; H5a: plans (see the file header).
 
+(defun %plan-id8 (state)
+  "The open plan's id, first 8 characters (\"\" without a plan)."
+  (let ((id (or (getf (state-plan state) :id) "")))
+    (subseq id 0 (min 8 (length id)))))
+
 (defun %plan-command (state command argument)
   "Run the plan command COMMAND (\"/plan\" \"/approve\" \"/reject\"), or refuse
 \"/clear\" / \"/permissions ARGUMENT\" while a plan is open. → effects."
-  (declare (ignore state command argument))
-  (%not-implemented '%plan-command))
+  (declare (ignore argument))
+  (flet ((entry (kind text)
+           (%add-entry state :kind kind :text text)
+           '()))
+    (cond
+      ((state-busy-p state)
+       (entry :error (format nil "~a is not available while a turn runs (Esc interrupts it)"
+                             command)))
+      ((member command '("/clear" "/permissions") :test #'string=)
+       (entry :error (format nil "plan ~a is open: /approve or /reject it first"
+                             (%plan-id8 state))))
+      ((null (state-plan state))
+       (entry (if (string= command "/plan") :notice :error) "no open plan"))
+      ((string= command "/plan") (list (list :show-plan)))
+      ((string= command "/approve") (list (list :approve-plan)))
+      (t (list (list :reject-plan))))))
+
+(defun %plan-continue-notice (state)
+  (%add-entry state :kind :notice
+                    :text (format nil "plan ~a stays open: send a message to keep planning, /plan to review it"
+                                  (%plan-id8 state)))
+  '())
+
+(defun %plan-reply (state choice)
+  "Answer the plan or drift dialog with CHOICE. → effects."
+  (let ((prompt (shiftf (state-plan-prompt state) nil)))
+    (ecase prompt
+      (:plan
+       (ecase choice
+         (:approve (list (list :approve-plan)))
+         (:reject (list (list :reject-plan)))
+         (:continue (%plan-continue-notice state))))
+      (:drift
+       (ecase choice
+         (:rebase (list (list :approve-plan :on-drift :rebase)))
+         (:overwrite (list (list :approve-plan :on-drift :overwrite)))
+         (:abort '()))))))
+
+(defun %plan-closed (state status changes conflicts)
+  (let ((id8 (%plan-id8 state)))
+    (setf (state-plan-prompt state) nil)
+    (%add-entry
+     state :kind :notice
+     :text (ecase status
+             (:applied (format nil "plan ~a applied: ~d file~:p changed" id8 (length changes)))
+             (:empty (format nil "plan ~a had no changes" id8))
+             (:discarded (format nil "plan ~a discarded" id8))
+             (:rebased (format nil "plan ~a rebased onto the working copy~@[; conflicts in ~{~a~^, ~}~]"
+                               id8 conflicts))
+             (:aborted (format nil "nothing applied; plan ~a stays open" id8))))
+    (when (member status '(:applied :empty :discarded))
+      (setf (state-plan state) nil))
+    '()))
 
 (defun %plan-event (state event)
   "Apply EVENT, one of (:plan-opened …) (:plan-projected …) (:plan-drift …)
 (:plan-closed …), or a (:reply …) / (:interrupt) answering the plan prompt.
 → effects."
-  (declare (ignore state event))
-  (%not-implemented '%plan-event))
+  (destructuring-bind (kind &rest args) event
+    (ecase kind
+      (:plan-opened
+       (destructuring-bind (&key id kind root) args
+         (setf (state-plan state) (list :id id :kind kind :root root :changes '() :diff "")
+               (state-plan-prompt state) nil)
+         (%add-entry state :kind :notice
+                           :text (format nil "plan ~a (~(~a~)): edits go to a copy of the project in ~a; the project changes only when you approve"
+                                         (%plan-id8 state) kind root))
+         '()))
+      (:plan-projected
+       (destructuring-bind (&key id changes diff) args
+         (let ((plan (state-plan state)))
+           (setf (state-plan state)
+                 (list :id (or id (getf plan :id)) :kind (getf plan :kind) :root (getf plan :root)
+                       :changes changes :diff (or diff ""))))
+         (cond ((null changes)
+                (%add-entry state :kind :notice
+                                  :text (format nil "plan ~a: no changes yet" (%plan-id8 state))))
+               (t
+                (%add-entry state :kind :plan :id (getf (state-plan state) :id)
+                                  :text (or diff "") :input changes)
+                (unless (state-busy-p state)
+                  (setf (state-plan-prompt state) :plan))))
+         '()))
+      (:plan-drift
+       (destructuring-bind (&key paths) args
+         (setf (state-plan-prompt state) :drift)
+         (%add-entry state :kind :error
+                           :text (format nil "the working copy changed since plan ~a was opened: ~{~a~^, ~}"
+                                         (%plan-id8 state) paths))
+         '()))
+      (:plan-closed
+       (destructuring-bind (&key status changes conflicts) args
+         (%plan-closed state status changes conflicts)))
+      (:reply (%plan-reply state (first args)))
+      (:interrupt
+       (%plan-reply state (if (eq :drift (state-plan-prompt state)) :abort :continue))))))

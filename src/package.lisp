@@ -293,7 +293,3 @@
 
 (defparameter +version+ "0.4.0"
   "The product version, as in the .asd.")
-
-(defun %not-implemented (name)
-  "H5a contract stub: the implementation removes this function and every call."
-  (error "~a is not implemented yet (H5a contract stub)" name))
