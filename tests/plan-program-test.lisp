@@ -107,6 +107,21 @@
       (ok (wait-screen tui "applied: 1 file changed"))
       (ok (equal (nl "beta") (read-file project "a.txt")) "overwrite: the plan wins"))))
 
+(deftest program-plan-shell-needs-no-dialog
+  ;; 0.4.1: the interactive program runs the shell in the area without asking.
+  (with-project (project config) '(("a.txt" "alpha
+"))
+    (with-plan-tui (tui program backend
+                        :steps (list (list :tool "bash" (json-args "command" "echo hi > made.txt"))
+                                     "Ran."))
+        (project config)
+      (send-line tui "run it")
+      (ok (wait-screen tui "Ran.") "the turn was not held for an approval")
+      (ok (not (on-screen tui "Allow once")) "no approval dialog")
+      (ok (not (probe-file (merge-pathnames "made.txt" project))) "the project is untouched")
+      (when (unix-p)
+        (ok (has "hi" (area-file (only-plan project config) "made.txt")) "it ran in the area")))))
+
 (deftest program-plan-turn-record
   (with-project (project config) '(("a.txt" "alpha"))
     (with-plan-tui (tui program backend :steps (list (list :tool "write" (write-args "a.txt" "beta"))

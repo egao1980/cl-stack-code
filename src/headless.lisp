@@ -50,9 +50,10 @@
 ;;;                    "--plan-area git: DIR is not a git worktree" (exit 2).
 ;;;   The run          Tools rooted at PLAN-TOOL-ROOT; ASSEMBLE-SYSTEM-PROMPT
 ;;;                    with :PLAN. Plan mode's base rules allow write, edit
-;;;                    and multi_edit (they are jailed to the area); bash and
-;;;                    job_input still ask, so -p refuses them unless a rule
-;;;                    allows them (the shell is not confined until R4d).
+;;;                    and multi_edit (they are jailed to the area), and since
+;;;                    0.4.1 bash and job_input: the shell runs in the area
+;;;                    without asking, but it is NOT confined to it until R4d.
+;;;                    An ask rule still asks (-p refuses it); a deny wins.
 ;;;   stream-json      After "system" init: {"type":"plan","subtype":
 ;;;                    "opened"|"reopened","plan_id","kind" ("copy"|"git"),
 ;;;                    "area" (native namestring of PLAN-ROOT),"base"}. After

@@ -190,13 +190,34 @@ err backend)."
             (ok (has (dir-native (plan-root plan)) (jget bash "content")) "it runs in the area")
             (ok (equal "alpha" (read-file project "a.txt"))))))))
 
-(deftest plan-cli-shell-still-asks
+(deftest plan-cli-shell-needs-no-rule
+  ;; 0.4.1 (was plan-cli-shell-still-asks): plan mode allows the shell in the
+  ;; area without a rule, so -p runs it.
   (with-project (project config) '(("a.txt" "alpha"))
     (multiple-value-bind (exit out)
         (plan-run project config (list (list :tool "bash" (json-args "command" "echo hi")) "ok"))
       (ok (eql 0 exit))
-      (ok (equal "denied" (jget (first (events out "tool_result")) "status"))
-          "headless refuses bash unless a rule allows it"))))
+      (let ((result (first (events out "tool_result"))))
+        (ok (not (equal "denied" (jget result "status"))) "headless runs bash with no rule")
+        (when (unix-p)
+          (ok (equal "done" (jget result "status")))
+          (ok (has "hi" (jget result "content"))))))))
+
+(deftest plan-cli-shell-deny-and-ask-still-win
+  (with-project (project config) '(("a.txt" "alpha")
+                                   (".cl-stack-code/settings.json"
+                                    "{\"permissions\": {\"ask\": [\"bash(git push *)\"]}}"))
+    (multiple-value-bind (exit out)
+        (plan-run project config (list (list :tools
+                                             (list "bash" (json-args "command" "rm -rf build"))
+                                             (list "bash" (json-args "command" "git push origin")))
+                                       "ok")
+                  "--disallowed-tools" "bash(rm *)")
+      (ok (eql 0 exit))
+      (let ((results (events out "tool_result")))
+        (ok (= 2 (length results)))
+        (ok (every (lambda (r) (equal "denied" (jget r "status"))) results)
+            "a deny rule wins; an ask rule still asks, which -p refuses")))))
 
 (deftest plan-cli-git-in-the-area
   (if (not (unix-p))
