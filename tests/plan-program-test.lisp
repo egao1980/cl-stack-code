@@ -83,7 +83,7 @@
       (send-line tui "check it")
       (ok (wait-screen tui "Still beta."))
       (ok (wait-idle tui program))
-      (ok (has "beta" (result-content (first (tool-results-of backend))))
+      (ok (has "beta" (result-content (car (last (tool-results-of backend)))))
           "the next turn works in the same area")
       (ok (= 1 (length (project-plans project config))))
       (send-line tui "/approve")

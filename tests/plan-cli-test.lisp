@@ -264,7 +264,7 @@ err backend)."
         (ok (eql 0 exit))
         (ok (equal id (jget (plan-event out2 "reopened") "plan_id")) "the same plan")
         (ok (null (plan-event out2 "opened")))
-        (ok (has "beta" (result-content (first (tool-results-of backend))))
+        (ok (has "beta" (result-content (car (last (tool-results-of backend)))))
             "the second turn sees the first turn's edit")
         (ok (= 1 (length (project-plans project config))))
         (ok (equal "alpha" (read-file project "a.txt")))))))
