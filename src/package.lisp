@@ -8,7 +8,12 @@
                     (#:cli #:cli-protocol)
                     (#:json #:json-protocol)
                     (#:p #:cl-stack-pathlib)
-                    (#:event #:event-protocol))
+                    (#:event #:event-protocol)
+                    (#:diff #:diff-protocol)
+                    (#:tui #:tui-protocol)
+                    (#:w #:tui-protocol/widgets)
+                    (#:md #:tui-markdown)
+                    (#:tty #:tui-backend-tty))
   (:export
    ;; entry
    #:run-cli
@@ -85,9 +90,69 @@
    #:model-not-found-designator
    #:run-failed
    #:run-failed-cause
-   #:condition-exit-code))
+   #:condition-exit-code
+
+   ;; H3b: saved "always" rules
+   #:format-permission-rule
+   #:settings-rule-store
+   #:make-settings-rule-store
+   #:settings-rule-store-file
+
+   ;; H3b: @ mentions
+   #:project-files
+   #:mention-candidates
+   #:expand-mentions
+   #:+max-mention-chars+
+
+   ;; H3b: transcript
+   #:entry
+   #:make-entry
+   #:entry-p
+   #:entry-kind
+   #:entry-text
+   #:entry-id
+   #:entry-name
+   #:entry-input
+   #:entry-status
+   #:entry-result
+   #:entry-error-p
+   #:tool-call-summary
+   #:tool-result-diff
+   #:tool-call-preview
+   #:approval-message
+   #:transcript-lines
+   #:status-line-text
+
+   ;; H3b: the interactive core
+   #:interactive-state
+   #:make-interactive-state
+   #:state-transcript
+   #:state-busy-p
+   #:state-queue
+   #:state-approvals
+   #:state-model
+   #:state-permission-mode
+   #:state-cwd
+   #:state-usage
+   #:state-rules
+   #:state-quit-p
+   #:interactive-update
+   #:+help-text+
+   #:+approval-choices+
+
+   ;; H3b: the program
+   #:code-program
+   #:make-code-program
+   #:close-code-program
+   #:code-program-state
+   #:code-program-input
+   #:code-program-dialog))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.1.1"
+(defparameter +version+ "0.2.0"
   "The product version, as in the .asd.")
+
+(defun %not-implemented (name)
+  "Contract stub (H3b): the implementation removes this function and every call."
+  (error "~a is not implemented yet (cl-stack-code H3b contract)" name))

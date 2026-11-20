@@ -8,6 +8,8 @@
 ;;;   (:tools (name json) …)              several tool calls
 ;;;   (:text "…" :tools ((name json) …))  text and tool calls
 ;;;   (:error "message")                  GENERATE signals an ERROR
+;;;   (:gate GATE STEP)                   wait until GATE is open (OPEN-GATE),
+;;;                                       then answer with STEP (H3b)
 ;;;
 ;;; Tool call ids are "call-<step>-<i>". Every response reports usage
 ;;; input 10, output 5, cache read 2, cache write 1. STREAM-GENERATE sends
@@ -82,6 +84,36 @@
                (setf start end)))
     (nreverse out)))
 
+(defstruct (gate (:constructor make-gate ()))
+  "A one-shot latch for (:gate GATE STEP) script steps."
+  (lock (bt:make-lock "gate"))
+  (cv (bt:make-condition-variable))
+  (open nil)
+  (waiting nil))
+
+(defun open-gate (gate)
+  (bt:with-lock-held ((gate-lock gate))
+    (setf (gate-open gate) t)
+    (bt:condition-notify (gate-cv gate)))
+  gate)
+
+(defun gate-waiting-p (gate)
+  "True once a generate is waiting at GATE (or went through it)."
+  (bt:with-lock-held ((gate-lock gate)) (gate-waiting gate)))
+
+(defun %pass-gate (gate)
+  (bt:with-lock-held ((gate-lock gate))
+    (setf (gate-waiting gate) t)
+    (loop until (gate-open gate)
+          do (bt:condition-wait (gate-cv gate) (gate-lock gate) :timeout 1))))
+
+(defun %ungated (step)
+  "STEP, after waiting at its gate when it is a (:gate GATE STEP) step."
+  (if (and (consp step) (eq (first step) :gate))
+      (progn (%pass-gate (second step))
+             (%ungated (third step)))
+      step))
+
 (defun %respond (backend turns tools on-part &optional model)
   (let ((n (bt:with-lock-held ((%lock backend))
              (push (make-instance 'scripted-request
@@ -93,7 +125,7 @@
     (when (> n (length (scripted-steps backend)))
       (error "scripted backend: no step ~d (the script has ~d)"
              n (length (scripted-steps backend))))
-    (multiple-value-bind (text calls) (%step-parts (nth (1- n) (scripted-steps backend)) n)
+    (multiple-value-bind (text calls) (%step-parts (%ungated (nth (1- n) (scripted-steps backend))) n)
       (when on-part
         (dolist (w (%words text))
           (funcall on-part (llm:make-llm-text-part :text w)))
