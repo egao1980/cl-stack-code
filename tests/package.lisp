@@ -13,6 +13,8 @@
                     (#:md #:tui-markdown)
                     (#:h #:tui-backend-terminal)
                     (#:tl #:terminal-backend-lisp)
-                    (#:pp #:pty-protocol)))
+                    (#:pp #:pty-protocol)
+                    (#:rev #:revision-protocol)
+                    (#:dt #:datetime-protocol)))
 
 (in-package #:cl-stack-code/tests)

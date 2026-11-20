@@ -55,6 +55,8 @@
                              :providers (list (cons "mock" (scripted-provider backend)))
                              :user-config-dir (uiop:parse-native-namestring config
                                                                             :ensure-directory t)
+                             :data-dir (data-dir-of (uiop:parse-native-namestring
+                                                     config :ensure-directory t))
                              :getenv (env-lookup))
                   (error (c) (%report report :error (princ-to-string c)) -1))))
       (%report report :exit code (length (scripted-requests backend)) (%stty-g)))))

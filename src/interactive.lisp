@@ -81,6 +81,65 @@
 ;;;   other         :error "unknown command /X: try /help"
 ;;; While busy only /help and /exit run; /clear, /model and /permissions add
 ;;; an :error naming the command (and saying Esc interrupts) and do nothing.
+;;;
+;;; H3c: sessions and steering
+;;;
+;;; Events
+;;;   (:steer TEXT)           Ctrl-T on the input (or /steer TEXT)
+;;;   (:steered TEXTS)        the agent took these steering messages into the
+;;;                           running turn (its :inbox event), oldest first
+;;;   (:session ID)           the program's session is now ID
+;;;   (:session-reset :entries ENTRIES [:input TEXT] [:notice M])
+;;;                           the head moved (/fork, /rewind): the transcript
+;;;                           is now ENTRIES
+;;;
+;;; Effects
+;;;   (:steer TEXT)           post TEXT (mentions expanded) into the running
+;;;                           turn with AGENT-RUN-POST; the program answers
+;;;                           (:steered (TEXT)) once the run takes it
+;;;   (:tree)                 the program answers (:notice <SESSION-TREE-LINES
+;;;                           joined by LF>)
+;;;   (:fork AT)              FORK-TURN (AT a string or NIL); the program
+;;;                           answers (:session-reset …) or (:error M)
+;;;   (:rewind N)             REWIND-SESSION; same answers
+;;;   (:clone)                CLONE-SESSION; the program answers (:session ID)
+;;;                           and (:notice "cloned session OLD as NEW")
+;;;   (:export FILE)          EXPORT-SESSION to FILE (relative to the working
+;;;                           directory; .json → JSON, anything else →
+;;;                           markdown); (:notice "exported N turn[s] to PATH")
+;;;                           or (:error M)
+;;;
+;;; Rules
+;;;   :steer    Blank: nothing. Text starting with "/" or idle: as :submit.
+;;;             Busy: TEXT is appended to STATE-STEERING (no entry yet),
+;;;             effect (:steer TEXT).
+;;;   :steered  Each text leaves STATE-STEERING (the first equal one) and
+;;;             becomes a :user entry, in order.
+;;;   :turn-end :stop / :max-steps: steering still pending was not taken by
+;;;             the turn; it goes to the front of the queue (in order) before
+;;;             the queue's first message starts the next turn.
+;;;             :canceled / :failed: the input gets the pending steering,
+;;;             then the queue, joined by LF (one :restore-input); both are
+;;;             emptied.
+;;;   :session  STATE-SESSION-ID becomes ID.
+;;;   :session-reset  The transcript becomes a copy of ENTRIES, then a
+;;;             :notice M when given; queue and steering emptied; usage kept;
+;;;             effect (:restore-input TEXT) when TEXT is given.
+;;;
+;;; Commands
+;;;   /session      :notice "session <STATE-SESSION-ID>"
+;;;   /tree         (:tree)
+;;;   /fork [AT]    (:fork AT), AT NIL without an argument
+;;;   /rewind [N]   N a positive decimal integer, default 1: (:rewind N);
+;;;                 anything else: :error "usage: /rewind [N], N a positive
+;;;                 number of turns"
+;;;   /clone        (:clone)
+;;;   /export FILE  (:export FILE); no argument: :error "usage: /export FILE
+;;;                 (.md or .json)"
+;;;   /steer TEXT   as (:steer TEXT); no argument: :error "usage: /steer
+;;;                 MESSAGE"
+;;; While busy /session, /tree and /steer run as well; /fork, /rewind,
+;;; /clone and /export add the same :error as /clear does.
 
 (defparameter +help-text+
   (format nil "~{~a~^~%~}"
@@ -89,11 +148,19 @@
             "  /clear                start a new conversation"
             "  /model [MODEL]        show or switch the model (provider or provider:model)"
             "  /permissions [MODE]   show the rules, or switch to default, acceptEdits, bypassPermissions or plan"
+            "  /session              show the session id"
+            "  /tree                 show the session's turns as a tree"
+            "  /fork [AT]            branch off before turn AT (a number or an id from /tree; default the last)"
+            "  /rewind [N]           go back N turns (default 1); later turns stay in /tree"
+            "  /clone                continue in a copy of this session"
+            "  /export FILE          write the conversation as markdown, or JSON for a .json FILE"
+            "  /steer MESSAGE        send MESSAGE into the running turn (also Ctrl-T)"
             "  /exit                 quit (also Ctrl-D, or Ctrl-C on an empty input)"
             "Keys:"
             "  Enter send · Alt+Enter, Shift+Enter or Ctrl+J newline · Up/Down history"
             "  @path attach a file (Tab completes) · PgUp/PgDn scroll"
-            "  Esc interrupt the turn · a message sent while a turn runs is queued"))
+            "  Esc interrupt the turn · Enter while a turn runs queues a follow-up"
+            "  Ctrl-T while a turn runs steers it: the message reaches the model before its next step"))
   "The /help notice.")
 
 (defparameter +approval-choices+
@@ -125,14 +192,33 @@ while approvals wait).")
           :documentation "The settings rules (allows, asks, denies) at start.")
    (usage :initform (list 0 0 0 0) :accessor state-usage
           :documentation "(input output cache-read cache-write), summed.")
-   (quit :initform nil :accessor state-quit-p))
+   (quit :initform nil :accessor state-quit-p)
+   ;; H3c
+   (steering :initform '() :accessor state-steering
+             :documentation "Steering messages sent into the running turn and
+not taken yet, oldest first.")
+   (session-id :initarg :session-id :initform nil :accessor state-session-id
+               :documentation "The program's session id."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
-                                    cwd rules)
+                                    cwd rules session-id)
   "→ a fresh INTERACTIVE-STATE: empty transcript, idle, usage zero."
   (make-instance 'interactive-state :model model :permission-mode permission-mode
-                                    :cwd cwd :rules rules))
+                                    :cwd cwd :rules rules :session-id session-id))
+
+(defun %session-command (state command argument)
+  "H3c: run the session command COMMAND (\"/session\" \"/tree\" \"/fork\"
+\"/rewind\" \"/clone\" \"/export\" \"/steer\") with ARGUMENT (trimmed, \"\" when
+none). → effects (see the file header)."
+  (declare (ignore state command argument))
+  (%not-implemented 'session-commands))
+
+(defun %session-event (state event)
+  "H3c: apply EVENT, one of (:steer …) (:steered …) (:session …)
+(:session-reset …). → effects (see the file header)."
+  (declare (ignore state event))
+  (%not-implemented 'session-events))
 
 (defun state-approvals (state)
   "→ the invocations still waiting for an answer, oldest first: the pending
@@ -190,6 +276,9 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
   (multiple-value-bind (command argument) (%split-command text)
     (let ((busy (state-busy-p state)))
       (cond
+        ((member command '("/session" "/tree" "/fork" "/rewind" "/clone" "/export" "/steer")
+                 :test #'string=)
+         (%session-command state command argument))
         ((string= command "/help")
          (%add-entry state :kind :notice :text +help-text+)
          '())
@@ -319,7 +408,8 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
                (%add-entry state :kind :notice :text (format nil "model: ~a" (first args)))
                '())
               (:notice (%add-entry state :kind :notice :text (first args)) '())
-              (:error (%add-entry state :kind :error :text (first args)) '())))))
+              (:error (%add-entry state :kind :error :text (first args)) '())
+              ((:steer :steered :session :session-reset) (%session-event state event))))))
     (values state effects)))
 
 (defun %home-relative (dir)

@@ -76,6 +76,57 @@
 ;;; TTY-BACKEND (which restores the terminal on any exit) and RUN-CLI returns
 ;;; 0 when it quits. A prompt given as arguments is the first message.
 ;;; --output-format without -p is a CODE-USAGE-ERROR naming --output-format.
+;;;
+;;; H3c: sessions and steering.
+;;;   Start            MAKE-CODE-PROGRAM resolves the session as -p does
+;;;                    (src/headless.lisp: --continue, --resume, --session-id,
+;;;                    --fork-session, the same errors, signalled before the
+;;;                    terminal is touched) under :DATA-DIR (default
+;;;                    USER-DATA-DIRECTORY). A resumed session starts with
+;;;                    STATE-TRANSCRIPT = SESSION-ENTRIES, the input history
+;;;                    = the prompts of the head's line (oldest first),
+;;;                    STATE-SESSION-ID = its id, and the model as in -p. The
+;;;                    first :run starts RUN-AI-AGENT-ASYNC on SESSION-TURNS
+;;;                    plus the message.
+;;;   Turns            At every turn end other than :approval the program
+;;;                    commits the turn (COMMIT-TURN: the message as typed,
+;;;                    the run's turns since the last commit without :system
+;;;                    turns, the finish, model, mode, the turn's usage and
+;;;                    the steering it took) on the agent thread, then sends
+;;;                    the :turn-end. A SESSION-CONFLICT takes FORK-SESSION and
+;;;                    sends (:session NEW) and (:notice "session OLD changed
+;;;                    in another process; continuing as session NEW"). Any
+;;;                    other commit error is an (:error M); those turns go
+;;;                    into the next commit.
+;;;   Effects          (:steer T): on the agent thread, when the run is still
+;;;                    going (finish reason NIL, :approval or :deferred),
+;;;                    AGENT-RUN-POST the expanded text; otherwise nothing
+;;;                    (the core makes it a follow-up at the turn end). The
+;;;                    run's :inbox event sends (:steered TEXTS) for the posts
+;;;                    it took, in order. A canceled or failed turn empties the
+;;;                    run's inbox. (:tree) → (:notice) of SESSION-TREE-LINES
+;;;                    at the width of the last frame. (:fork AT) /
+;;;                    (:rewind N) → FORK-TURN / REWIND-SESSION, the run is
+;;;                    dropped, the next :run starts from SESSION-TURNS, and
+;;;                    (:session-reset :entries (SESSION-ENTRIES) …): /fork
+;;;                    with :input = AT's prompt and :notice "forked before
+;;;                    turn <id8>: edit the message and press Enter"; /rewind
+;;;                    with :notice "rewound N turn[s]". (:clone) →
+;;;                    CLONE-SESSION, later turns go to the clone, (:session
+;;;                    NEW) and (:notice "cloned session OLD as NEW").
+;;;                    (:export FILE) → EXPORT-SESSION (FILE relative to the
+;;;                    working directory, parent directories created, an
+;;;                    existing file replaced). :new-conversation
+;;;                    (/clear) also makes a new session (CREATE-SESSION) and
+;;;                    sends (:session NEW). Errors from these are (:error M)
+;;;                    with the condition's text.
+;;;   Keys             Ctrl-T in the input: a non-blank value is taken from
+;;;                    the input (cleared, added to the history as Enter does)
+;;;                    and sent as (:steer TEXT). Enter is unchanged.
+;;;   Layout           Busy and no dialog: above the queued rows, one row per
+;;;                    pending steering message (at most 3) "  steering:
+;;;                    <its first line>", then "  … +N steering" when more
+;;;                    wait.
 
 (defclass code-program ()
   ((state :initarg :state :reader code-program-state
@@ -111,6 +162,8 @@
    (handle :initform nil :accessor %cp-handle
            :documentation "The handle of the last started, continued or resumed turn.")
    (mode :initarg :mode :accessor %cp-mode :documentation "The permission mode.")
+   (data-dir :initarg :data-dir :initform nil :reader %cp-data-dir
+             :documentation "H3c: RUN-CLI's :DATA-DIR, or NIL for USER-DATA-DIRECTORY.")
    ;; UI thread only.
    (files :initform '() :accessor %cp-files :documentation "The @-completion list.")
    (viewport :initarg :viewport :reader %cp-viewport)
@@ -136,7 +189,7 @@
                      (and program (mention-candidates (%cp-files program) token))))))
 
 (defun make-code-program (invocation &key providers user-config-dir
-                                          (getenv #'uiop:getenv))
+                                          (getenv #'uiop:getenv) data-dir)
   "→ a CODE-PROGRAM for INVOCATION (a parsed command line without -p). The
 configuration errors of -p signal here."
   (let* ((getenv (or getenv #'uiop:getenv))
@@ -194,6 +247,7 @@ configuration errors of -p signal here."
                              :http-backend http-protocol:*http-backend*
                              :event-maker http-backend-async:*event-backend-maker*
                              :mode mode
+                             :data-dir data-dir
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -416,6 +470,8 @@ generate; both would spoil the next turn."
       (:set-permission-mode (let ((mode (first args)))
                               (%on-loop program
                                         (lambda () (%set-permission-mode program mode)))))
+      ((:steer :tree :fork :rewind :clone :export)
+       (%not-implemented 'session-effects))
       (:quit nil))))
 
 (defun %interrupt-wins (program event)
@@ -672,13 +728,14 @@ goes back to the input)."
         (event:close-event-loop eb el))))
   nil)
 
-(defun %run-interactive (inv &key output input providers user-config-dir getenv)
+(defun %run-interactive (inv &key output input providers user-config-dir getenv data-dir)
   "RUN-CLI without -p (see the file header). → exit code."
   (when (invocation-output-format-given-p inv)
     (error 'code-usage-error
            :message "--output-format needs -p (--print): the interactive mode has no output format"))
   (let ((program (make-code-program inv :providers providers :user-config-dir user-config-dir
-                                        :getenv (or getenv #'uiop:getenv))))
+                                        :getenv (or getenv #'uiop:getenv)
+                                        :data-dir data-dir)))
     (unwind-protect
          (progn
            (unless (and (eq input *standard-input*)

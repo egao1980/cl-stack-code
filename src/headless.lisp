@@ -1,6 +1,37 @@
 (in-package #:cl-stack-code)
 
 ;;; Headless runs: -p with text, json or stream-json output.
+;;;
+;;; H3c: every run is a turn of a session (src/sessions.lisp).
+;;;   Before the run   CHECK-SESSION-FLAGS; then the session: --continue →
+;;;                    LAST-SESSION of SESSIONS-DIRECTORY (none →
+;;;                    SESSION-NOT-FOUND, exit 2); --resume ID → OPEN-SESSION
+;;;                    (exit 2 when not found); otherwise CREATE-SESSION with
+;;;                    --session-id (an existing id → CODE-USAGE-ERROR
+;;;                    "session ID already exists: use --resume ID", exit 2)
+;;;                    or a random id. --fork-session: CLONE-SESSION of the
+;;;                    resumed session at its head, with --session-id when
+;;;                    given; the run goes on in the clone.
+;;;   Model            --model, else the resumed session's head record MODEL,
+;;;                    else the settings files, else +DEFAULT-MODEL+. Nothing
+;;;                    else is restored: rules, mode, env and max turns come
+;;;                    from today's settings and flags.
+;;;   The run          RUN-AI-AGENT on (SESSION-TURNS store) plus the prompt;
+;;;                    every event's session_id is the store's id.
+;;;   After the run    Once the run has started (its :started event), its
+;;;                    turn is committed with COMMIT-TURN before the result is
+;;;                    written: prompt, the run's turns past the ones it was
+;;;                    given (without :system turns), finish (:stop,
+;;;                    :max-steps, :canceled or :failed), the model
+;;;                    designator, the mode and the summed usage. A
+;;;                    SESSION-CONFLICT takes FORK-SESSION: error-output gets
+;;;                    "cl-stack-code: session OLD changed in another process;
+;;;                    this turn was saved as session NEW" and the result's
+;;;                    session_id is NEW (the exit code is the run's).
+;;;   --list-sessions  Without -p or a prompt: SESSION-SUMMARY-LINES, one per
+;;;                    line on output, exit 0 (nothing when there are none).
+;;;   Data directory   RUN-CLI :DATA-DIR, else USER-DATA-DIRECTORY with
+;;;                    RUN-CLI's GETENV.
 
 ;;; Outcomes of a run that started, as conditions. RUN-CLI handles them like
 ;;; every other error: the message goes to ERROR-OUTPUT, the exit code comes
@@ -297,9 +328,10 @@ on success."
              :message "no prompt: give it as arguments or on standard input"))
     prompt))
 
-(defun %run-headless (inv &key output input providers user-config-dir getenv start)
+(defun %run-headless (inv &key output input providers user-config-dir getenv start data-dir)
   "The -p run of INV. Configuration errors signal before anything is written
 to OUTPUT; a run that started writes its result, then signals its failure."
+  (declare (ignore data-dir))           ; H3c: see the file header
   (unless (invocation-print-p inv)
     (error 'code-usage-error
            :message "-p (--print) is required: cl-stack-code 0.1 runs headless only (the interactive mode arrives in H3b)"))
@@ -365,12 +397,13 @@ to OUTPUT; a run that started writes its result, then signals its failure."
 
 (defun run-cli (argv &key (output *standard-output*) (error-output *error-output*)
                        (input *standard-input*) providers user-config-dir
-                       (getenv #'uiop:getenv))
+                       (getenv #'uiop:getenv) data-dir)
   "Run one invocation of ARGV and return its exit code (0, 1, 2 or 130); never
 quits. OUTPUT gets the answer or JSON, ERROR-OUTPUT the diagnostics, INPUT the
 prompt when ARGV has none. PROVIDERS (alist name → factory) come before the
 built-in ones. USER-CONFIG-DIR defaults to USER-CONFIG-DIRECTORY. GETENV is the
-process environment lookup under the settings env."
+process environment lookup under the settings env. DATA-DIR (H3c) defaults to
+USER-DATA-DIRECTORY: sessions live under it."
   (let ((start (get-internal-real-time)))
     (handler-case
         (let ((inv (parse-arguments argv)))
@@ -382,11 +415,12 @@ process environment lookup under the settings env."
                  0)
                 ((not (invocation-print-p inv))
                  (%run-interactive inv :output output :input input :providers providers
-                                       :user-config-dir user-config-dir :getenv getenv))
+                                       :user-config-dir user-config-dir :getenv getenv
+                                       :data-dir data-dir))
                 (t
                  (%run-headless inv :output output :input input :providers providers
                                     :user-config-dir user-config-dir :getenv getenv
-                                    :start start))))
+                                    :start start :data-dir data-dir))))
       (error (c)
         (format error-output "cl-stack-code: ~a~%" c)
         (force-output error-output)

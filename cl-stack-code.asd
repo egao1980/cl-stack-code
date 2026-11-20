@@ -1,9 +1,9 @@
 (defsystem "cl-stack-code"
-  :version "0.2.0"
-  :description "Coding agent CLI on cl-stack: an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
+  :version "0.3.0"
+  :description "Coding agent CLI on cl-stack: an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "ai-agent-protocol" "0.12.0")
+  :depends-on ((:version "ai-agent-protocol" "0.13.0")
                (:version "agent-tools" "0.2.0")
                (:version "llm-protocol" "0.5.0")
                (:version "llm-protocol-anthropic" "0.3.0")
@@ -15,6 +15,8 @@
                "json-backend-jzon"
                (:version "cl-stack-pathlib" "0.6.0")
                (:version "diff-protocol" "0.3.0")
+               (:version "revision-protocol" "0.3.0")
+               (:version "datetime-protocol" "0.1.3")
                (:version "tui-protocol" "0.2.0")
                "tui-protocol/widgets"
                (:version "tui-markdown" "0.2.0")
@@ -37,6 +39,8 @@
                (:file "rule-store")
                (:file "mentions")
                (:file "transcript")
+               (:file "sessions")
+               (:file "session-views")
                (:file "interactive")
                (:file "headless")
                (:file "program"))
@@ -57,6 +61,8 @@
                "json-backend-jzon"
                "bordeaux-threads"
                "diff-protocol"
+               "revision-protocol"
+               "datetime-protocol"
                "tui-protocol"
                "tui-protocol/widgets"
                "tui-markdown"
@@ -86,7 +92,14 @@
                (:file "mentions-test")
                (:file "rule-store-test")
                (:file "program-test")
-               (:file "interactive-cli-test"))
+               (:file "interactive-cli-test")
+               ;; H3c
+               (:file "session-support")
+               (:file "session-store-test")
+               (:file "session-view-test")
+               (:file "session-cli-test")
+               (:file "session-core-test")
+               (:file "session-program-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
