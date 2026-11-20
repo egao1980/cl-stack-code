@@ -44,7 +44,7 @@
     (multiple-value-bind (exit out err backend)
         (image-stream-run project config
                     '("--lisp-image" "spawn"
-                      "--allowed-tools" "repl-eval" "debug-invoke-restart(restart:retry-later)"
+                      "--allowed-tools" "repl-eval" "--allowed-tools" "debug-invoke-restart(restart:retry-later)"
                       "watch it")
                     (list (list :tool "repl-eval" (json-args "code" +bg-error+))
                           (list :tool "debug-invoke-restart" (json-args "restart" 1))
@@ -78,7 +78,7 @@
     (multiple-value-bind (exit out err)
         (image-stream-run project config
                     '("--lisp-image" "spawn" "--allowed-tools" "repl-eval"
-                      "debug-invoke-restart(restart:return-default)" "fix it")
+                      "--allowed-tools" "debug-invoke-restart(restart:return-default)" "fix it")
                     (list (list :tool "repl-eval" (json-args "code" +seeded-bug+))
                           (list :tool "repl-eval" (json-args "code" "(seeded 1)"))
                           (list :tool "debug-invoke-restart" (json-args "restart" 0))
