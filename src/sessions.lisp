@@ -451,19 +451,23 @@ transient errors: 0, the first error is final.")
 (defun %lock-io (store file operation thunk)
   "→ THUNK's value, THUNK reading (OPERATION :READ) or removing (:DELETE) the
 lock FILE; NIL when FILE vanished meanwhile (another process released or
-broke the lock: the expected race). An error while FILE still exists is
-retried for +LOCK-IO-RETRY-SECONDS+ (Windows sharing violations); after that
-any file or stream error → SESSION-LOCK-ERROR."
+broke the lock: the expected race). A FILE-ERROR while FILE still exists
+is retried for +LOCK-IO-RETRY-SECONDS+ (Windows sharing violations); after
+that, and at once for any other stream error (undecodable text is not
+transient), → SESSION-LOCK-ERROR."
   (let ((deadline (+ (get-internal-real-time)
                      (round (* +lock-io-retry-seconds+ internal-time-units-per-second)))))
-    (loop
-      (handler-case (return (funcall thunk))
-        ((or file-error stream-error) (e)
-          (cond ((%lock-file-gone-p file) (return nil))
-                ((>= (get-internal-real-time) deadline)
-                 (error 'session-lock-error :session (and store (session-id store))
-                                            :file file :operation operation :cause e))
-                (t (sleep 0.005))))))))
+    (flet ((fail (e)
+             (error 'session-lock-error :session (and store (session-id store))
+                                        :file file :operation operation :cause e)))
+      (loop
+        (handler-case (return (funcall thunk))
+          (file-error (e)
+            (cond ((%lock-file-gone-p file) (return nil))
+                  ((>= (get-internal-real-time) deadline) (fail e))
+                  (t (sleep 0.005))))
+          (stream-error (e)
+            (if (%lock-file-gone-p file) (return nil) (fail e))))))))
 
 (defun %read-lock-file (store file)
   (%lock-io store file :read
@@ -506,14 +510,16 @@ restart BREAK-LOCK while probing. → the token written into it."
           (return token)))
       ;; Two breakers of one stale lock may race for a moment; the lock
       ;; assumes one local filesystem and a 30 s dead holder (file header).
-      (when (restart-case (%stale-lock-p store file)
-              (break-lock ()
-                :report "Remove the session's lock file and take the lock (no other process may hold it)"
-                t))
-        (%remove-lock-file store file))
-      (when (> (get-internal-real-time) deadline)
-        (error 'session-locked :session (session-id store) :file file))
-      (sleep 0.01))))
+      ;; A lock just removed is retried at once, even past the deadline.
+      (let ((broken (and (restart-case (%stale-lock-p store file)
+                           (break-lock ()
+                             :report "Remove the session's lock file and take the lock (no other process may hold it)"
+                             t))
+                         (progn (%remove-lock-file store file) t))))
+        (unless broken
+          (when (> (get-internal-real-time) deadline)
+            (error 'session-locked :session (session-id store) :file file))
+          (sleep 0.01))))))
 
 (defun %release-lock (store token)
   "Remove STORE's lock file when it still holds TOKEN (ours). A lock file
