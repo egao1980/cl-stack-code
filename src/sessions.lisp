@@ -262,7 +262,11 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
          :documentation "The head id this store read or last wrote (see the
 file header), or NIL.")
    (lock :initform (bt:make-lock "cl-stack-code session") :reader %session-lock
-         :documentation "Serializes this object's own writes and syncs."))
+         :documentation "Serializes this object's own writes and syncs.")
+   ;; H5b
+   (checkpoints :initform nil :accessor %session-checkpoints
+                :documentation "This session's CHECKPOINT-STORE once CHECKPOINT-STORE made
+it (one per session store object), or NIL."))
   (:documentation "A session: revision-protocol's in-memory store written
 through to its directory (see the file header). Make one with CREATE-SESSION,
 OPEN-SESSION or CLONE-SESSION, not MAKE-INSTANCE."))

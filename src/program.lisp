@@ -171,6 +171,44 @@
 ;;;   Transcript       A :plan entry renders as "● plan <id8>: N file[s]
 ;;;                    changed", then its diff through MD:RENDER-DIFF-LINES
 ;;;                    at W − 2, indented by 2 (TRANSCRIPT-LINES).
+;;;
+;;; H5b: checkpoints and rewind (src/checkpoints.lisp).
+;;;   Checkpointer     MAKE-CODE-PROGRAM makes one (as -p does: project
+;;;                    directory, CHECKPOINT-SETTINGS, the data directory)
+;;;                    before the terminal is touched; CLOSE-CODE-PROGRAM
+;;;                    closes it.
+;;;   Turns            On the agent thread: BEGIN-CHECKPOINT-TURN when a :run
+;;;                    starts a turn (after %ENSURE-PLAN), END-CHECKPOINT-
+;;;                    TURN right after the turn is committed (before the
+;;;                    :turn-end reaches the UI, so disk state is current
+;;;                    when the UI goes idle), with the store the turn went
+;;;                    to. A checkpoint error is an (:error M); the turn
+;;;                    stands.
+;;;   Plans            (:approve-plan …) passes :CHECKPOINTER to APPROVE-PLAN,
+;;;                    then RECORD-PLAN-CHECKPOINTS with the session's head.
+;;;   Effects          (:checkpoints) → (:notice …) of CHECKPOINT-SUMMARY-
+;;;                    LINES at the width of the last frame (see the core).
+;;;                    (:tree) passes SESSION-TREE-LINES :MARKED the
+;;;                    conversation revision ids of SESSION-CHECKPOINTS.
+;;;                    (:rewind N) (H3c, no parts): T = the line's length −
+;;;                    N; when TURN-CHECKPOINT T is a retained checkpoint
+;;;                    whose files are not the same as the tip's, (:rewind-
+;;;                    prompt :n N :turn T :paths P) with P the paths that
+;;;                    differ; otherwise H3c's conversation rewind ("rewound
+;;;                    N turn[s]"). (:rewind N :parts P :on-drift M) →
+;;;                    REWIND-TO; a moved conversation drops the run and
+;;;                    sends (:session-reset :entries (SESSION-ENTRIES)),
+;;;                    then (:rewound …). A PLAN-DRIFT without M sends
+;;;                    (:rewind-drift :paths P) and takes ABORT-APPROVAL
+;;;                    (no :rewound follows). Errors are (:error M).
+;;;   Dialog           STATE-REWIND-PROMPT :rewind: a W:CONFIRM-DIALOG
+;;;                    titled "Rewind to turn T" with message "Files to
+;;;                    restore: P1, P2" and +REWIND-CHOICES+; :drift: titled
+;;;                    "Rewind: the working copy changed" with message
+;;;                    "Changed in both: P1, P2" and +DRIFT-CHOICES+. Events
+;;;                    as for the plan dialogs ((:reply CHOICE) /
+;;;                    (:interrupt)).
+
 
 (defclass code-program ()
   ((state :initarg :state :reader code-program-state
@@ -248,7 +286,12 @@
    (user-config-dir :initarg :user-config-dir :initform nil :reader %cp-user-config-dir
                     :documentation "The user config directory (for ASSEMBLE-SYSTEM-PROMPT).")
    (drift-paths :initform '() :accessor %cp-drift-paths
-                :documentation "The paths of the last (:plan-drift …) sent, for the drift dialog."))
+                :documentation "The paths of the last (:plan-drift …) sent, for the drift dialog.")
+   ;; H5b
+   (checkpointer :initarg :checkpointer :initform nil :reader %cp-checkpointer
+                 :documentation "The CHECKPOINTER, from MAKE-CODE-PROGRAM.")
+   (turn-pre :initform nil :accessor %cp-turn-pre
+             :documentation "Loop thread: BEGIN-CHECKPOINT-TURN's state for the running turn."))
   (:documentation "The interactive mode as a tui-protocol program."))
 
 (defun %make-input (program-cell)
@@ -281,6 +324,8 @@ configuration errors of -p signal here."
          (mode (or (settings-permission-mode settings) :default))
          (project-dir (or (find-project-root cwd) cwd))
          (session (%session-for-run invocation source sessions-dir project-dir))
+         ;; H5b: before the terminal is touched.
+         (checkpointer (%make-run-checkpointer settings cwd data-dir getenv))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (sources nil)
@@ -330,6 +375,7 @@ configuration errors of -p signal here."
                              :mode mode
                              :data-dir data-dir
                              :user-config-dir config
+                             :checkpointer checkpointer
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -349,6 +395,7 @@ configuration errors of -p signal here."
       (unless done
         (when (second sources)
           (tools:close-shell-tools (second sources)))
+        (close-checkpointer checkpointer)
         (event:close-event-loop event-backend event-loop)))))
 
 ;;; The agent thread: the program's event loop and everything on it.
@@ -426,7 +473,8 @@ follow-up or goes back to the input), so the run must not take it later."
 (defun %commit-run (program run finish)
   "Loop thread: commit RUN's turns since the last commit as one turn record,
 before the turn end reaches the UI. A conflict forks the session; any other
-error is an (:error M) and the turns go into the next commit."
+error is an (:error M) and the turns go into the next commit. → (values
+revision store), or NIL when nothing was committed."
   (let* ((committed (%cp-committed program))
          (new (remove-if (lambda (turn)
                            (or (eq :system (llm:llm-turn-role turn)) (gethash turn committed)))
@@ -445,7 +493,6 @@ error is an (:error M) and the turns go into the next commit."
                                                   (and plan (%cp-turn-plan program)
                                                        (plan-record plan))))))
             (multiple-value-bind (revision store) (%commit-forking old record)
-              (declare (ignore revision))
               (dolist (turn new) (setf (gethash turn committed) t))
               (setf (%cp-turn-usage program) (list 0 0 0 0)
                     (%cp-turn-steering program) '())
@@ -453,7 +500,17 @@ error is an (:error M) and the turns go into the next commit."
                 (setf (%cp-session program) store)
                 (%send program (list :session (session-id store)))
                 (%send program (list :notice (format nil "session ~a changed in another process; continuing as session ~a"
-                                                     (session-id old) (session-id store)))))))
+                                                     (session-id old) (session-id store)))))
+              (values revision store)))
+        (error (e) (%send program (list :error (%message-text e))))))))
+
+(defun %end-checkpoint-turn (program revision store)
+  "H5b, loop thread: END-CHECKPOINT-TURN for the turn just committed as
+REVISION in STORE (nothing without a commit). A checkpoint error is an
+(:error M); the turn stands."
+  (let ((pre (shiftf (%cp-turn-pre program) nil)))
+    (when (and pre revision)
+      (handler-case (end-checkpoint-turn (%cp-checkpointer program) store pre revision)
         (error (e) (%send program (list :error (%message-text e))))))))
 
 (defun %turn-callback (program)
@@ -462,10 +519,13 @@ error is an (:error M) and the turns go into the next commit."
     (let ((reason (agent:agent-run-finish-reason run)))
       (unless (member reason '(:approval :deferred))
         (%end-steering program run)
-        (%commit-run program run (case reason
-                                   (:max-steps :max-steps)
-                                   (:canceled :canceled)
-                                   (t :stop))))
+        (multiple-value-bind (revision store)
+            (%commit-run program run (case reason
+                                       (:max-steps :max-steps)
+                                       (:canceled :canceled)
+                                       (t :stop)))
+          ;; H5b: before the :turn-end reaches the UI.
+          (%end-checkpoint-turn program revision store)))
       (%send program
              (case reason
                ((:approval :deferred)
@@ -487,8 +547,8 @@ error is an (:error M) and the turns go into the next commit."
     (%refresh-files program)
     (let ((run (%cp-run program)))
       (%end-steering program run)
-      (when run
-        (%commit-run program run :failed)))
+      (multiple-value-bind (revision store) (and run (%commit-run program run :failed))
+        (%end-checkpoint-turn program revision store)))
     (%send program (list :turn-end :reason :failed :message (%message-text condition)))))
 
 (defun %on-inbox (program turns)
@@ -533,6 +593,13 @@ run starts on the session's conversation."
                        (when (eq :plan (%cp-mode program))
                          (%ensure-plan program))
                        (setf (%cp-turn-plan program) (and (%cp-plan program) t))
+                       ;; H5b: the files before the turn (after the plan).
+                       (setf (%cp-turn-pre program)
+                             (handler-case (begin-checkpoint-turn (%cp-checkpointer program)
+                                                                  (%cp-session program))
+                               (error (e)
+                                 (%send program (list :error (%message-text e)))
+                                 nil)))
                        (if (%cp-plan program)
                            (plan-tool-root (%cp-plan program) (%cp-cwd program))
                            (%cp-cwd program))))
@@ -646,6 +713,21 @@ run starts on the session's conversation."
                                               (subseq id 0 (min 8 (length id))))))))
 
 (defun %rewind (program n)
+  "(:rewind N) without parts: the rewind dialog when turn T's files differ
+from the tip's (H5b), else H3c's conversation rewind."
+  (let* ((session (%cp-session program))
+         (cp (%cp-checkpointer program))
+         (len (length (session-line session)))
+         (turn (- len n)))
+    (when (and (integerp n) (<= 1 n len))
+      (let ((target (turn-checkpoint session (princ-to-string turn)))
+            (tip (tip-checkpoint session)))
+        (when (and target tip
+                   (not (checkpoint-expired-p target))
+                   (not (%same-files-p cp target tip)))
+          (%send program (list :rewind-prompt :n n :turn turn
+                                              :paths (%checkpoint-paths cp session tip target)))
+          (return-from %rewind nil)))))
   (rewind-session (%cp-session program) n)
   (%drop-run program)
   (%session-reset program :notice (format nil "rewound ~d turn~:p" n)))
@@ -704,12 +786,20 @@ run starts on the session's conversation."
                            (%send program
                                   (list :notice
                                         (format nil "~{~a~^~%~}"
-                                                (session-tree-lines (%cp-session program)
-                                                                    :width width))))))))
+                                                (let ((session (%cp-session program)))
+                                                  (session-tree-lines
+                                                   session :width width
+                                                   ;; H5b: turns with a retained checkpoint.
+                                                   :marked (remove nil (mapcar #'checkpoint-turn-id
+                                                                               (session-checkpoints session))))))))))))
       (:fork (let ((at (first args)))
                (%on-loop program (lambda () (%fork program at)))))
-      (:rewind (let ((n (first args)))
-                 (%on-loop program (lambda () (%rewind program n)))))
+      (:rewind (destructuring-bind (n &key (parts nil parts-p) on-drift) args
+                 (if parts-p
+                     ;; H5b
+                     (%on-loop program (lambda () (%rewind-parts-effect program n parts on-drift)))
+                     (%on-loop program (lambda () (%rewind program n))))))
+      (:checkpoints (%on-loop program (lambda () (%checkpoints-effect program))))
       (:clone (%on-loop program (lambda () (%clone program))))
       (:export (let ((file (first args)))
                  (%on-loop program (lambda () (%export program file)))))
@@ -752,6 +842,9 @@ goes back to the input)."
     (cond ((and (null approvals) (state-plan-prompt state))
            ;; H5a: the plan or drift dialog.
            (%sync-plan-dialog program))
+          ((and (null approvals) (state-rewind-prompt state))
+           ;; H5b: the rewind or its drift dialog.
+           (%sync-rewind-dialog program))
           ((null approvals)
            (setf (code-program-dialog program) nil
                  (%cp-dialog-invocation program) nil
@@ -996,6 +1089,9 @@ goes back to the input)."
       (let ((shell (second (%cp-plan-sources program))))
         (when shell
           (tools:close-shell-tools shell)))
+      ;; H5b
+      (when (%cp-checkpointer program)
+        (close-checkpointer (%cp-checkpointer program)))
       ;; Never free a loop a thread may still run (CLOSE-EVENT-LOOP: "once RUN
       ;; has returned").
       (when ended
@@ -1105,7 +1201,7 @@ instructions back, the run is dropped."
     (unless plan
       (%send program (list :error "no open plan"))
       (return-from %approve-plan-effect nil))
-    (multiple-value-bind (result status)
+    (multiple-value-bind (result status pre)
         (handler-bind ((plan-drift
                          (lambda (c)
                            (if on-drift
@@ -1118,7 +1214,13 @@ instructions back, the run is dropped."
                                        (%cp-drift-paths program) (plan-drift-paths c))
                                  (%send program (list :plan-drift :paths (plan-drift-paths c)))
                                  (invoke-restart (find-restart 'abort-approval c)))))))
-          (approve-plan plan))
+          (approve-plan plan :checkpointer (%cp-checkpointer program)))
+      ;; H5b: the plan belongs to the session's head (its last turn).
+      (when pre
+        (handler-case (let ((session (%cp-session program)))
+                        (record-plan-checkpoints (%cp-checkpointer program) session pre
+                                                 (session-head session)))
+          (error (e) (%send program (list :error (%message-text e))))))
       (unless (and drifted (eq status :aborted))
         (%send program (list* :plan-closed :status status
                               (case status
@@ -1159,6 +1261,70 @@ STATE-PLAN-PROMPT (made once per prompt), focus it. → NIL."
                               :title (format nil "Plan ~a: the working copy changed" id8)
                               :message (format nil "Changed in both: ~{~a~^, ~}"
                                                (%cp-drift-paths program))
+                              :choices +drift-choices+)))
+            (%cp-dialog-invocation program) key))
+    (setf (w:widget-focused-p (code-program-input program)) nil)
+    nil))
+
+;;; H5b: checkpoints and rewind (see the "H5b" part of the file header).
+
+(defun %checkpoints-effect (program)
+  "(:checkpoints): send the /checkpoints notice."
+  (let ((session (%cp-session program))
+        (cp (%cp-checkpointer program)))
+    (%send program
+           (list :notice
+                 (if (and (not (checkpointer-enabled-p cp)) (null (session-checkpoints session)))
+                     "checkpoints are off"
+                     (format nil "~{~a~^~%~}"
+                             (checkpoint-summary-lines session :width (%cp-width program))))))))
+
+(defun %rewind-parts-effect (program n parts on-drift)
+  "(:rewind N :parts PARTS :on-drift M): REWIND-TO and its answers."
+  (let* ((session (%cp-session program))
+         (turn (- (length (session-line session)) n))
+         (drifted nil))
+    (unless (>= turn 0)
+      (error 'session-turn-not-found :session (session-id session) :designator n))
+    (let ((result
+            (handler-bind ((plan-drift
+                             (lambda (c)
+                               (if on-drift
+                                   (invoke-restart (find-restart (ecase on-drift
+                                                                   (:rebase 'rebase-plan)
+                                                                   (:overwrite 'overwrite-plan))
+                                                                 c))
+                                   (progn
+                                     (setf drifted t)
+                                     (%send program (list :rewind-drift :paths (plan-drift-paths c)))
+                                     (invoke-restart (find-restart 'abort-approval c)))))))
+              (rewind-to (%cp-checkpointer program) session (princ-to-string turn) :parts parts))))
+      (when (eq :moved (getf result :conversation))
+        (%drop-run program)
+        (%session-reset program))
+      ;; After a drift without an answer the drift dialog answers.
+      (unless (and drifted (eq :aborted (getf result :files)))
+        (%send program (list* :rewound result))))))
+
+(defun %sync-rewind-dialog (program)
+  "UI thread: make CODE-PROGRAM-DIALOG the rewind or drift dialog of
+STATE-REWIND-PROMPT (made once per prompt), focus it. → NIL."
+  (let* ((state (code-program-state program))
+         (prompt (state-rewind-prompt state))
+         (rewind (state-rewind state))
+         (key (list :rewind-dialog prompt rewind)))
+    (unless (equal key (%cp-dialog-invocation program))
+      (setf (code-program-dialog program)
+            (ecase prompt
+              (:rewind
+               (make-instance 'w:confirm-dialog
+                              :title (format nil "Rewind to turn ~a" (getf rewind :turn))
+                              :message (format nil "Files to restore: ~{~a~^, ~}" (getf rewind :paths))
+                              :choices +rewind-choices+))
+              (:drift
+               (make-instance 'w:confirm-dialog
+                              :title "Rewind: the working copy changed"
+                              :message (format nil "Changed in both: ~{~a~^, ~}" (getf rewind :paths))
                               :choices +drift-choices+)))
             (%cp-dialog-invocation program) key))
     (setf (w:widget-focused-p (code-program-input program)) nil)

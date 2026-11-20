@@ -41,6 +41,13 @@
 ;;; exactly WIDTH, ending in "…" (the prefix, mark, id and "  (head)" are never
 ;;; cut). No revisions → ("no turns yet").
 ;;;
+;;; H5b: SESSION-TREE-LINES :MARKED IDS (revision ids): a marked revision's
+;;; label gets " ◆" right after its message (before "  (head)"), and the
+;;; marker is never cut either: "● bbbbbbbb second question ◆  (head)"; a cut
+;;; message ends in "…" before it ("● bbbbbbbb sec… ◆  (head)", WIDTH long).
+;;; The interactive /tree marks the turns that have a retained checkpoint (the
+;;; conversation revisions of SESSION-CHECKPOINTS).
+;;;
 ;;; Markdown export (EXPORT-SESSION :FORMAT :MARKDOWN), blocks joined by one
 ;;; empty line, the text ending in one LF:
 ;;;   "# Session <id>"
@@ -132,8 +139,9 @@ header)."
 
 ;;; The tree.
 
-(defun session-tree-lines (store &key (width 80))
-  "→ the /tree lines of STORE (strings; see the file header)."
+(defun session-tree-lines (store &key (width 80) marked)
+  "→ the /tree lines of STORE (strings; see the file header). MARKED (H5b):
+revision ids whose rows end their message with \" ◆\"."
   (let* ((all (%all-revisions store))
          (positions (make-hash-table :test 'equal))
          (on-line (make-hash-table :test 'equal))
@@ -153,7 +161,9 @@ header)."
                       (fixed (format nil "~a~a ~a " prefix
                                      (if (gethash id on-line) "●" "○")
                                      (subseq id 0 (min 8 (length id)))))
-                      (suffix (if (equal id head-id) "  (head)" ""))
+                      (suffix (concatenate 'string
+                                      (if (member id marked :test #'equal) " ◆" "")
+                                      (if (equal id head-id) "  (head)" "")))
                       (message (or (rev:revision-message r) ""))
                       (line (concatenate 'string fixed message suffix)))
                  (if (> (length line) width)
