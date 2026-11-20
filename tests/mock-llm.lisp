@@ -66,8 +66,8 @@
        (ecase (first step)
          (:tool (values "" (calls (list (rest step)))))
          (:tools (values "" (calls (rest step))))
-         (:text (values (getf (rest step) :text "")
-                        (calls (getf (rest step) :tools))))
+         (:text (values (getf step :text "")
+                        (calls (getf step :tools))))
          (:error (error "~a" (second step))))))))
 
 (defun %words (text)
