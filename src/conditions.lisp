@@ -120,6 +120,29 @@ cloned at EXPECTED); ABORT gives up. Exit 1.")
                                         (and (session-locked-file c)
                                              (uiop:native-namestring (session-locked-file c)))))))))
 
+(define-condition session-lock-error (session-error)
+  ((file :initarg :file :reader session-lock-error-file :initform nil
+         :documentation "The lock file (a pathname).")
+   (operation :initarg :operation :reader session-lock-error-operation
+              :initform :read
+              :documentation ":READ or :DELETE.")
+   (cause :initarg :cause :reader session-lock-error-cause :initform nil
+          :documentation "The file or stream error underneath."))
+  (:documentation "The session's lock file exists but cannot be read or
+removed (permission denied, not a lock file). A lock file that vanishes
+between the probe and the read is not an error: another process released or
+broke it. While waiting for the lock the restart BREAK-LOCK (remove the lock
+file and take it) is offered for an unreadable lock: safe only when no other
+process holds it. Exit 1.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "session ~@[~a ~]lock file ~a cannot be ~:[read~;removed~]: ~a"
+                                        (session-error-session c)
+                                        (and (session-lock-error-file c)
+                                             (uiop:native-namestring (session-lock-error-file c)))
+                                        (eq :delete (session-lock-error-operation c))
+                                        (session-lock-error-cause c)))))))
+
 (define-condition session-turn-not-found (session-error)
   ((designator :initarg :designator :reader session-turn-not-found-designator
                :initform nil

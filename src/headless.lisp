@@ -131,15 +131,16 @@ streamed parts by then), else of RESPONSE itself."
 
 (defun %on-permission (report payload)
   "A refused call (payload with a :CONDITION) goes on the denial list:
-decision :REJECTED is the headless refusal of an ask, :DENY a rule or policy."
+decision :UNATTENDED is the headless refusal of an ask (:REJECTED before
+ai-agent-protocol 0.13), :DENY a rule or policy (or a tool's own refusal)."
   (let ((condition (getf payload :condition))
         (inv (getf payload :invocation)))
     (when (and condition inv)
       (push (%json-object "id" (agent:agent-invocation-id inv)
                           "name" (agent:agent-invocation-name inv)
                           "input" (%tool-input (agent:agent-invocation-arguments inv))
-                          "reason" (if (eq (agent:tool-permission-denied-decision condition)
-                                           :rejected)
+                          "reason" (if (member (agent:tool-permission-denied-decision condition)
+                                               '(:unattended :rejected))
                                        "headless"
                                        "denied"))
             (%report-denials report)))))
@@ -310,7 +311,8 @@ and every settings or flag rule comes later and wins."
                      (lambda (c)
                        (if (eq mode :bypass-permissions)
                            (agent:invoke-approve c)
-                           (agent:invoke-deny c +headless-denial-feedback+))))
+                           (agent:invoke-deny c +headless-denial-feedback+
+                                              :by :unattended))))
                    #+sbcl
                    (sb-sys:interactive-interrupt
                      (lambda (c)
