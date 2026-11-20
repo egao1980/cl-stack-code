@@ -15,6 +15,7 @@
                     (#:md #:tui-markdown)
                     (#:tty #:tui-backend-tty)
                     (#:rev #:revision-protocol)
+                    (#:git #:revision-backend-git)
                     (#:dt #:datetime-protocol))
   (:export
    ;; entry
@@ -236,9 +237,63 @@
 
    ;; H3c: the interactive core
    #:state-steering
-   #:state-session-id))
+   #:state-session-id
+
+   ;; H5a: plans
+   #:plan
+   #:plan-p
+   #:plan-id
+   #:plan-kind
+   #:plan-project-dir
+   #:plan-root
+   #:plan-base
+   #:plan-status
+   #:plan-session-id
+   #:plan-directory
+   #:plan-opened-at
+   #:+plan-format+
+   #:+plan-ref-prefix+
+   #:+plan-kinds+
+   #:plans-directory
+   #:open-plan
+   #:reopen-plan
+   #:list-plans
+   #:plan-tool-root
+   #:plan-changes
+   #:plan-diff
+   #:plan-diff-text
+   #:approve-plan
+   #:reject-plan
+   #:plan-record
+   #:rebase-plan
+   #:overwrite-plan
+   #:abort-approval
+   #:plan-error
+   #:plan-error-plan
+   #:plan-not-found
+   #:plan-not-found-designator
+   #:plan-drift
+   #:plan-drift-paths
+   #:record-plan
+
+   ;; H5a: the command line
+   #:invocation-apply-p
+   #:invocation-reject-p
+   #:invocation-on-drift
+   #:invocation-plan-area
+   #:check-plan-flags
+
+   ;; H5a: the interactive core
+   #:state-plan
+   #:state-plan-prompt
+   #:+plan-choices+
+   #:+drift-choices+))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.3.1"
+(defparameter +version+ "0.4.0"
   "The product version, as in the .asd.")
+
+(defun %not-implemented (name)
+  "H5a contract stub: the implementation removes this function and every call."
+  (error "~a is not implemented yet (H5a contract stub)" name))

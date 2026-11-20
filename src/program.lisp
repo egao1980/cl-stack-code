@@ -127,6 +127,50 @@
 ;;;                    pending steering message (at most 3) "  steering:
 ;;;                    <its first line>", then "  … +N steering" when more
 ;;;                    wait.
+;;;
+;;; H5a: plans (src/plans.lisp).
+;;;   Opening          When a :run starts a turn and the program's mode is
+;;;                    :plan with no plan open, %ENSURE-PLAN (loop thread)
+;;;                    opens one before the turn: the resumed session's head
+;;;                    record's open plan (REOPEN-PLAN), else OPEN-PLAN on the
+;;;                    project directory (:KIND :AUTO, the program's data
+;;;                    directory and session id). The agent gets tools rooted
+;;;                    at PLAN-TOOL-ROOT and ASSEMBLE-SYSTEM-PROMPT :PLAN
+;;;                    (SETF of AI-AGENT-TOOLS and AI-AGENT-INSTRUCTIONS; the
+;;;                    working directory's tools are kept for later), the run
+;;;                    is dropped so the turn starts a new run on
+;;;                    SESSION-TURNS, and (:plan-opened :id :kind :root) is
+;;;                    sent. An error opening it fails the turn (:turn-end
+;;;                    :reason :failed with its message) and nothing runs.
+;;;   Turn ends        After a :stop or :max-steps turn end of a turn that
+;;;                    ran in the plan, (:plan-projected :id :changes
+;;;                    (PLAN-CHANGES) :diff (PLAN-DIFF-TEXT)) is sent after
+;;;                    the :turn-end. The turn record carries PLAN-RECORD.
+;;;   Effects          (:show-plan) → (:plan-projected …). (:approve-plan
+;;;                    :on-drift M) → APPROVE-PLAN with PLAN-DRIFT answered by
+;;;                    M (:rebase → REBASE-PLAN, :overwrite → OVERWRITE-PLAN),
+;;;                    or, without M, ABORT-APPROVAL after sending
+;;;                    (:plan-drift :paths P); then (:plan-closed :status S
+;;;                    :changes C :conflicts X) with APPROVE-PLAN's status
+;;;                    (:aborted is not sent after a :plan-drift: the drift
+;;;                    dialog answers). After :rebased, (:plan-projected …)
+;;;                    follows. (:reject-plan) → REJECT-PLAN, (:plan-closed
+;;;                    :status :discarded). A plan that closed (applied,
+;;;                    empty, discarded) gives the agent back the working
+;;;                    directory's tools and instructions and drops the run;
+;;;                    the mode stays :plan, so the next message opens a new
+;;;                    plan. Errors are (:error M).
+;;;   Dialog           STATE-PLAN-PROMPT :plan (and no approvals waiting): a
+;;;                    W:CONFIRM-DIALOG titled "Plan <id8>" with message
+;;;                    "<N> file[s] changed. Approve to apply them to the
+;;;                    project." and +PLAN-CHOICES+; :drift: titled "Plan
+;;;                    <id8>: the working copy changed" with message "Changed
+;;;                    in both: P1, P2" and +DRIFT-CHOICES+. Its confirm-event
+;;;                    is (:reply CHOICE), its cancel-event (:interrupt), as
+;;;                    for approvals.
+;;;   Transcript       A :plan entry renders as "● plan <id8>: N file[s]
+;;;                    changed", then its diff through MD:RENDER-DIFF-LINES
+;;;                    at W − 2, indented by 2 (TRANSCRIPT-LINES).
 
 (defclass code-program ()
   ((state :initarg :state :reader code-program-state
@@ -192,7 +236,13 @@
               :documentation "(generation width busy) the viewport lines were made for.")
    (generation :initform 0 :accessor %cp-generation)
    (interrupted :initform nil :accessor %cp-interrupted
-                :documentation "True from a :cancel effect until the turn ends."))
+                :documentation "True from a :cancel effect until the turn ends.")
+   ;; H5a, loop thread only.
+   (plan :initform nil :accessor %cp-plan :documentation "The open PLAN, or NIL.")
+   (plan-sources :initform nil :accessor %cp-plan-sources
+                 :documentation "The tool sources rooted in the plan's area, or NIL.")
+   (turn-plan :initform nil :accessor %cp-turn-plan
+              :documentation "True when the running turn runs in the plan."))
   (:documentation "The interactive mode as a tui-protocol program."))
 
 (defun %make-input (program-cell)
@@ -383,7 +433,10 @@ error is an (:error M) and the turns go into the next commit."
                                           :model (%cp-designator program)
                                           :permission-mode (or (%cp-mode program) :default)
                                           :usage (copy-list (%cp-turn-usage program))
-                                          :steering (copy-list (%cp-turn-steering program)))))
+                                          :steering (copy-list (%cp-turn-steering program))
+                                          :plan (let ((plan (%cp-plan program)))
+                                                  (and plan (%cp-turn-plan program)
+                                                       (plan-record plan))))))
             (multiple-value-bind (revision store) (%commit-forking old record)
               (declare (ignore revision))
               (dolist (turn new) (setf (gethash turn committed) t))
@@ -417,7 +470,10 @@ error is an (:error M) and the turns go into the next commit."
                 (list :turn-end :reason :max-steps
                       :message (format nil "reached max turns (~d)" (%cp-max-turns program))))
                (:canceled (list :turn-end :reason :canceled))
-               (t (list :turn-end :reason :stop)))))))
+               (t (list :turn-end :reason :stop))))
+      ;; H5a: the projection follows the turn end of a plan turn.
+      (when (and (%cp-turn-plan program) (member reason '(:stop :max-steps)))
+        (%plan-turn-end program)))))
 
 (defun %turn-error-callback (program)
   (lambda (condition)
@@ -464,8 +520,17 @@ run starts on the session's conversation."
         (err (%turn-error-callback program)))
     (setf (%cp-turn-prompt program) text)
     (handler-case
-        (let ((prompt (expand-mentions text (%cp-cwd program)))
-              (run (%cp-run program)))
+        (let* ((root (progn
+                       ;; H5a: plan mode opens (or reopens) the plan first;
+                       ;; mentions then read the area.
+                       (when (eq :plan (%cp-mode program))
+                         (%ensure-plan program))
+                       (setf (%cp-turn-plan program) (and (%cp-plan program) t))
+                       (if (%cp-plan program)
+                           (plan-tool-root (%cp-plan program) (%cp-cwd program))
+                           (%cp-cwd program))))
+               (prompt (expand-mentions text root))
+               (run (%cp-run program)))
           (setf (%cp-handle program)
                 (if run
                     (agent:continue-ai-agent-async run prompt
@@ -641,6 +706,11 @@ run starts on the session's conversation."
       (:clone (%on-loop program (lambda () (%clone program))))
       (:export (let ((file (first args)))
                  (%on-loop program (lambda () (%export program file)))))
+      ;; H5a
+      (:show-plan (%on-loop program (lambda () (%show-plan program))))
+      (:approve-plan (destructuring-bind (&key on-drift) args
+                       (%on-loop program (lambda () (%approve-plan-effect program on-drift)))))
+      (:reject-plan (%on-loop program (lambda () (%reject-plan-effect program))))
       (:quit nil))))
 
 (defun %interrupt-wins (program event)
@@ -672,7 +742,10 @@ goes back to the input)."
          (input (code-program-input program))
          (approvals (state-approvals state))
          (spinner (%cp-spinner program)))
-    (cond ((null approvals)
+    (cond ((and (null approvals) (state-plan-prompt state))
+           ;; H5a: the plan or drift dialog.
+           (%sync-plan-dialog program))
+          ((null approvals)
            (setf (code-program-dialog program) nil
                  (%cp-dialog-invocation program) nil
                  (w:widget-focused-p input) t))
@@ -939,3 +1012,34 @@ goes back to the input)."
                       :message (format nil "~a; the interactive mode needs a terminal: use -p PROMPT for a headless run" e))))
            0)
       (close-code-program program))))
+
+;;; H5a: plans (see the file header). Loop thread unless said otherwise.
+
+(defun %ensure-plan (program)
+  "Open or reopen the plan when none is open; swap the agent's tools and
+instructions to the area and drop the run; send (:plan-opened …)."
+  (declare (ignore program))
+  (%not-implemented '%ensure-plan))
+
+(defun %plan-turn-end (program)
+  "Send (:plan-projected …) for the open plan."
+  (declare (ignore program))
+  (%not-implemented '%plan-turn-end))
+
+(defun %show-plan (program)
+  (declare (ignore program))
+  (%not-implemented '%show-plan))
+
+(defun %approve-plan-effect (program on-drift)
+  (declare (ignore program on-drift))
+  (%not-implemented '%approve-plan-effect))
+
+(defun %reject-plan-effect (program)
+  (declare (ignore program))
+  (%not-implemented '%reject-plan-effect))
+
+(defun %sync-plan-dialog (program)
+  "UI thread: make CODE-PROGRAM-DIALOG the plan or drift dialog of
+STATE-PLAN-PROMPT (made once per prompt), focus it. → NIL."
+  (declare (ignore program))
+  (%not-implemented '%sync-plan-dialog))

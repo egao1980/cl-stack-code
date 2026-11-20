@@ -171,18 +171,19 @@
       (ok (equal "keep" (read-file project "x.txt"))))))
 
 (deftest tools-plan-mode
+  ;; H5a: plan mode writes into the plan's area, never the project.
   (with-project (project config) '(("a.txt" "alpha"))
-    (let* ((out (nth-value 1 (streamed project config
-                                       (list (list :tools
-                                                   (list "read" (json-args "file_path" "a.txt"))
-                                                   (list "write" (json-args "file_path" "a.txt" "content" "beta")))
-                                             "ok")
-                                       "--permission-mode" "plan" "--allowed-tools" "write")))
-           (w (result-named out "write")))
+    (multiple-value-bind (exit out)
+        (streamed project config
+                  (list (list :tools
+                              (list "read" (json-args "file_path" "a.txt"))
+                              (list "write" (json-args "file_path" "a.txt" "content" "beta")))
+                        "ok")
+                  "--permission-mode" "plan")
+      (ok (eql 0 exit))
       (ok (equal "done" (jget (result-named out "read") "status")))
-      (ok (equal "denied" (jget w "status")))
-      (ok (has "read-only" (jget w "content")))
-      (ok (equal "alpha" (read-file project "a.txt")) "no allow rule lifts plan mode")
+      (ok (equal "done" (jget (result-named out "write") "status")) "edits are allowed")
+      (ok (equal "alpha" (read-file project "a.txt")) "the project is untouched")
       (ok (equal "plan" (jget (first (json-lines out)) "permission_mode"))))))
 
 (deftest tools-hidden-by-bare-deny

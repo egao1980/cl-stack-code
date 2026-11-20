@@ -1,5 +1,7 @@
 (defpackage #:cl-stack-code/tests
   (:use #:cl #:rove #:cl-stack-code)
+  ;; H5a: rove exports PLAN too.
+  (:shadowing-import-from #:cl-stack-code #:plan)
   (:local-nicknames (#:a #:ai-agent-protocol)
                     (#:llm #:llm-protocol)
                     (#:at #:agent-tools)
@@ -15,6 +17,8 @@
                     (#:tl #:terminal-backend-lisp)
                     (#:pp #:pty-protocol)
                     (#:rev #:revision-protocol)
+                    (#:git #:revision-backend-git)
+                    (#:p #:cl-stack-pathlib)
                     (#:dt #:datetime-protocol)))
 
 (in-package #:cl-stack-code/tests)

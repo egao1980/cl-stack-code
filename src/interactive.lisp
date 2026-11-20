@@ -140,6 +140,70 @@
 ;;;                 MESSAGE"
 ;;; While busy /session, /tree and /steer run as well; /fork, /rewind,
 ;;; /clone and /export add the same :error as /clear does.
+;;;
+;;; H5a: plans (src/plans.lisp). <id8> is the plan id's first 8 characters.
+;;;
+;;; Events
+;;;   (:plan-opened :id ID :kind K :root ROOT)
+;;;                           the program opened (or reopened) the plan
+;;;   (:plan-projected :id ID :changes C :diff TEXT)
+;;;                           the projected change, C = PLAN-CHANGES
+;;;   (:plan-drift :paths P)  approval found the working copy changed at P
+;;;   (:plan-closed :status S [:changes C] [:conflicts X])
+;;;                           S :applied :empty :discarded :rebased :aborted
+;;;
+;;; Effects
+;;;   (:show-plan)            the program answers (:plan-projected …)
+;;;   (:approve-plan [:on-drift M])
+;;;                           APPROVE-PLAN; PLAN-DRIFT → (:plan-drift :paths
+;;;                           P) unless M (:rebase / :overwrite) picks the
+;;;                           restart; then (:plan-closed …), and after a
+;;;                           rebase (:plan-projected …) again
+;;;   (:reject-plan)          REJECT-PLAN; (:plan-closed :status :discarded)
+;;;
+;;; State
+;;;   STATE-PLAN              NIL, or (:id ID :kind K :root ROOT :changes C
+;;;                           :diff TEXT) of the open plan
+;;;   STATE-PLAN-PROMPT       NIL, :plan (the plan dialog, +PLAN-CHOICES+) or
+;;;                           :drift (the drift dialog, +DRIFT-CHOICES+)
+;;;
+;;; Rules
+;;;   :plan-opened   STATE-PLAN = (:id :kind :root, no changes); :notice
+;;;             "plan <id8> (<kind>): edits go to a copy of the project in
+;;;             <ROOT>; the project changes only when you approve".
+;;;   :plan-projected  STATE-PLAN gets :changes and :diff. C empty: :notice
+;;;             "plan <id8>: no changes yet". Otherwise a :plan entry (ID =
+;;;             the plan id, TEXT = the diff, INPUT = C) and, when idle,
+;;;             STATE-PLAN-PROMPT :plan.
+;;;   :plan-drift  STATE-PLAN-PROMPT :drift; :error "the working copy
+;;;             changed since plan <id8> was opened: P1, P2".
+;;;   :plan-closed  :applied → :notice "plan <id8> applied: N file[s]
+;;;             changed", STATE-PLAN NIL; :empty → :notice "plan <id8> had no
+;;;             changes", STATE-PLAN NIL; :discarded → :notice "plan <id8>
+;;;             discarded", STATE-PLAN NIL; :rebased → :notice "plan <id8>
+;;;             rebased onto the working copy" + "; conflicts in P1, P2" when
+;;;             X; :aborted → :notice "nothing applied; plan <id8> stays
+;;;             open". STATE-PLAN-PROMPT NIL in every case.
+;;;   :reply    With no approvals waiting and STATE-PLAN-PROMPT :plan:
+;;;             :approve → (:approve-plan); :reject → (:reject-plan);
+;;;             :continue → :notice "plan <id8> stays open: send a message to
+;;;             keep planning, /plan to review it". With :drift: :rebase →
+;;;             (:approve-plan :on-drift :rebase); :overwrite →
+;;;             (:approve-plan :on-drift :overwrite); :abort → nothing more.
+;;;             Every answer sets STATE-PLAN-PROMPT NIL.
+;;;   :interrupt  With no approvals and a plan prompt: :plan as :continue,
+;;;             :drift as :abort.
+;;;   :turn-end  Unchanged; the program sends :plan-projected after a :stop
+;;;             or :max-steps turn end of a plan turn.
+;;;
+;;; Commands
+;;;   /plan     no open plan: :notice "no open plan"; else (:show-plan)
+;;;   /approve  no open plan: :error "no open plan"; else (:approve-plan)
+;;;   /reject   no open plan: :error "no open plan"; else (:reject-plan)
+;;;   /clear, and /permissions with a mode other than plan, while a plan is
+;;;             open: :error "plan <id8> is open: /approve or /reject it
+;;;             first" and nothing else.
+;;; While busy /plan, /approve and /reject add the same :error as /clear.
 
 (defparameter +help-text+
   (format nil "~{~a~^~%~}"
@@ -155,6 +219,9 @@
             "  /clone                continue in a copy of this session"
             "  /export FILE          write the conversation as markdown, or JSON for a .json FILE"
             "  /steer MESSAGE        send MESSAGE into the running turn (also Ctrl-T)"
+            "  /plan                 show the open plan's projected change (plan mode)"
+            "  /approve              apply the open plan to the project"
+            "  /reject               discard the open plan"
             "  /exit                 quit (also Ctrl-D, or Ctrl-C on an empty input)"
             "Keys:"
             "  Enter send · Alt+Enter, Shift+Enter or Ctrl+J newline · Up/Down history"
@@ -170,6 +237,18 @@
     (:reject-all "Reject all"))
   "The approval dialog's choices (W:CONFIRM-DIALOG :choices). :reject asks
 for feedback.")
+
+(defparameter +plan-choices+
+  '((:approve "Approve")
+    (:continue "Keep planning")
+    (:reject "Reject"))
+  "H5a: the plan dialog's choices.")
+
+(defparameter +drift-choices+
+  '((:rebase "Rebase onto the working copy")
+    (:overwrite "Overwrite")
+    (:abort "Cancel"))
+  "H5a: the drift dialog's choices.")
 
 (defclass interactive-state ()
   ((transcript :initform '() :accessor state-transcript
@@ -198,7 +277,12 @@ while approvals wait).")
              :documentation "Steering messages sent into the running turn and
 not taken yet, oldest first.")
    (session-id :initarg :session-id :initform nil :accessor state-session-id
-               :documentation "The program's session id."))
+               :documentation "The program's session id.")
+   ;; H5a
+   (plan :initform nil :accessor state-plan
+         :documentation "NIL, or (:id ID :kind K :root ROOT :changes C :diff TEXT).")
+   (plan-prompt :initform nil :accessor state-plan-prompt
+                :documentation "NIL, :PLAN or :DRIFT: the plan dialog to show."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
@@ -340,6 +424,14 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
         ((member command '("/session" "/tree" "/fork" "/rewind" "/clone" "/export" "/steer")
                  :test #'string=)
          (%session-command state command argument))
+        ;; H5a
+        ((or (member command '("/plan" "/approve" "/reject") :test #'string=)
+             (and (state-plan state)
+                  (or (string= command "/clear")
+                      (and (string= command "/permissions")
+                           (plusp (length argument))
+                           (not (eq :plan (parse-permission-mode argument)))))))
+         (%plan-command state command argument))
         ((string= command "/help")
          (%add-entry state :kind :notice :text +help-text+)
          '())
@@ -459,6 +551,7 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
             (ecase kind
               (:submit (%submit state (first args)))
               (:interrupt (cond ((state-approvals state) (%reply state :reject-all nil))
+                                ((state-plan-prompt state) (%plan-event state event))
                                 ((state-busy-p state) (list (list :cancel)))
                                 (t '())))
               (:quit (%quit-effects state))
@@ -468,13 +561,17 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               (:invocation (%core-invocation state (first args)))
               (:turn-end (destructuring-bind (&key reason pending message) args
                            (%on-turn-end state reason pending message)))
-              (:reply (%reply state (first args) (second args)))
+              (:reply (if (and (null (state-approvals state)) (state-plan-prompt state))
+                          (%plan-event state event)
+                          (%reply state (first args) (second args))))
               (:model-set (setf (state-model state) (first args))
                (%add-entry state :kind :notice :text (format nil "model: ~a" (first args)))
                '())
               (:notice (%add-entry state :kind :notice :text (first args)) '())
               (:error (%add-entry state :kind :error :text (first args)) '())
-              ((:steer :steered :session :session-reset) (%session-event state event))))))
+              ((:steer :steered :session :session-reset) (%session-event state event))
+              ((:plan-opened :plan-projected :plan-drift :plan-closed)
+               (%plan-event state event))))))
     (values state effects)))
 
 (defun %home-relative (dir)
@@ -544,3 +641,18 @@ middle, not its end: the project directory name stays (#4)."
                       (%text-width prefix))))
         (setf dir (%elide-directory dir (max 0 room)))))
     (values (concatenate 'string prefix dir) right)))
+
+;;; H5a: plans (see the file header).
+
+(defun %plan-command (state command argument)
+  "Run the plan command COMMAND (\"/plan\" \"/approve\" \"/reject\"), or refuse
+\"/clear\" / \"/permissions ARGUMENT\" while a plan is open. → effects."
+  (declare (ignore state command argument))
+  (%not-implemented '%plan-command))
+
+(defun %plan-event (state event)
+  "Apply EVENT, one of (:plan-opened …) (:plan-projected …) (:plan-drift …)
+(:plan-closed …), or a (:reply …) / (:interrupt) answering the plan prompt.
+→ effects."
+  (declare (ignore state event))
+  (%not-implemented '%plan-event))

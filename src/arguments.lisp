@@ -31,7 +31,16 @@ NIL to read the prompt from input (no free argument, or \"-\").")
                    :documentation "--fork-session: resume into a new session.")
    (list-sessions-p :initarg :list-sessions-p :reader invocation-list-sessions-p
                     :initform nil
-                    :documentation "--list-sessions: print this project's sessions."))
+                    :documentation "--list-sessions: print this project's sessions.")
+   ;; H5a
+   (apply-p :initarg :apply-p :reader invocation-apply-p :initform nil
+            :documentation "--apply: approve the plan (after the run, or alone with --resume).")
+   (reject-p :initarg :reject-p :reader invocation-reject-p :initform nil
+             :documentation "--reject: discard the resumed session's open plan.")
+   (on-drift :initarg :on-drift :reader invocation-on-drift :initform nil
+             :documentation "--on-drift: :ABORT, :REBASE or :OVERWRITE, or NIL (not given).")
+   (plan-area :initarg :plan-area :reader invocation-plan-area :initform nil
+              :documentation "--plan-area: :AUTO, :GIT or :COPY, or NIL (not given)."))
   (:documentation "One parsed command line."))
 
 (defparameter +output-format-names+ '("text" "json" "stream-json")
@@ -69,7 +78,14 @@ ours to rebind, so it goes in as :BACKEND)."
            (opt "resume" "Resume the session with this id (or a unique prefix of it)" :short #\r)
            (opt "session-id" "Id for the new session (32 hex digits or a UUID)")
            (opt "fork-session" "With --resume or --continue: continue in a new session" :kind :flag)
-           (opt "list-sessions" "Print this project's sessions, newest first" :kind :flag)))))
+           (opt "list-sessions" "Print this project's sessions, newest first" :kind :flag)
+           ;; H5a
+           (opt "apply" "Plan mode: apply the projected change (after the run; with --resume and no prompt, at once)"
+                :kind :flag)
+           (opt "reject" "With --resume or --continue and no prompt: discard the session's open plan"
+                :kind :flag)
+           (opt "on-drift" "With --apply, when the working copy changed under the plan: abort (default), rebase or overwrite")
+           (opt "plan-area" "Plan mode: auto (default), git or copy")))))
 
 (defun %output-format (value)
   (cond ((null value) :text)
@@ -96,6 +112,19 @@ ours to rebind, so it goes in as :BACKEND)."
   (loop for value in values
         append (mapcar (lambda (text) (parse-permission-rule text effect))
                        (split-rule-list value))))
+
+(defparameter +on-drift-names+ '("abort" "rebase" "overwrite")
+  "H5a: the --on-drift values.")
+
+(defparameter +plan-area-names+ '("auto" "git" "copy")
+  "H5a: the --plan-area values.")
+
+(defun %choice-flag (flag value names)
+  "VALUE (one of NAMES) as a keyword, NIL when not given; anything else →
+CODE-USAGE-ERROR \"unknown FLAG \\\"X\\\": use a, b, c\"."
+  (cond ((null value) nil)
+        ((member value names :test #'string=) (intern (string-upcase value) :keyword))
+        (t (%usage-fail "unknown ~a ~s: use ~{~a~^, ~}" flag value names))))
 
 (defun %prompt (free)
   (and free
@@ -133,6 +162,10 @@ are present is checked by RUN-CLI, not here."
          :session-id (get-opt :session-id)
          :fork-session-p (and (get-opt :fork-session) t)
          :list-sessions-p (and (get-opt :list-sessions) t)
+         :apply-p (and (get-opt :apply) t)
+         :reject-p (and (get-opt :reject) t)
+         :on-drift (%choice-flag "--on-drift" (get-opt :on-drift) +on-drift-names+)
+         :plan-area (%choice-flag "--plan-area" (get-opt :plan-area) +plan-area-names+)
          :settings (make-settings
                     :model (get-opt :model)
                     :max-turns (%max-turns (get-opt :max-turns))
@@ -184,3 +217,19 @@ Whether the sessions exist is checked later (SESSION-NOT-FOUND)."
                            (every (lambda (c) (digit-char-p c 16)) resume))))
         (bad-id resume))
       t)))
+
+;;; H5a: plan flags.
+
+(defun check-plan-flags (invocation mode)
+  "→ T when INVOCATION's plan flags go together, MODE being the effective
+permission mode (flags over settings); otherwise CODE-USAGE-ERROR:
+  --apply with --reject                   → \"--apply and --reject cannot be used together\"
+  --reject with a prompt, or without --resume / --continue
+                                          → \"--reject needs --resume or --continue and no prompt\"
+  --on-drift without --apply              → \"--on-drift needs --apply\"
+  --apply with a prompt and MODE not :PLAN, or --plan-area with MODE not :PLAN
+                                          → \"--apply and --plan-area need --permission-mode plan\"
+An action-only invocation (--apply or --reject, --resume or --continue, no
+prompt) does not need plan mode; it acts on the session's open plan."
+  (declare (ignore invocation mode))
+  (%not-implemented 'check-plan-flags))

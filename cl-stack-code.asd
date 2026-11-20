@@ -1,6 +1,6 @@
 (defsystem "cl-stack-code"
-  :version "0.3.1"
-  :description "Coding agent CLI on cl-stack: an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
+  :version "0.4.0"
+  :description "Coding agent CLI on cl-stack: plan mode (edits and shell commands in a copy of the project, a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "ai-agent-protocol" "0.14.0")
@@ -16,6 +16,7 @@
                (:version "cl-stack-pathlib" "0.6.0")
                (:version "diff-protocol" "0.3.0")
                (:version "revision-protocol" "0.3.0")
+               (:version "revision-backend-git" "0.4.0")
                (:version "datetime-protocol" "0.1.3")
                (:version "tui-protocol" "0.2.0")
                "tui-protocol/widgets"
@@ -41,6 +42,7 @@
                (:file "transcript")
                (:file "sessions")
                (:file "session-views")
+               (:file "plans")
                (:file "interactive")
                (:file "headless")
                (:file "program"))
@@ -62,6 +64,8 @@
                "bordeaux-threads"
                "diff-protocol"
                "revision-protocol"
+               "revision-backend-git"
+               "cl-stack-pathlib"
                "datetime-protocol"
                "tui-protocol"
                "tui-protocol/widgets"
@@ -99,7 +103,13 @@
                (:file "session-view-test")
                (:file "session-cli-test")
                (:file "session-core-test")
-               (:file "session-program-test"))
+               (:file "session-program-test")
+               ;; H5a
+               (:file "plan-support")
+               (:file "plan-test")
+               (:file "plan-cli-test")
+               (:file "plan-core-test")
+               (:file "plan-program-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

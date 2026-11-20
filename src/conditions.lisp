@@ -154,3 +154,44 @@ process holds it. Exit 1.")
                                         (session-turn-not-found-designator c)))))))
 
 (defmethod condition-exit-code ((condition session-not-found)) 2)
+
+;;; H5a: plans (src/plans.lisp).
+
+(define-condition plan-error (code-error)
+  ((plan :initarg :plan :reader plan-error-plan :initform nil
+         :documentation "The PLAN, or NIL."))
+  (:documentation "Root of the plan errors: a plan that cannot be opened,
+read or written, or an operation on a plan that is no longer open. Exit 1.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c) "plan error")))))
+
+(define-condition plan-not-found (plan-error)
+  ((designator :initarg :designator :reader plan-not-found-designator :initform nil
+               :documentation "The plan id asked for."))
+  (:documentation "REOPEN-PLAN: no plan with that id under the plans
+directory, the plan is no longer :OPEN, or its area directory is gone. Exit 2
+(it comes from the command line).")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "no open plan ~a" (plan-not-found-designator c)))))))
+
+(define-condition plan-drift (plan-error)
+  ((paths :initarg :paths :reader plan-drift-paths :initform '()
+          :documentation "Relative POSIX paths (sorted, string<) that changed
+both in the area and in the working copy since the plan's base, to different
+results."))
+  (:documentation "APPROVE-PLAN: the working copy changed since the plan's
+base at paths the plan changed too. Signalled once, with every such path,
+before anything is written. Restarts REBASE-PLAN (merge the working copy
+into the area and make it the new base; nothing is applied), OVERWRITE-PLAN
+(apply, the plan's version wins at PATHS) and ABORT-APPROVAL (write nothing;
+the plan stays open). Unhandled, nothing is written and the plan stays open.
+Exit 1.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "the working copy changed since plan ~a was opened: ~{~a~^, ~}"
+                                        (let ((p (plan-error-plan c)))
+                                          (if p (plan-id p) "?"))
+                                        (plan-drift-paths c)))))))
+
+(defmethod condition-exit-code ((condition plan-not-found)) 2)
