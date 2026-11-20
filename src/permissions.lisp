@@ -130,14 +130,22 @@ parentheses; empty pieces dropped."
 (defparameter +edit-tool-names+ '("write" "edit" "multi_edit")
   "The file tools a mode's base rules decide.")
 
+(defparameter +shell-tool-names+ '("bash" "job_input")
+  "The shell tools plan mode's base rules allow (0.4.1).")
+
 (defun %mode-base-rules (mode)
-  (case (or mode :default)
-    (:default (mapcar (lambda (tool) (agent:make-permission-rule tool "*" :ask))
-                      +edit-tool-names+))
-    ;; H5a: plan mode edits the area, so its edits are allowed as in acceptEdits.
-    ((:accept-edits :plan) (mapcar (lambda (tool) (agent:make-permission-rule tool "*" :allow))
-                           +edit-tool-names+))
-    (t '())))
+  (flet ((rules (tools effect)
+           (mapcar (lambda (tool) (agent:make-permission-rule tool "*" effect)) tools)))
+    (case (or mode :default)
+      (:default (rules +edit-tool-names+ :ask))
+      (:accept-edits (rules +edit-tool-names+ :allow))
+      ;; H5a: plan mode edits the area, so its edits are allowed as in
+      ;; acceptEdits. 0.4.1 (the user's decision): the shell is allowed too,
+      ;; rooted at the area but NOT confined to it until R4d; these are the
+      ;; lowest rules, so ask and deny rules from settings or flags still win.
+      (:plan (append (rules +edit-tool-names+ :allow)
+                     (rules +shell-tool-names+ :allow)))
+      (t '()))))
 
 (defun settings-permission-rules (settings)
   "The agent's :permissions for merged SETTINGS: base rules of its mode, then

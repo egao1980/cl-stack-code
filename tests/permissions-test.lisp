@@ -64,9 +64,21 @@
   (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow))
              (rule-lists (settings-permission-rules (make-settings :permission-mode :accept-edits)))))
   (ok (null (settings-permission-rules (make-settings :permission-mode :bypass-permissions))))
-  ;; H5a: plan mode edits the area, so its base rules are acceptEdits'.
-  (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow))
+  ;; H5a: plan mode edits the area, so its base rules are acceptEdits'; since
+  ;; 0.4.1 they allow the shell too (rooted at the area, unconfined until R4d).
+  (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow)
+               ("bash" "*" :allow) ("job_input" "*" :allow))
              (rule-lists (settings-permission-rules (make-settings :permission-mode :plan))))))
+
+(deftest permission-plan-mode-shell-rules-still-win
+  ;; 0.4.1: plan mode's shell allow is the lowest layer.
+  (let ((rules (settings-permission-rules
+                (make-settings :permission-mode :plan
+                               :ask (ask "bash(git push *)")
+                               :deny (deny "bash(rm *)")))))
+    (ok (eq :allow (a:permission-rules-effect rules "bash" '("bash:make test"))))
+    (ok (eq :ask (a:permission-rules-effect rules "bash" '("bash:git push origin"))))
+    (ok (eq :deny (a:permission-rules-effect rules "bash" '("bash:rm -rf build"))))))
 
 (deftest permission-rule-order
   (let ((s (merge-settings (make-settings :allow (allow "bash(git *)") :deny (deny "bash(program:rm)"))

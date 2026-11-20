@@ -1,5 +1,5 @@
 (defsystem "cl-stack-code"
-  :version "0.4.0"
+  :version "0.4.1"
   :description "Coding agent CLI on cl-stack: plan mode (edits and shell commands in a copy of the project, a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
