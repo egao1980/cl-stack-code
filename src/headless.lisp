@@ -380,6 +380,9 @@ process environment lookup under the settings env."
                 ((invocation-version-p inv)
                  (format output "cl-stack-code ~a~%" +version+)
                  0)
+                ((not (invocation-print-p inv))
+                 (%run-interactive inv :output output :input input :providers providers
+                                       :user-config-dir user-config-dir :getenv getenv))
                 (t
                  (%run-headless inv :output output :input input :providers providers
                                     :user-config-dir user-config-dir :getenv getenv

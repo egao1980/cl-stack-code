@@ -84,7 +84,10 @@
           (feedback (field "feedback")))
       (unless (stringp tool)
         (%rule-fail designator "\"tool\" must be a string"))
-      (%check-rule-tool designator tool)
+      ;; The object form takes the tool literally (it is the fallback of
+      ;; FORMAT-PERMISSION-RULE for tools the string form cannot write).
+      (when (zerop (length tool))
+        (%rule-fail designator "no tool name"))
       (unless (stringp resource)
         (%rule-fail designator "\"resource\" must be a string"))
       (unless (or (null feedback) (stringp feedback))

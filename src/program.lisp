@@ -83,33 +83,612 @@
    (input :initarg :input :reader code-program-input
           :documentation "The W:TEXT-INPUT.")
    (dialog :initform nil :accessor code-program-dialog
-           :documentation "The W:CONFIRM-DIALOG while approvals wait, else NIL."))
+           :documentation "The W:CONFIRM-DIALOG while approvals wait, else NIL.")
+   ;; Configuration, from MAKE-CODE-PROGRAM (read-only afterwards).
+   (cwd :initarg :cwd :reader %cp-cwd)
+   (settings :initarg :settings :reader %cp-settings)
+   (providers :initarg :providers :reader %cp-providers)
+   (env :initarg :env :reader %cp-env)
+   (agent :initarg :agent :reader %cp-agent)
+   (sources :initarg :sources :reader %cp-sources)
+   (max-turns :initarg :max-turns :reader %cp-max-turns)
+   (prompt :initarg :prompt :reader %cp-prompt)
+   (event-backend :initarg :event-backend :reader %cp-event-backend)
+   (event-loop :initarg :event-loop :reader %cp-event-loop)
+   (http-backend :initarg :http-backend :reader %cp-http-backend
+                 :documentation "HTTP-PROTOCOL:*HTTP-BACKEND* when the program was made.")
+   (event-maker :initarg :event-maker :reader %cp-event-maker
+                :documentation "HTTP-BACKEND-ASYNC:*EVENT-BACKEND-MAKER* then.")
+   ;; Lifecycle (any thread, set once).
+   (thread :initform nil :accessor %cp-thread
+           :documentation "The agent thread running the event loop, from TUI-INIT.")
+   (stopping :initform nil :accessor %cp-stopping)
+   (closed :initform nil :accessor %cp-closed)
+   (tui :initform nil :accessor %cp-tui
+        :documentation "The TUI-RUN (TUI:*TUI* in TUI-INIT), for TUI-SEND.")
+   ;; Loop thread only.
+   (run :initform nil :accessor %cp-run :documentation "The AGENT-RUN, or NIL.")
+   (handle :initform nil :accessor %cp-handle
+           :documentation "The handle of the last started, continued or resumed turn.")
+   (mode :initarg :mode :accessor %cp-mode :documentation "The permission mode.")
+   ;; UI thread only.
+   (files :initform '() :accessor %cp-files :documentation "The @-completion list.")
+   (viewport :initarg :viewport :reader %cp-viewport)
+   (spinner :initarg :spinner :reader %cp-spinner)
+   (status :initarg :status :reader %cp-status)
+   (dialog-invocation :initform nil :accessor %cp-dialog-invocation)
+   (lines-key :initform nil :accessor %cp-lines-key
+              :documentation "(generation width busy) the viewport lines were made for.")
+   (generation :initform 0 :accessor %cp-generation)
+   (interrupted :initform nil :accessor %cp-interrupted
+                :documentation "True from a :cancel effect until the turn ends."))
   (:documentation "The interactive mode as a tui-protocol program."))
+
+(defun %make-input (program-cell)
+  "The prompt input; PROGRAM-CELL is a cons whose car becomes the program."
+  (make-instance 'w:text-input
+                 :prompt "> "
+                 :placeholder "Message, @file, /help"
+                 :completion-max-items 5
+                 :completion-function
+                 (lambda (token)
+                   (let ((program (car program-cell)))
+                     (and program (mention-candidates (%cp-files program) token))))))
 
 (defun make-code-program (invocation &key providers user-config-dir
                                           (getenv #'uiop:getenv))
   "→ a CODE-PROGRAM for INVOCATION (a parsed command line without -p). The
 configuration errors of -p signal here."
-  (declare (ignore invocation providers user-config-dir getenv))
-  (%not-implemented 'make-code-program))
+  (let* ((getenv (or getenv #'uiop:getenv))
+         (cwd (%resolve-cwd (invocation-cwd invocation)))
+         (config (or user-config-dir (user-config-directory :getenv getenv)))
+         (settings (load-settings cwd :user-config-dir config
+                                      :cli (invocation-settings invocation)))
+         (designator (or (settings-model settings) +default-model+))
+         (env (%env-lookup settings getenv))
+         (resolved (multiple-value-list
+                    (resolve-model designator :providers providers :env env)))
+         (backend (first resolved))
+         (mode (or (settings-permission-mode settings) :default))
+         (event-backend (event-backend-libuv:make-libuv-backend))
+         (event-loop (event:make-event-loop event-backend))
+         (sources nil)
+         (done nil))
+    (unwind-protect
+         (let ((program
+                 (let ((event:*event-backend* event-backend)
+                       (event:*event-loop* event-loop))
+                   (setf sources (make-code-tools cwd :settings settings))
+                   (let* ((offered (loop for source in sources
+                                         append (mapcar #'llm:llm-tool-name
+                                                        (agent:list-agent-tools source))))
+                          (instructions (assemble-system-prompt
+                                         cwd :tools offered :backend backend
+                                             :settings settings :user-config-dir config))
+                          (store (make-settings-rule-store
+                                  (third (settings-file-paths cwd :user-config-dir config))))
+                          (agent (agent:make-ai-agent
+                                  :name "cl-stack-code"
+                                  :backend backend
+                                  :model (third resolved)
+                                  :instructions instructions
+                                  :tools sources
+                                  :permissions (%agent-permissions settings)
+                                  :settings (%agent-settings cwd settings)
+                                  :permission-store store))
+                          (cell (list nil))
+                          (program
+                            (make-instance
+                             'code-program
+                             :state (make-interactive-state
+                                     :model designator :permission-mode mode :cwd cwd
+                                     :rules (append (settings-allow settings)
+                                                    (settings-ask settings)
+                                                    (settings-deny settings)))
+                             :input (%make-input cell)
+                             :cwd cwd :settings settings :providers providers :env env
+                             :agent agent :sources sources
+                             :max-turns (or (settings-max-turns settings) +default-max-turns+)
+                             :prompt (invocation-prompt invocation)
+                             :event-backend event-backend :event-loop event-loop
+                             :http-backend http-protocol:*http-backend*
+                             :event-maker http-backend-async:*event-backend-maker*
+                             :mode mode
+                             :viewport (make-instance 'w:viewport :follow t :wrap nil)
+                             :spinner (make-instance 'w:spinner
+                                                     :active nil
+                                                     :label "Working… (Esc to interrupt)")
+                             :status (make-instance 'w:status-line
+                                                    :style (w:text-run-style
+                                                            (w:text-run "" :inverse t))))))
+                     (setf (car cell) program)
+                     program))))
+           (setf done t)
+           program)
+      (unless done
+        (when (second sources)
+          (tools:close-shell-tools (second sources)))
+        (event:close-event-loop event-backend event-loop)))))
+
+;;; The agent thread: the program's event loop and everything on it.
+
+(defun %send (program message)
+  "Send MESSAGE to the program's TUI (from any thread)."
+  (let ((run (%cp-tui program)))
+    (when run
+      (tui:tui-send message run))))
+
+(defun %message-text (condition)
+  (handler-case (princ-to-string condition)
+    (error () (format nil "~a" (type-of condition)))))
+
+(defun %on-loop (program function)
+  "Run FUNCTION on the agent thread, after the work posted before it. An error
+in it becomes an :error message."
+  (unless (%cp-closed program)
+    (event:wake-call (%cp-event-backend program) (%cp-event-loop program)
+                     (lambda ()
+                       (handler-case (funcall function)
+                         (error (e) (%send program (list :error (%message-text e)))))))))
+
+(defun %agent-thread-main (program)
+  (let* ((null-stream (make-broadcast-stream))
+         (*standard-output* null-stream)
+         (*error-output* null-stream)
+         (*trace-output* null-stream)
+         (event:*event-backend* (%cp-event-backend program))
+         (event:*event-loop* (%cp-event-loop program))
+         (http-protocol:*http-backend*
+           (or (%cp-http-backend program) (http-backend-async:make-async-backend)))
+         (http-backend-async:*event-backend-maker*
+           (or (%cp-event-maker program) #'event-backend-libuv:make-libuv-backend))
+         (agent:*off-loop-specials*
+           (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
+                  agent:*off-loop-specials*)))
+    (handler-bind ((agent:agent-approval-required
+                     (lambda (c)
+                       ;; Only bypassPermissions answers; otherwise the run pauses.
+                       (when (eq (%cp-mode program) :bypass-permissions)
+                         (agent:invoke-approve c))))
+                   (warning
+                     (lambda (w)
+                       (%send program (list :notice (%message-text w)))
+                       (muffle-warning w))))
+      (loop until (%cp-stopping program)
+            do (handler-case
+                   (event:run (%cp-event-backend program) (%cp-event-loop program)
+                              :stop-when-idle nil)
+                 (error (e)
+                   (%send program (list :error (%message-text e)))
+                   (return)))))))
+
+(defun %proposed (run)
+  (remove :proposed (agent:agent-run-invocations run)
+          :key #'agent:agent-invocation-status :test-not #'eq))
+
+(defun %refresh-files (program)
+  "Read the @-completion list again (loop thread) and send it to the UI."
+  (let ((files (handler-case (project-files (%cp-cwd program))
+                 (error () nil))))
+    (when files
+      (%send program (list :%cp-files files)))))
+
+(defun %turn-callback (program)
+  (lambda (run)
+    (%refresh-files program)
+    (let ((reason (agent:agent-run-finish-reason run)))
+      (%send program
+             (case reason
+               ((:approval :deferred)
+                (let ((pending (%proposed run)))
+                  (dolist (inv pending)
+                    (%send program (list :invocation inv)))
+                  (list :turn-end :reason :approval :pending pending)))
+               (:max-steps
+                (list :turn-end :reason :max-steps
+                      :message (format nil "reached max turns (~d)" (%cp-max-turns program))))
+               (:canceled (list :turn-end :reason :canceled))
+               (t (list :turn-end :reason :stop)))))))
+
+(defun %turn-error-callback (program)
+  (lambda (condition)
+    (%refresh-files program)
+    (%send program (list :turn-end :reason :failed :message (%message-text condition)))))
+
+(defun %program-agent-event (program)
+  (lambda (kind payload)
+    (handler-case
+        (case kind
+          (:started (setf (%cp-run program) payload))
+          (:part (when (and (llm:llm-text-part-p payload)
+                            (plusp (length (llm:llm-text-part-text payload))))
+                   (%send program (list :part (llm:llm-text-part-text payload)))))
+          (:response (%send program (list :usage (%usage-counts
+                                                  (llm:llm-response-usage payload)))))
+          (:invocation (%send program (list :invocation payload))))
+      (error (e) (%send program (list :error (%message-text e)))))))
+
+(defun %reopen-run (run)
+  "Make a canceled or failed RUN continuable: CONTINUE-AI-AGENT-ASYNC (0.12.0)
+keeps the handle's cancel flag and a partial assistant turn of a canceled
+generate; both would spoil the next turn."
+  (setf (agent:agent-run-handle-canceled-p (agent:agent-run-handle run)) nil)
+  (let ((turn (agent:agent-run-in-flight-turn run)))
+    (when turn
+      (setf (agent:agent-run-turns run) (remove turn (agent:agent-run-turns run) :test #'eq)
+            (agent:agent-run-in-flight-turn run) nil))))
+
+(defun %loop-start-turn (program text)
+  "Loop thread: send TEXT (mentions expanded) as the next user message."
+  (let ((ok (%turn-callback program))
+        (err (%turn-error-callback program)))
+    (handler-case
+        (let ((prompt (expand-mentions text (%cp-cwd program)))
+              (run (%cp-run program)))
+          (setf (%cp-handle program)
+                (if run
+                    (progn (%reopen-run run)
+                           (agent:continue-ai-agent-async run prompt
+                                                          :callback ok :error-callback err))
+                    (agent:run-ai-agent-async (%cp-agent program) prompt
+                                              :on-event (%program-agent-event program)
+                                              :callback ok :error-callback err))))
+      (error (e) (funcall err e)))))
+
+(defun %proposed-p (inv)
+  (eq :proposed (agent:agent-invocation-status inv)))
+
+(defun %approve (program inv always)
+  (let ((run (%cp-run program)))
+    (when (and run (%proposed-p inv))
+      (handler-case (agent:approve-invocation run inv :always always)
+        (settings-error (e)
+          ;; The rule could not be saved; the user still said yes.
+          (%send program (list :error (%message-text e)))
+          (when (%proposed-p inv)
+            (agent:approve-invocation run inv)))))))
+
+(defun %deny (program inv feedback all)
+  (let ((run (%cp-run program)))
+    (when (and run (%proposed-p inv))
+      (agent:deny-invocation run inv :feedback (and feedback (plusp (length feedback)) feedback)
+                                     :all all))))
+
+(defun %maybe-resume (program)
+  (let ((run (%cp-run program)))
+    (when (and run
+               (member (agent:agent-run-finish-reason run) '(:approval :deferred))
+               (notany #'%proposed-p (agent:agent-run-invocations run)))
+      (let ((err (%turn-error-callback program)))
+        (handler-case
+            (setf (%cp-handle program)
+                  (agent:resume-ai-agent-async run :callback (%turn-callback program)
+                                                   :error-callback err))
+          (error (e) (funcall err e)))))))
+
+(defun %cancel (program)
+  (let ((handle (%cp-handle program)))
+    (when handle
+      (agent:cancel-agent-run handle))))
+
+(defun %set-model (program designator)
+  (handler-case
+      (multiple-value-bind (backend name model)
+          (resolve-model designator :providers (%cp-providers program) :env (%cp-env program))
+        (declare (ignore name))
+        (let ((agent (%cp-agent program)))
+          (setf (agent:ai-agent-backend agent) backend
+                (agent:ai-agent-model agent) model))
+        (%send program (list :model-set designator)))
+    (model-not-found (c)
+      (%send program (list :error (%message-text c))))))
+
+(defun %set-permission-mode (program mode)
+  (let* ((settings (merge-settings (%cp-settings program) (make-settings :permission-mode mode)))
+         (agent (%cp-agent program))
+         (agent-settings (agent:ai-agent-settings agent)))
+    (setf (%cp-mode program) mode
+          (agent:ai-agent-permissions agent) (%agent-permissions settings)
+          (getf (agent:agent-settings-extra agent-settings) :permission-policy)
+          ;; The run's settings are this object (RUN-AI-AGENT-ASYNC without
+          ;; :settings uses the agent's), read on every permission check.
+          (settings-permission-policy settings))))
+
+;;; Effects (UI thread).
+
+(defun %run-effect (program effect)
+  (destructuring-bind (kind &rest args) effect
+    (ecase kind
+      (:run (setf (%cp-interrupted program) nil)
+       (%on-loop program (lambda () (%loop-start-turn program (first args)))))
+      (:cancel (setf (%cp-interrupted program) t)
+       (%on-loop program (lambda () (%cancel program))))
+      (:approve (destructuring-bind (inv &key always) args
+                  (%on-loop program (lambda () (%approve program inv always)))))
+      (:deny (destructuring-bind (inv &key feedback all) args
+               (%on-loop program (lambda () (%deny program inv feedback all)))))
+      (:resume (%on-loop program (lambda () (%maybe-resume program))))
+      (:restore-input (setf (w:text-input-value (code-program-input program)) (first args)))
+      (:new-conversation (%on-loop program (lambda () (setf (%cp-run program) nil
+                                                            (%cp-handle program) nil))))
+      (:set-model (let ((designator (first args)))
+                    (%on-loop program (lambda () (%set-model program designator)))))
+      (:set-permission-mode (let ((mode (first args)))
+                              (%on-loop program
+                                        (lambda () (%set-permission-mode program mode)))))
+      (:quit nil))))
+
+(defun %interrupt-wins (program event)
+  "EVENT, except that a turn end the user already interrupted is :canceled: an
+Esc that raced the model's last answer still interrupts the turn (the queue
+goes back to the input)."
+  (if (and (eq :turn-end (first event))
+           (%cp-interrupted program)
+           (member (getf (rest event) :reason) '(:stop :max-steps)))
+      (list :turn-end :reason :canceled)
+      event))
+
+(defun %apply-event (program event)
+  "Feed EVENT to the core and carry out its effects. → NIL."
+  (when (eq :turn-end (first event))
+    (setf event (%interrupt-wins program event))
+    (unless (eq :approval (getf (rest event) :reason))
+      (setf (%cp-interrupted program) nil)))
+  (multiple-value-bind (state effects) (interactive-update (code-program-state program) event)
+    (declare (ignore state))
+    (incf (%cp-generation program))
+    (dolist (effect effects)
+      (%run-effect program effect)))
+  nil)
+
+(defun %sync-widgets (program)
+  "Make the dialog, focus and spinner match the state. → a command or NIL."
+  (let* ((state (code-program-state program))
+         (input (code-program-input program))
+         (approvals (state-approvals state))
+         (spinner (%cp-spinner program)))
+    (cond ((null approvals)
+           (setf (code-program-dialog program) nil
+                 (%cp-dialog-invocation program) nil
+                 (w:widget-focused-p input) t))
+          ((not (eq (first approvals) (%cp-dialog-invocation program)))
+           (let* ((n (length (%state-pending state)))
+                  (i (1+ (- n (length approvals)))))
+             (setf (code-program-dialog program)
+                   (make-instance 'w:confirm-dialog
+                                  :title (if (> n 1)
+                                             (format nil "Permission (~d of ~d)" i n)
+                                             "Permission")
+                                  :message (approval-message (%cp-cwd program) (first approvals))
+                                  :choices +approval-choices+
+                                  :feedback-choice :reject)
+                   (%cp-dialog-invocation program) (first approvals)
+                   (w:widget-focused-p input) nil))))
+    (cond ((and (state-busy-p state) (not (w:spinner-active-p spinner)))
+           (w:spinner-start spinner))
+          ((and (not (state-busy-p state)) (w:spinner-active-p spinner))
+           (w:spinner-stop spinner))
+          (t nil))))
+
+(defun %commands (&rest commands)
+  (let ((commands (remove nil commands)))
+    (cond ((null commands) nil)
+          ((null (rest commands)) (first commands))
+          (t (apply #'tui:batch commands)))))
+
+(defmethod tui:tui-init ((program code-program))
+  (setf (%cp-tui program) tui:*tui*
+        (%cp-files program) (handler-case (project-files (%cp-cwd program))
+                           (error () '())))
+  (setf (%cp-thread program)
+        (bt:make-thread (lambda () (%agent-thread-main program))
+                        :name "cl-stack-code agent"))
+  (let ((prompt (%cp-prompt program)))
+    (when prompt
+      (%apply-event program (list :submit prompt))))
+  (values program (%sync-widgets program)))
+
+(defun %key-event (program message)
+  "A key MESSAGE. → a command or NIL."
+  (let* ((key (tui:key-message-key message))
+         (ctrl (member :ctrl (tui:key-message-modifiers message)))
+         (state (code-program-state program))
+         (input (code-program-input program))
+         (dialog (code-program-dialog program)))
+    (cond
+      ((eq :release (tui:key-message-action message)) nil)
+      ((and ctrl (eq key :c))
+       (cond ((state-busy-p state) (%apply-event program '(:interrupt)))
+             ((plusp (length (w:text-input-value input)))
+              (setf (w:text-input-value input) "")
+              nil)
+             (t (%apply-event program '(:quit)))))
+      ((and ctrl (eq key :d))
+       (when (and (null dialog) (string= "" (w:text-input-value input)))
+         (%apply-event program '(:quit))))
+      ((member key '(:page-up :page-down))
+       (w:widget-update (%cp-viewport program) message)
+       nil)
+      (dialog
+       (multiple-value-bind (widget command event) (w:widget-update dialog message)
+         (declare (ignore widget))
+         (cond ((w:confirm-event-p event)
+                (%apply-event program (list :reply (w:confirm-event-choice event)
+                                            (w:confirm-event-feedback event)))
+                command)
+               ((w:cancel-event-p event)
+                (%apply-event program '(:interrupt))
+                command)
+               (t command))))
+      (t
+       (multiple-value-bind (widget command event) (w:widget-update input message)
+         (declare (ignore widget))
+         (cond ((w:submit-event-p event)
+                (%apply-event program (list :submit (w:submit-event-text event)))
+                command)
+               ((w:cancel-event-p event)
+                (%apply-event program '(:interrupt))
+                command)
+               (t command)))))))
+
+(defmethod tui:tui-update ((program code-program) model message)
+  (let ((command
+          (cond ((consp message)
+                 (if (eq :%cp-files (first message))
+                     (progn (when (second message)
+                              (setf (%cp-files program) (second message)))
+                            nil)
+                     (%apply-event program message)))
+                ((tui:key-message-p message) (%key-event program message))
+                ((tui:mouse-message-p message)
+                 (w:widget-update (%cp-viewport program) message)
+                 nil)
+                ((tui:paste-message-p message)
+                 (nth-value 1 (w:widget-update (or (code-program-dialog program)
+                                                   (code-program-input program))
+                                               message)))
+                ((tui:tick-message-p message)
+                 (nth-value 1 (w:widget-update (%cp-spinner program) message)))
+                (t nil))))
+    (let ((sync (%sync-widgets program)))
+      (values model
+              (if (state-quit-p (code-program-state program))
+                  :quit
+                  (%commands command sync))))))
+
+;;; The view.
+
+(defun %input-rows (input width)
+  "Rows the text input draws its text in at WIDTH (as its view wraps)."
+  (let ((tw (max 1 (- width (w:runs-width (w:text-input-prompt input))))))
+    (multiple-value-bind (crow ccol) (w:text-input-cursor input)
+      (loop for line in (w:text-input-lines input)
+            for i from 0
+            sum (let* ((cells (w:runs-width line))
+                       (rows (max 1 (ceiling cells tw))))
+                  (if (and (= i crow) (= ccol (length line)) (plusp cells) (zerop (mod cells tw)))
+                      (1+ rows)
+                      rows))))))
+
+(defun %menu-rows (input)
+  (if (w:text-input-completing-p input)
+      (min (length (w:text-input-completion-candidates input))
+           (w:text-input-completion-max-items input))
+      0))
+
+(defun %dialog-rows (dialog width)
+  (+ 7
+     (length (w:wrap-runs (w:confirm-dialog-message dialog) (max 1 (- width 4))))
+     ;; The feedback prompt and its input row.
+     (if (eq :feedback (w:confirm-dialog-mode dialog)) 2 0)))
+
+(defun %first-line (text)
+  (subseq text 0 (or (position #\Newline text) (length text))))
+
+(defun %queued-rows (state)
+  (let* ((queue (state-queue state))
+         (shown (subseq queue 0 (min 3 (length queue))))
+         (more (- (length queue) (length shown))))
+    (append (mapcar (lambda (text) (format nil "  queued: ~a" (%first-line text))) shown)
+            (when (plusp more)
+              (list (format nil "  … +~d queued" more))))))
+
+(defun %viewport-lines (program width)
+  "Give the viewport the transcript lines for WIDTH when they changed."
+  (let* ((state (code-program-state program))
+         (key (list (%cp-generation program) width (state-busy-p state))))
+    (unless (equal key (%cp-lines-key program))
+      (setf (w:viewport-lines (%cp-viewport program))
+            (transcript-lines (state-transcript state) width
+                              :streaming (state-busy-p state))
+            (%cp-lines-key program) key))))
+
+(defmethod tui:tui-view ((program code-program) model canvas)
+  (declare (ignore model))
+  (let* ((width (tui:canvas-cols canvas))
+         (height (tui:canvas-rows canvas))
+         (state (code-program-state program))
+         (busy (state-busy-p state))
+         (dialog (code-program-dialog program))
+         (input (code-program-input program))
+         (status (%cp-status program))
+         (bottom (max 0 (if dialog
+                            (min (- height 2) (%dialog-rows dialog width))
+                            (min 8 (+ (%input-rows input width) (%menu-rows input))))))
+         (bottom-y (- height 1 bottom))
+         (rule-y (1- bottom-y))
+         (extra (if (and busy (not dialog)) (%queued-rows state) '()))
+         (spinner-y (and busy (not dialog) (1- rule-y)))
+         (top (max 0 (- rule-y (if spinner-y 1 0) (length extra)))))
+    (when (or (zerop width) (zerop height))
+      (return-from tui:tui-view nil))
+    (multiple-value-bind (left right) (status-line-text state)
+      (setf (w:status-line-left status) left
+            (w:status-line-right status) right))
+    (w:widget-view status (tui:sub-canvas canvas 0 (1- height) width 1))
+    (when (plusp bottom)
+      (w:widget-view (or dialog input) (tui:sub-canvas canvas 0 bottom-y width bottom)))
+    (when (>= rule-y 0)
+      (tui:draw-text canvas 0 rule-y (make-string width :initial-element #\─)))
+    (when (and spinner-y (>= spinner-y 0))
+      (w:widget-view (%cp-spinner program) (tui:sub-canvas canvas 0 spinner-y width 1))
+      (loop for row in extra
+            for y from (- spinner-y (length extra))
+            when (>= y 0)
+              do (tui:draw-text canvas 0 y row)))
+    (%viewport-lines program width)
+    (w:widget-view (%cp-viewport program) (tui:sub-canvas canvas 0 0 width top))))
+
+;;; Closing.
+
+(defun %join-thread (thread seconds)
+  "Wait up to SECONDS for THREAD to end. → true when it ended."
+  (let ((deadline (+ (get-internal-real-time) (* seconds internal-time-units-per-second))))
+    (loop while (and (bt:thread-alive-p thread) (< (get-internal-real-time) deadline))
+          do (sleep 0.01))
+    (not (bt:thread-alive-p thread))))
 
 (defun close-code-program (program)
   "Close PROGRAM's shell tools and event loop. Idempotent. → NIL."
-  (declare (ignore program))
-  (%not-implemented 'close-code-program))
-
-(defmethod tui:tui-init ((program code-program))
-  (%not-implemented 'tui-init))
-
-(defmethod tui:tui-update ((program code-program) model message)
-  (declare (ignore model message))
-  (%not-implemented 'tui-update))
-
-(defmethod tui:tui-view ((program code-program) model canvas)
-  (declare (ignore model canvas))
-  (%not-implemented 'tui-view))
+  (unless (%cp-closed program)
+    (setf (%cp-stopping program) t)
+    (let* ((thread (%cp-thread program))
+           (eb (%cp-event-backend program))
+           (el (%cp-event-loop program))
+           (ended (or (null thread)
+                      (progn
+                        (when (bt:thread-alive-p thread)
+                          (event:wake-call eb el (lambda ()
+                                                   (%cancel program)
+                                                   (event:stop eb el))))
+                        (%join-thread thread 10)))))
+      (setf (%cp-closed program) t)
+      (let ((shell (second (%cp-sources program))))
+        (when shell
+          (tools:close-shell-tools shell)))
+      ;; Never free a loop a thread may still run (CLOSE-EVENT-LOOP: "once RUN
+      ;; has returned").
+      (when ended
+        (event:close-event-loop eb el))))
+  nil)
 
 (defun %run-interactive (inv &key output input providers user-config-dir getenv)
   "RUN-CLI without -p (see the file header). → exit code."
-  (declare (ignore inv output input providers user-config-dir getenv))
-  (%not-implemented '%run-interactive))
+  (when (invocation-output-format-given-p inv)
+    (error 'code-usage-error
+           :message "--output-format needs -p (--print): the interactive mode has no output format"))
+  (let ((program (make-code-program inv :providers providers :user-config-dir user-config-dir
+                                        :getenv (or getenv #'uiop:getenv))))
+    (unwind-protect
+         (progn
+           (unless (and (eq input *standard-input*)
+                        (eq output *standard-output*)
+                        (tty:tty-available-p))
+             (error 'code-usage-error
+                    :message "the interactive mode needs a terminal on standard input and output; use -p PROMPT for a headless run"))
+           (handler-case (tui:run-tui program :backend (tty:make-tty-backend) :mouse t)
+             (tty:tty-not-a-terminal (e)
+               (error 'code-usage-error
+                      :message (format nil "~a; the interactive mode needs a terminal: use -p PROMPT for a headless run" e))))
+           0)
+      (close-code-program program))))

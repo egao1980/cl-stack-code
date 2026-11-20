@@ -152,7 +152,3 @@
 
 (defparameter +version+ "0.2.0"
   "The product version, as in the .asd.")
-
-(defun %not-implemented (name)
-  "Contract stub (H3b): the implementation removes this function and every call."
-  (error "~a is not implemented yet (cl-stack-code H3b contract)" name))

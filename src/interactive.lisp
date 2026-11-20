@@ -138,18 +138,210 @@ while approvals wait).")
   "→ the invocations still waiting for an answer, oldest first: the pending
 ones of the last :approval turn end that were not answered with :reply and
 whose AGENT-INVOCATION-STATUS is still :proposed."
-  (declare (ignore state))
-  (%not-implemented 'state-approvals))
+  (let ((answered (%state-answered state)))
+    (remove-if-not (lambda (inv)
+                     (and (not (member inv answered :test #'eq))
+                          (eq :proposed (agent:agent-invocation-status inv))))
+                   (%state-pending state))))
+
+;;; Helpers. Each returns the effects it adds, as a list.
+
+(defun %add-entry (state &rest initargs)
+  (let ((entry (apply #'make-entry initargs)))
+    (setf (state-transcript state) (append (state-transcript state) (list entry)))
+    entry))
+
+(defun %blank-text-p (text)
+  (every (lambda (c) (member c '(#\Space #\Tab #\Newline #\Return #\Page))) text))
+
+(defun %core-start-turn (state text)
+  "A :user entry for TEXT, busy, → ((:run TEXT))."
+  (%add-entry state :kind :user :text text)
+  (setf (state-busy-p state) t)
+  (list (list :run text)))
+
+(defun %split-command (text)
+  "→ (values command argument) of a command line \"/NAME ARG\"."
+  (let* ((text (string-trim '(#\Space #\Tab #\Newline #\Return) text))
+         (gap (position-if (lambda (c) (member c '(#\Space #\Tab #\Newline #\Return))) text)))
+    (if gap
+        (values (subseq text 0 gap)
+                (string-trim '(#\Space #\Tab #\Newline #\Return) (subseq text gap)))
+        (values text ""))))
+
+(defun %quit-effects (state)
+  (setf (state-quit-p state) t)
+  (if (state-busy-p state)
+      (list (list :cancel) (list :quit))
+      (list (list :quit))))
+
+(defun %rule-text (rule)
+  (let ((form (format-permission-rule rule)))
+    (format nil "~(~a~) ~a" (agent:permission-rule-effect rule)
+            (if (stringp form) form (json:encode form)))))
+
+(defun %permissions-notice (state)
+  (format nil "permission mode: ~a~{~%~a~}"
+          (permission-mode-name (state-permission-mode state))
+          (mapcar #'%rule-text (state-rules state))))
+
+(defun %command (state text)
+  "Run the command line TEXT. → effects."
+  (multiple-value-bind (command argument) (%split-command text)
+    (let ((busy (state-busy-p state)))
+      (cond
+        ((string= command "/help")
+         (%add-entry state :kind :notice :text +help-text+)
+         '())
+        ((string= command "/exit") (%quit-effects state))
+        ((and busy (member command '("/clear" "/model" "/permissions") :test #'string=))
+         (%add-entry state :kind :error
+                         :text (format nil "~a is not available while a turn runs (Esc interrupts it)"
+                                       command))
+         '())
+        ((string= command "/clear")
+         (setf (state-transcript state) '()
+               (state-usage state) (list 0 0 0 0))
+         (list (list :new-conversation)))
+        ((string= command "/model")
+         (if (zerop (length argument))
+             (progn (%add-entry state :kind :notice
+                                      :text (format nil "model: ~a" (state-model state)))
+                    '())
+             (list (list :set-model argument))))
+        ((string= command "/permissions")
+         (cond ((zerop (length argument))
+                (%add-entry state :kind :notice :text (%permissions-notice state))
+                '())
+               ((parse-permission-mode argument)
+                (let ((mode (parse-permission-mode argument)))
+                  (setf (state-permission-mode state) mode)
+                  (%add-entry state :kind :notice
+                                    :text (format nil "permission mode: ~a"
+                                                  (permission-mode-name mode)))
+                  (list (list :set-permission-mode mode))))
+               (t
+                (%add-entry state :kind :error
+                                  :text (format nil "unknown permission mode ~s: use ~{~a~^, ~}"
+                                                argument +permission-mode-names+))
+                '())))
+        (t
+         (%add-entry state :kind :error
+                           :text (format nil "unknown command ~a: try /help" command))
+         '())))))
+
+(defun %submit (state text)
+  (cond ((%blank-text-p text) '())
+        ((char= #\/ (char (string-left-trim '(#\Space #\Tab #\Newline #\Return) text) 0))
+         (%command state text))
+        ((state-busy-p state)
+         (setf (state-queue state) (append (state-queue state) (list text)))
+         '())
+        (t (%core-start-turn state text))))
+
+(defun %core-part (state text)
+  (let ((last (car (last (state-transcript state)))))
+    (if (and last (eq :assistant (entry-kind last)))
+        (setf (entry-text last) (concatenate 'string (entry-text last) text))
+        (%add-entry state :kind :assistant :text text)))
+  '())
+
+(defun %core-invocation (state inv)
+  (let* ((id (agent:agent-invocation-id inv))
+         (entry (find-if (lambda (e) (and (eq :tool (entry-kind e)) (equal id (entry-id e))))
+                         (state-transcript state))))
+    (unless entry
+      (setf entry (%add-entry state :kind :tool :id id :name (agent:agent-invocation-name inv))))
+    (setf (entry-input entry) (agent:agent-invocation-arguments inv)
+          (entry-status entry) (agent:agent-invocation-status inv)
+          (entry-result entry) (let ((r (agent:agent-invocation-result inv)))
+                                 (if (or (null r) (stringp r)) r (princ-to-string r)))
+          (entry-error-p entry) (and (agent:agent-invocation-error-p inv) t)))
+  '())
+
+(defun %on-turn-end (state reason pending message)
+  (ecase reason
+    (:approval
+     (setf (%state-pending state) (copy-list pending)
+           (%state-answered state) '())
+     '())
+    ((:stop :max-steps)
+     (setf (state-busy-p state) nil
+           (%state-pending state) '()
+           (%state-answered state) '())
+     (when (and (eq reason :max-steps) message)
+       (%add-entry state :kind :notice :text message))
+     (let ((next (pop (state-queue state))))
+       (if next (%core-start-turn state next) '())))
+    ((:canceled :failed)
+     (setf (state-busy-p state) nil
+           (%state-pending state) '()
+           (%state-answered state) '())
+     (if (eq reason :canceled)
+         (%add-entry state :kind :notice :text "interrupted")
+         (%add-entry state :kind :error :text (or message "the turn failed")))
+     (let ((queued (shiftf (state-queue state) '())))
+       (when queued
+         (list (list :restore-input (format nil "~{~a~^~%~}" queued))))))))
+
+(defun %reply (state choice feedback)
+  (let ((approvals (state-approvals state)))
+    (when approvals
+      (let ((inv (first approvals)))
+        (setf (%state-answered state)
+              (append (%state-answered state)
+                      (if (eq choice :reject-all) approvals (list inv))))
+        (list (ecase choice
+                (:once (list :approve inv :always nil))
+                (:always (list :approve inv :always t))
+                (:reject (list :deny inv :feedback feedback :all nil))
+                (:reject-all (list :deny inv :feedback feedback :all t)))
+              (list :resume))))))
 
 (defun interactive-update (state event)
   "→ (values STATE effects) after EVENT (see the file header)."
-  (declare (ignore state event))
-  (%not-implemented 'interactive-update))
+  (let ((effects
+          (destructuring-bind (kind &rest args) event
+            (ecase kind
+              (:submit (%submit state (first args)))
+              (:interrupt (cond ((state-approvals state) (%reply state :reject-all nil))
+                                ((state-busy-p state) (list (list :cancel)))
+                                (t '())))
+              (:quit (%quit-effects state))
+              (:part (%core-part state (first args)))
+              (:usage (setf (state-usage state) (mapcar #'+ (state-usage state) (first args)))
+               '())
+              (:invocation (%core-invocation state (first args)))
+              (:turn-end (destructuring-bind (&key reason pending message) args
+                           (%on-turn-end state reason pending message)))
+              (:reply (%reply state (first args) (second args)))
+              (:model-set (setf (state-model state) (first args))
+               (%add-entry state :kind :notice :text (format nil "model: ~a" (first args)))
+               '())
+              (:notice (%add-entry state :kind :notice :text (first args)) '())
+              (:error (%add-entry state :kind :error :text (first args)) '())))))
+    (values state effects)))
+
+(defun %home-relative (dir)
+  "DIR (a native directory namestring) with the user's home shown as \"~/\"."
+  (let ((home (uiop:native-namestring (user-homedir-pathname))))
+    (if (and (plusp (length home)) (uiop:string-prefix-p home dir))
+        (concatenate 'string "~" (subseq dir (1- (length home))))
+        dir)))
 
 (defun status-line-text (state)
   "→ (values left right) of the status line:
 left  \" <model> · <permission mode name> · <cwd>\", the cwd as a native
       directory namestring with the user's home directory prefix shown as \"~/\";
 right \"<input> in · <output> out \", the summed input and output tokens."
-  (declare (ignore state))
-  (%not-implemented 'status-line-text))
+  (let ((cwd (state-cwd state)))
+    (values (format nil " ~a · ~a · ~a"
+                    (state-model state)
+                    (permission-mode-name (state-permission-mode state))
+                    (if cwd
+                        (%home-relative (uiop:native-namestring
+                                         (uiop:ensure-directory-pathname cwd)))
+                        ""))
+            (destructuring-bind (input output &rest more) (state-usage state)
+              (declare (ignore more))
+              (format nil "~d in · ~d out " input output)))))
