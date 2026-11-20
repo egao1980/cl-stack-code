@@ -89,13 +89,5 @@
 
 (in-package #:cl-stack-code)
 
-;;; H3a contract: the package, conditions, the SETTINGS and INVOCATION classes
-;;; with their readers, CONDITION-EXIT-CODE and the constants are given. Every
-;;; function body that does work calls %NOT-IMPLEMENTED. The implementation
-;;; removes %NOT-IMPLEMENTED and every call to it.
-
-(defun %not-implemented (what)
-  (error "cl-stack-code: ~a is not implemented (H3a contract)" what))
-
 (defparameter +version+ "0.1.0"
   "The product version, as in the .asd.")
