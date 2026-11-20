@@ -9,8 +9,10 @@
   "Feedback the model gets when an ask is refused in headless mode.")
 
 (defparameter +plan-mode-feedback+
-  "Plan mode is read-only: describe the change instead of making it."
-  "Feedback of plan mode's policy denies.")
+  "You are in plan mode: your edits and shell commands run in a copy of the project (the working directory above), not in the project itself. Make the change there and run the tests there; nothing reaches the project until the user approves the projected change."
+  "H5a: the system prompt section of a plan run (ASSEMBLE-SYSTEM-PROMPT :PLAN).
+Until 0.3 it was the feedback of plan mode's read-only policy, which H5a
+removed.")
 
 (defparameter +explicit-resource-prefixes+
   '("path:" "bash:" "program:" "cd:" "read:" "write:" "job:")
@@ -128,14 +130,12 @@ parentheses; empty pieces dropped."
 (defparameter +edit-tool-names+ '("write" "edit" "multi_edit")
   "The file tools a mode's base rules decide.")
 
-(defparameter +plan-denied-tool-names+ '("write" "edit" "multi_edit" "bash" "job_input")
-  "The tools plan mode's policy denies.")
-
 (defun %mode-base-rules (mode)
   (case (or mode :default)
     (:default (mapcar (lambda (tool) (agent:make-permission-rule tool "*" :ask))
                       +edit-tool-names+))
-    (:accept-edits (mapcar (lambda (tool) (agent:make-permission-rule tool "*" :allow))
+    ;; H5a: plan mode edits the area, so its edits are allowed as in acceptEdits.
+    ((:accept-edits :plan) (mapcar (lambda (tool) (agent:make-permission-rule tool "*" :allow))
                            +edit-tool-names+))
     (t '())))
 
@@ -148,12 +148,11 @@ SETTINGS-ALLOW, SETTINGS-ASK, SETTINGS-DENY."
           (settings-deny settings)))
 
 (defun settings-permission-policy (settings)
-  "Plan mode → deny rules for write, edit, multi_edit, bash and job_input with
-+PLAN-MODE-FEEDBACK+ (the run's :permission-policy). Other modes → NIL."
-  (when (eq (settings-permission-mode settings) :plan)
-    (mapcar (lambda (tool)
-              (agent:make-permission-rule tool "*" :deny :feedback +plan-mode-feedback+))
-            +plan-denied-tool-names+)))
+  "The run's :permission-policy for SETTINGS. NIL in every mode since H5a:
+plan mode no longer denies edits and the shell, it runs them in the plan's
+area (src/plans.lisp). Kept as the hook for a mode that needs a policy."
+  (declare (ignore settings))
+  nil)
 
 (defun hidden-tool-names (settings names)
   "The members of NAMES (in order) that a deny rule with resource \"*\" in

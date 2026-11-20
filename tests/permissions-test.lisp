@@ -64,7 +64,9 @@
   (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow))
              (rule-lists (settings-permission-rules (make-settings :permission-mode :accept-edits)))))
   (ok (null (settings-permission-rules (make-settings :permission-mode :bypass-permissions))))
-  (ok (null (settings-permission-rules (make-settings :permission-mode :plan)))))
+  ;; H5a: plan mode edits the area, so its base rules are acceptEdits'.
+  (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow))
+             (rule-lists (settings-permission-rules (make-settings :permission-mode :plan))))))
 
 (deftest permission-rule-order
   (let ((s (merge-settings (make-settings :allow (allow "bash(git *)") :deny (deny "bash(program:rm)"))
@@ -91,13 +93,10 @@
     (ok (eq :allow (a:permission-rules-effect rules "bash" '("bash:git status"))))))
 
 (deftest permission-plan-policy
+  ;; H5a: no mode has a policy; plan mode runs edits and the shell in its area.
   (ok (null (settings-permission-policy (make-settings))))
   (ok (null (settings-permission-policy (make-settings :permission-mode :accept-edits))))
-  (let ((policy (settings-permission-policy (make-settings :permission-mode :plan))))
-    (ok (equal '(("write" "*" :deny) ("edit" "*" :deny) ("multi_edit" "*" :deny)
-                 ("bash" "*" :deny) ("job_input" "*" :deny))
-               (rule-lists policy)))
-    (ok (every (lambda (r) (equal +plan-mode-feedback+ (a:permission-rule-feedback r))) policy))))
+  (ok (null (settings-permission-policy (make-settings :permission-mode :plan)))))
 
 (deftest permission-hidden-tools
   (let ((names '("read" "write" "edit" "bash" "job_output" "job_input" "job_kill" "job_list")))
@@ -116,4 +115,5 @@
   (ok (has "headless" +headless-denial-feedback+))
   (ok (has "--allowed-tools" +headless-denial-feedback+))
   (ok (has "bypassPermissions" +headless-denial-feedback+))
-  (ok (has "read-only" +plan-mode-feedback+)))
+  (ok (has "plan mode" +plan-mode-feedback+))
+  (ok (has "copy of the project" +plan-mode-feedback+)))

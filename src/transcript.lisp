@@ -66,12 +66,15 @@
 ;;;               - any other status: nothing more
 ;;;   :notice     the text wrapped at WIDTH
 ;;;   :error      "error: " + text, wrapped at WIDTH
+;;;   :plan       (H5a) "● plan <id8>: N file[s] changed" (ID the plan id,
+;;;               N = (length INPUT), INPUT the plan changes), then each line
+;;;               of (MD:RENDER-DIFF-LINES text (- WIDTH 2)) after "  "
 ;;; Styles are free; tests compare W:RUNS-STRING of each line.
 
 (defstruct (entry (:constructor make-entry
                       (&key kind text id name input status result error-p)))
   "One transcript block (see the file header)."
-  (kind :notice :type (member :user :assistant :tool :notice :error))
+  (kind :notice :type (member :user :assistant :tool :notice :error :plan))
   (text "")
   (id nil)
   (name nil)
@@ -316,7 +319,22 @@ the others."
     (:tool (%tool-entry-lines entry width))
     (:notice (w:wrap-runs (entry-text entry) width))
     (:error (w:wrap-runs (list (w:text-run (concatenate 'string "error: " (entry-text entry))))
-                         width))))
+                         width))
+    (:plan (%plan-entry-lines entry width))))
+
+(defun %plan-entry-lines (entry width)
+  "H5a: the lines of a :plan ENTRY (see the file header)."
+  (let* ((id (or (entry-id entry) ""))
+         (n (length (entry-input entry)))
+         (header (w:truncate-runs
+                  (list (w:text-run (format nil "● plan ~a: ~d file~:p changed"
+                                            (subseq id 0 (min 8 (length id))) n)
+                                    :bold t))
+                  width))
+         (text (or (entry-text entry) "")))
+    (cons header
+          (and (plusp (length text))
+               (%prefixed "  " (md:render-diff-lines text (max 1 (- width 2))))))))
 
 (defun transcript-lines (entries width &key streaming)
   "→ lines of runs showing ENTRIES at WIDTH (see the file header)."

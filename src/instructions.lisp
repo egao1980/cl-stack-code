@@ -93,19 +93,44 @@ project root (else the filesystem root) down to CWD. Blank files are left out."
           (%platform-name)
           (permission-mode-name mode)))
 
-(defun assemble-system-prompt (cwd &key tools backend settings user-config-dir)
+(defun %plan-environment-sections (cwd plan settings)
+  "H5a: the sections that replace the # Environment section in a plan run:
+  # Environment
+  - Working directory: <native PLAN-TOOL-ROOT of CWD>
+  - Project root: <native PLAN-ROOT, or \"none\" when CWD has no project root>
+  - Platform: <as without a plan>
+  - Permission mode: <mode name>
+  - Plan: <id> (<copy|git>), a copy of <native PLAN-PROJECT-DIR>
+then, as its own section, +PLAN-MODE-FEEDBACK+. → list of two strings."
+  (let ((cwd (%truename-directory cwd)))
+    (list (format nil "# Environment~%- Working directory: ~a~%- Project root: ~a~%- Platform: ~a~%- Permission mode: ~a~%- Plan: ~a (~(~a~)), a copy of ~a"
+                  (uiop:native-namestring (plan-tool-root plan cwd))
+                  (if (find-project-root cwd) (uiop:native-namestring (plan-root plan)) "none")
+                  (%platform-name)
+                  (permission-mode-name (settings-permission-mode settings))
+                  (plan-id plan)
+                  (plan-kind plan)
+                  (uiop:native-namestring (plan-project-dir plan)))
+          +plan-mode-feedback+)))
+
+(defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan)
   "→ (values prompt files). Sections joined by one blank line: steer's
 BUILD-SYSTEM-PROMPT for TOOLS (offered names) and BACKEND, the # Environment
 section, each instruction file as <instructions path=\"…\">…</instructions>,
-then SETTINGS-APPEND-SYSTEM-PROMPT. FILES is INSTRUCTION-FILES."
+then SETTINGS-APPEND-SYSTEM-PROMPT. FILES is INSTRUCTION-FILES. H5a: with a
+PLAN, the # Environment section is %PLAN-ENVIRONMENT-SECTIONS (the area's
+directories, the plan line, then +PLAN-MODE-FEEDBACK+); the instruction files
+are still CWD's own."
   (let* ((settings (or settings (make-settings)))
          (cwd (%truename-directory cwd))
          (files (instruction-files cwd :user-config-dir user-config-dir))
          (append-prompt (settings-append-system-prompt settings))
          (sections (append
-                    (list (steer:build-system-prompt :tools tools :model backend)
-                          (%environment-section cwd (find-project-root cwd)
-                                                (settings-permission-mode settings)))
+                    (list (steer:build-system-prompt :tools tools :model backend))
+                    (if plan
+                        (%plan-environment-sections cwd plan settings)
+                        (list (%environment-section cwd (find-project-root cwd)
+                                                    (settings-permission-mode settings))))
                     (mapcar #'%instruction-block files)
                     (and append-prompt (plusp (length append-prompt))
                          (list append-prompt)))))

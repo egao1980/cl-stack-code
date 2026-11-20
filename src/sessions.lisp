@@ -158,7 +158,7 @@ dashes are dropped)."
 (defstruct (turn-record (:constructor make-turn-record
                             (&key prompt turns replace-p (finish :stop) model
                                   (permission-mode :default) (usage (list 0 0 0 0))
-                                  steering (version +version+)))
+                                  steering plan (version +version+)))
                         (:conc-name record-))
   "One turn of a session. PROMPT is the user's message as typed (before @
 mentions were expanded). TURNS are the LLM-TURNs the turn added to the
@@ -170,7 +170,8 @@ does not write such records itself). FINISH is :STOP, :MAX-STEPS, :CANCELED
 or :FAILED. MODEL is the model designator the turn ran with,
 PERMISSION-MODE its mode keyword, USAGE (input output cache-read
 cache-write) summed over the turn's responses, STEERING the steering
-messages delivered into the turn, as typed, in order."
+messages delivered into the turn, as typed, in order. PLAN (H5a) is the
+PLAN-RECORD of the plan the turn ran in (plan mode), or NIL."
   (prompt "" :type string)
   (turns '() :type list)
   (replace-p nil)
@@ -179,6 +180,7 @@ messages delivered into the turn, as typed, in order."
   (permission-mode :default :type keyword)
   (usage (list 0 0 0 0) :type list)
   (steering '() :type list)
+  (plan nil :type list)
   (version +version+))
 
 (defparameter +record-finishes+ '(:stop :max-steps :canceled :failed))
@@ -188,9 +190,11 @@ messages delivered into the turn, as typed, in order."
 lists:
   (:format 1 :prompt S :turns (LLM:TURN-STATE …) :replace BOOL :finish K
    :model S-or-NIL :permission-mode K :usage (I O CR CW) :steering (S …)
-   :version S)"
+   :version S [:plan (:id S :kind K :base S :root S :status K)])
+The :PLAN key (H5a) is present only when the record has a plan."
   (check-type record turn-record)
-  (list :format +session-format+
+  (append
+   (list :format +session-format+
         :prompt (record-prompt record)
         :turns (mapcar #'llm:turn-state (record-turns record))
         :replace (and (record-replace-p record) t)
@@ -199,7 +203,9 @@ lists:
         :permission-mode (record-permission-mode record)
         :usage (copy-list (record-usage record))
         :steering (copy-list (record-steering record))
-        :version (record-version record)))
+        :version (record-version record))
+   (when (record-plan record)
+     (list :plan (copy-list (record-plan record))))))
 
 (defun %malformed-record (content &optional cause)
   (error 'session-error
@@ -212,7 +218,7 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                (handler-case (progn (getf content :format) t) (error () nil)))
     (%malformed-record content "not a plist"))
   (destructuring-bind (&key format prompt turns replace finish model permission-mode
-                            usage steering version &allow-other-keys)
+                            usage steering version plan &allow-other-keys)
       content
     (unless (eql format +session-format+) (%malformed-record content ":format"))
     (unless (stringp prompt) (%malformed-record content ":prompt"))
@@ -224,6 +230,8 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
       (%malformed-record content ":usage"))
     (unless (and (listp steering) (every #'stringp steering))
       (%malformed-record content ":steering"))
+    (unless (and (listp plan) (evenp (length plan)))
+      (%malformed-record content ":plan"))
     (make-turn-record :prompt prompt
                       :turns (mapcar #'llm:state-turn turns)
                       :replace-p (and replace t)
@@ -232,6 +240,7 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                       :permission-mode permission-mode
                       :usage (copy-list usage)
                       :steering (copy-list steering)
+                      :plan (copy-list plan)
                       :version version)))
 
 (defun revision-record (revision)
@@ -429,17 +438,36 @@ with \".\" (temporary files do). Otherwise SESSION-ERROR, before anything."
   (handler-case (null (probe-file file))
     (file-error () nil)))
 
+(defparameter +lock-io-retry-seconds+
+  #+(or windows win32) 1
+  #-(or windows win32) 0
+  "How long a lock file read or removal that fails while the file still
+exists is retried. On Windows a file another process (or thread) has open
+cannot be deleted (a sharing violation), and a file being deleted cannot be
+opened (delete pending): both last only as long as the other side's few
+microseconds of I/O on the lock file, so they are retried. POSIX has no such
+transient errors: 0, the first error is final.")
+
 (defun %lock-io (store file operation thunk)
   "→ THUNK's value, THUNK reading (OPERATION :READ) or removing (:DELETE) the
 lock FILE; NIL when FILE vanished meanwhile (another process released or
-broke the lock: the expected race). Any other file or stream error →
-SESSION-LOCK-ERROR."
-  (handler-case (funcall thunk)
-    ((or file-error stream-error) (e)
-      (if (%lock-file-gone-p file)
-          nil
-          (error 'session-lock-error :session (and store (session-id store))
-                                     :file file :operation operation :cause e)))))
+broke the lock: the expected race). A FILE-ERROR while FILE still exists
+is retried for +LOCK-IO-RETRY-SECONDS+ (Windows sharing violations); after
+that, and at once for any other stream error (undecodable text is not
+transient), → SESSION-LOCK-ERROR."
+  (let ((deadline (+ (get-internal-real-time)
+                     (round (* +lock-io-retry-seconds+ internal-time-units-per-second)))))
+    (flet ((fail (e)
+             (error 'session-lock-error :session (and store (session-id store))
+                                        :file file :operation operation :cause e)))
+      (loop
+        (handler-case (return (funcall thunk))
+          (file-error (e)
+            (cond ((%lock-file-gone-p file) (return nil))
+                  ((>= (get-internal-real-time) deadline) (fail e))
+                  (t (sleep 0.005))))
+          (stream-error (e)
+            (if (%lock-file-gone-p file) (return nil) (fail e))))))))
 
 (defun %read-lock-file (store file)
   (%lock-io store file :read
@@ -482,14 +510,16 @@ restart BREAK-LOCK while probing. → the token written into it."
           (return token)))
       ;; Two breakers of one stale lock may race for a moment; the lock
       ;; assumes one local filesystem and a 30 s dead holder (file header).
-      (when (restart-case (%stale-lock-p store file)
-              (break-lock ()
-                :report "Remove the session's lock file and take the lock (no other process may hold it)"
-                t))
-        (%remove-lock-file store file))
-      (when (> (get-internal-real-time) deadline)
-        (error 'session-locked :session (session-id store) :file file))
-      (sleep 0.01))))
+      ;; A lock just removed is retried at once, even past the deadline.
+      (let ((broken (and (restart-case (%stale-lock-p store file)
+                           (break-lock ()
+                             :report "Remove the session's lock file and take the lock (no other process may hold it)"
+                             t))
+                         (progn (%remove-lock-file store file) t))))
+        (unless broken
+          (when (> (get-internal-real-time) deadline)
+            (error 'session-locked :session (session-id store) :file file))
+          (sleep 0.01))))))
 
 (defun %release-lock (store token)
   "Remove STORE's lock file when it still holds TOKEN (ours). A lock file

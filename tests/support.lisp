@@ -13,6 +13,19 @@
     (ensure-directories-exist dir)
     (truename dir)))
 
+;;; git writes its object files read-only. POSIX unlinks them anyway (the
+;;; directory's mode decides); Windows refuses to delete a file with the
+;;; read-only attribute ("Access is denied"), so the attribute is cleared
+;;; first there.
+(defun delete-temp-base (base)
+  "Delete the temp directory BASE and everything under it."
+  (when (and (uiop:os-windows-p) (uiop:directory-exists-p base))
+    (uiop:run-program (list "attrib" "-R"
+                            (concatenate 'string (uiop:native-namestring base) "*")
+                            "/S" "/D")
+                      :output nil :error-output nil :ignore-error-status t))
+  (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))
+
 (defun subdir (dir rel)
   "Directory pathname REL (\"a/b/\") under DIR."
   (uiop:ensure-directory-pathname (merge-pathnames rel dir)))
@@ -50,7 +63,7 @@ pathname."
            (when git
              (ensure-directories-exist (subdir project ".git/")))
            (funcall fn (truename project) (truename config) base))
-      (uiop:delete-directory-tree base :validate t :if-does-not-exist :ignore))))
+      (delete-temp-base base))))
 
 (defmacro with-project ((project config &key (git t) base) entries &body body)
   "PROJECT and CONFIG: fresh directories (truenames) under one temp base;

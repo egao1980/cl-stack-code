@@ -32,6 +32,72 @@
 ;;;                    line on output, exit 0 (nothing when there are none).
 ;;;   Data directory   RUN-CLI :DATA-DIR, else USER-DATA-DIRECTORY with
 ;;;                    RUN-CLI's GETENV.
+;;;
+;;; H5a: plan mode (src/plans.lisp).
+;;;   Which runs       The effective mode is :PLAN (flag or settings), or a
+;;;                    plan flag is given: CHECK-PLAN-FLAGS first (exit 2 on
+;;;                    a bad combination), before anything is written.
+;;;   The plan         A resumed session whose head record has a PLAN with
+;;;                    status :OPEN → REOPEN-PLAN of its id (subtype
+;;;                    "reopened"). If it cannot be reopened (PLAN-NOT-FOUND),
+;;;                    or there is none, OPEN-PLAN on the project directory
+;;;                    (project root, else cwd) with :KIND from --plan-area
+;;;                    (default :AUTO), :DATA-DIR and the session's id
+;;;                    (subtype "opened"); a reopen that failed also writes
+;;;                    "cl-stack-code: plan OLD is no longer open; opened plan
+;;;                    NEW" to error-output. --plan-area git where the
+;;;                    project is not a git worktree → CODE-USAGE-ERROR
+;;;                    "--plan-area git: DIR is not a git worktree" (exit 2).
+;;;   The run          Tools rooted at PLAN-TOOL-ROOT; ASSEMBLE-SYSTEM-PROMPT
+;;;                    with :PLAN. Plan mode's base rules allow write, edit
+;;;                    and multi_edit (they are jailed to the area); bash and
+;;;                    job_input still ask, so -p refuses them unless a rule
+;;;                    allows them (the shell is not confined until R4d).
+;;;   stream-json      After "system" init: {"type":"plan","subtype":
+;;;                    "opened"|"reopened","plan_id","kind" ("copy"|"git"),
+;;;                    "area" (native namestring of PLAN-ROOT),"base"}. After
+;;;                    the run, before "result": {"type":"plan","subtype":
+;;;                    "projected","plan_id","changes":[{"path","kind"}],
+;;;                    "diff"} (kind "added" "removed" "modified"
+;;;                    "mode_changed"; diff = PLAN-DIFF-TEXT). With --apply,
+;;;                    then one of {"subtype":"applied","plan_id","changes"},
+;;;                    {"subtype":"rebased","plan_id","conflicts":[paths]},
+;;;                    {"subtype":"drift","plan_id","paths":[paths]} (abort).
+;;;   result           In plan runs only, "plan": {"id","kind","status"
+;;;                    ("open" "applied" "rebased" "discarded"),"area",
+;;;                    "base" (after a rebase: the new base),"changes" (as
+;;;                    projected),"diff","conflicts" (rebase; else [])}.
+;;;   text             The answer, then, when the projection has changes, one
+;;;                    empty line and PLAN-DIFF-TEXT. error-output gets one
+;;;                    line: "cl-stack-code: plan ID: N file[s] changed, not
+;;;                    applied (cl-stack-code -p --resume SESSION --apply
+;;;                    applies it)", "cl-stack-code: plan ID: no changes", or
+;;;                    with --apply "cl-stack-code: plan ID: applied N
+;;;                    file[s]" / the rebase line "cl-stack-code: plan ID:
+;;;                    rebased onto the working copy (conflicts in P, Q);
+;;;                    review it and --apply again" ("(no conflicts)" when
+;;;                    there are none).
+;;;   --apply          Only after a run whose subtype is "success": APPROVE-
+;;;                    PLAN, PLAN-DRIFT answered per --on-drift (abort, the
+;;;                    default → ABORT-APPROVAL; rebase → REBASE-PLAN;
+;;;                    overwrite → OVERWRITE-PLAN). Anything but :APPLIED /
+;;;                    :EMPTY fails the run (exit 1, subtype
+;;;                    "error_during_execution"): abort with a message naming
+;;;                    the paths and "--on-drift rebase or --on-drift
+;;;                    overwrite"; rebase with the rebase line above. A failed
+;;;                    or max-turns run applies nothing.
+;;;   Action only      --apply or --reject with --resume / --continue and no
+;;;                    prompt arguments: no run, no LLM call, INPUT not read,
+;;;                    no turn committed. The head record's open plan (none,
+;;;                    or not open → CODE-USAGE-ERROR "session ID has no open
+;;;                    plan", exit 2) is approved (as --apply above; text mode
+;;;                    prints the applied PLAN-DIFF-TEXT on output) or
+;;;                    rejected ("cl-stack-code: plan ID: discarded" on
+;;;                    error-output, nothing on output). json / stream-json:
+;;;                    the plan event of the action, then a "result" with
+;;;                    num_turns 0, "result" "", and "plan".
+;;;   Turn record      PLAN-RECORD of the plan after --apply, so a later
+;;;                    resume does not reopen an applied plan.
 
 ;;; Outcomes of a run that started, as conditions. RUN-CLI handles them like
 ;;; every other error: the message goes to ERROR-OUTPUT, the exit code comes
@@ -86,7 +152,11 @@ count is 0."
   (denials '())                               ; newest first
   (seen (make-hash-table :test #'equal))      ; ids with a tool_result
   (call-steps (make-hash-table :test #'equal))
-  (failure nil))                              ; first error inside the sink
+  (failure nil)                               ; first error inside the sink
+  ;; H5a
+  (plan nil)                                  ; the result's "plan" object, or NIL
+  (plan-text nil)                             ; text mode: the diff after the answer
+  (plan-failure nil))                         ; a condition that fails a finished run
 
 (defun %write-json-line (report object)
   (let ((out (%report-output report)))
@@ -185,7 +255,7 @@ the run is canceled and the error fails the run afterwards."
         (when run (agent:cancel-agent-run run))))))
 
 (defun %result-object (report subtype text error-message duration-ms)
-  (%json-object "type" "result"
+  (apply #'%json-object "type" "result"
                 "subtype" subtype
                 "is_error" (not (string= subtype "success"))
                 "result" text
@@ -194,7 +264,11 @@ the run is canceled and the error fails the run afterwards."
                 "duration_ms" duration-ms
                 "usage" (%usage-object (%report-usage report))
                 "permission_denials" (coerce (reverse (%report-denials report)) 'vector)
-                "session_id" (%report-session report)))
+                "session_id" (%report-session report)
+                ;; H5a: only in plan mode, so the other shapes are unchanged.
+                (if (%report-plan report)
+                    (list "plan" (%report-plan report))
+                    '())))
 
 ;;; Working directory, environment, HTTP.
 
@@ -350,6 +424,10 @@ on success."
   "Write the run's result to the report's output; signal the failure, if any."
   (multiple-value-bind (subtype condition)
       (%outcome run (or (%report-failure report) failure) interrupted max-turns)
+    ;; H5a: a plan step that failed after a good run (--apply on drift) fails it.
+    (when (and (null condition) (%report-plan-failure report))
+      (setf subtype "error_during_execution"
+            condition (%report-plan-failure report)))
     (let ((text (if (and run (not failure) (not (%report-failure report)))
                     (%trim-answer (agent:agent-run-text run))
                     ""))
@@ -361,6 +439,11 @@ on success."
            (let ((out (%report-output report)))
              (write-string text out)
              (terpri out)
+             ;; H5a: the projected diff, after one empty line.
+             (let ((diff (%report-plan-text report)))
+               (when (plusp (length diff))
+                 (terpri out)
+                 (write-string diff out)))
              (force-output out))))
         (t
          (%write-json-line report
@@ -380,7 +463,7 @@ on success."
     prompt))
 
 (defun %commit-headless-turn (report store prompt history failure interrupted
-                              designator mode error-output)
+                              designator mode error-output &optional plan)
   "Commit the turn of the run REPORT saw start, before its result is written.
 A conflict forks the turn into a new session: one stderr line, and the
 report's session id becomes the new one."
@@ -392,7 +475,8 @@ report's session id becomes the new one."
                                                            interrupted)
                                       :model designator
                                       :permission-mode mode
-                                      :usage (copy-list (%report-usage report)))))
+                                      :usage (copy-list (%report-usage report))
+                                      :plan (and plan (plan-record plan)))))
         (multiple-value-bind (revision went-to) (%commit-forking store record)
           (declare (ignore revision))
           (unless (eq went-to store)
@@ -400,6 +484,223 @@ report's session id becomes the new one."
                     (session-id store) (session-id went-to))
             (force-output error-output)
             (setf (%report-session report) (session-id went-to))))))))
+
+;;; H5a: plan mode in -p (see the "H5a" part of the file header).
+
+(defun %plan-action-only-p (inv)
+  "--apply or --reject with --resume / --continue and no prompt arguments:
+act on the session's open plan, no run, INPUT not read."
+  (and (or (invocation-apply-p inv) (invocation-reject-p inv))
+       (null (invocation-prompt inv))
+       (or (invocation-continue-p inv) (invocation-resume inv))
+       t))
+
+(defun %plan-run-p (inv mode)
+  "True when the run is a plan run (MODE :PLAN) or a plan flag was given
+(CHECK-PLAN-FLAGS then refuses the combination)."
+  (and (or (eq mode :plan)
+           (invocation-apply-p inv) (invocation-reject-p inv)
+           (invocation-on-drift inv) (invocation-plan-area inv))
+       t))
+
+(defun %plans-dir (cwd data-dir getenv)
+  (plans-directory cwd :data-dir (or data-dir (user-data-directory :getenv getenv))))
+
+(defun %head-plan-entry (source)
+  "The PLAN of SOURCE's head record (a plist), or NIL."
+  (let ((head (and source (session-head source))))
+    (and head (record-plan (revision-record head)))))
+
+(defun %change-kind-name (kind)
+  (substitute #\_ #\- (string-downcase (string kind))))
+
+(defun %changes-json (changes)
+  (map 'vector (lambda (c)
+                 (%json-object "path" (second c) "kind" (%change-kind-name (first c))))
+       changes))
+
+(defun %plan-object (plan status changes diff conflicts)
+  "The result's \"plan\" object."
+  (%json-object "id" (plan-id plan)
+                "kind" (string-downcase (string (plan-kind plan)))
+                "status" (string-downcase (string status))
+                "area" (uiop:native-namestring (plan-root plan))
+                "base" (plan-base plan)
+                "changes" (%changes-json changes)
+                "diff" diff
+                "conflicts" (coerce conflicts 'vector)))
+
+(defun %files-count (n)
+  (format nil "~d file~:p" n))
+
+(defun %rebase-line (plan conflicts)
+  (format nil "plan ~a: rebased onto the working copy (~:[no conflicts~;conflicts in ~:*~{~a~^, ~}~]); review it and --apply again"
+          (plan-id plan) conflicts))
+
+(defun %headless-approve (report plan inv)
+  "--apply: APPROVE-PLAN with PLAN-DRIFT answered per --on-drift; the
+applied / rebased / drift event; a failure for the report unless the plan
+was applied. → (values status result)."
+  (let ((on-drift (or (invocation-on-drift inv) :abort))
+        (drift '()))
+    (multiple-value-bind (result status)
+        (handler-bind ((plan-drift
+                         (lambda (c)
+                           (setf drift (plan-drift-paths c))
+                           (invoke-restart
+                            (find-restart (ecase on-drift
+                                            (:rebase 'rebase-plan)
+                                            (:overwrite 'overwrite-plan)
+                                            (:abort 'abort-approval))
+                                          c)))))
+          (approve-plan plan))
+      (ecase status
+        ((:applied :empty)
+         (%emit-event report "plan" "subtype" "applied" "plan_id" (plan-id plan)
+                                    "changes" (%changes-json result)))
+        (:rebased
+         (%emit-event report "plan" "subtype" "rebased" "plan_id" (plan-id plan)
+                                    "conflicts" (coerce result 'vector))
+         (setf (%report-plan-failure report)
+               (make-condition 'plan-error :plan plan :message (%rebase-line plan result))))
+        (:aborted
+         (%emit-event report "plan" "subtype" "drift" "plan_id" (plan-id plan)
+                                    "paths" (coerce drift 'vector))
+         (setf (%report-plan-failure report)
+               (make-condition 'plan-drift
+                               :plan plan :paths drift
+                               :message (format nil "plan ~a: the working copy changed at ~{~a~^, ~}; nothing applied (use --on-drift rebase or --on-drift overwrite)"
+                                                (plan-id plan) drift)))))
+      (values status result))))
+
+(defun %plan-stderr-line (error-output control &rest args)
+  (format error-output "cl-stack-code: ~?~%" control args)
+  (force-output error-output))
+
+(defun %headless-plan (inv mode cwd store source sessions-dir data-dir getenv error-output)
+  "Before a plan run: CHECK-PLAN-FLAGS, then the plan. → (values plan
+reopened-p)."
+  (declare (ignore sessions-dir))
+  (check-plan-flags inv mode)
+  (let ((plans-dir (%plans-dir cwd data-dir getenv))
+        (entry (%head-plan-entry source))
+        (lost nil))
+    (when (and entry (eq :open (getf entry :status)))
+      (handler-case
+          (return-from %headless-plan (values (reopen-plan plans-dir (getf entry :id)) t))
+        (plan-not-found ()
+          (setf lost (getf entry :id)))))
+    (let* ((project (or (find-project-root cwd) cwd))
+           (kind (or (invocation-plan-area inv) :auto))
+           (plan (handler-case
+                     (open-plan project :kind kind
+                                        :data-dir (or data-dir (user-data-directory :getenv getenv))
+                                        :session-id (session-id store))
+                   (plan-error (e)
+                     (if (eq kind :git)
+                         (%usage-fail "--plan-area git: ~a is not a git worktree"
+                                      (uiop:native-namestring project))
+                         (error e))))))
+      (when lost
+        (%plan-stderr-line error-output "plan ~a is no longer open; opened plan ~a"
+                           lost (plan-id plan)))
+      (values plan nil))))
+
+(defun %headless-plan-finish (report plan inv run failure interrupted error-output)
+  "After a plan run, before its turn is committed: the projection, --apply,
+the plan events, the result's plan object, the text-mode diff and the
+stderr line (see the file header)."
+  (let* ((changes (plan-changes plan))
+         (diff (plan-diff-text plan))
+         (status :open)
+         (conflicts '()))
+    (%emit-event report "plan" "subtype" "projected" "plan_id" (plan-id plan)
+                               "changes" (%changes-json changes) "diff" diff)
+    (when (and (invocation-apply-p inv)
+               (string= "success" (%outcome run failure interrupted 0)))
+      (multiple-value-bind (result-status result) (%headless-approve report plan inv)
+        (setf status (case result-status
+                       ((:applied :empty) :applied)
+                       (:rebased :rebased)
+                       (t :open)))
+        (when (eq result-status :rebased)
+          (setf conflicts result))))
+    (setf (%report-plan report) (%plan-object plan status changes diff conflicts)
+          (%report-plan-text report) (if changes diff ""))
+    (case status
+      (:applied
+       (if changes
+           (%plan-stderr-line error-output "plan ~a: applied ~a" (plan-id plan)
+                              (%files-count (length changes)))
+           (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))
+      (:open
+       (unless (%report-plan-failure report)
+         (if changes
+             (%plan-stderr-line error-output
+                                "plan ~a: ~a changed, not applied (cl-stack-code -p --resume ~a --apply applies it)"
+                                (plan-id plan) (%files-count (length changes))
+                                (%report-session report))
+             (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))))
+    plan))
+
+(defun %run-plan-action (inv &key output getenv data-dir user-config-dir error-output start)
+  "--apply / --reject on the resumed session's open plan, without a run.
+→ exit code."
+  (let* ((getenv (or getenv #'uiop:getenv))
+         (cwd (%resolve-cwd (invocation-cwd inv)))
+         (config (or user-config-dir (user-config-directory :getenv getenv)))
+         (settings (load-settings cwd :user-config-dir config :cli (invocation-settings inv)))
+         (mode (or (settings-permission-mode settings) :default))
+         (sessions-dir (%sessions-dir cwd data-dir getenv))
+         (source (progn (check-plan-flags inv mode)
+                        (%session-source inv sessions-dir)))
+         (entry (%head-plan-entry source))
+         (plan (and entry (eq :open (getf entry :status))
+                    (handler-case (reopen-plan (%plans-dir cwd data-dir getenv) (getf entry :id))
+                      (plan-not-found () nil))))
+         (report (make-%report :format (invocation-output-format inv) :output output
+                               :session (session-id source))))
+    (unless plan
+      (%usage-fail "session ~a has no open plan" (session-id source)))
+    (let ((changes '()) (diff "") (status :open) (conflicts '()))
+      (cond
+        ((invocation-reject-p inv)
+         (setf changes (plan-changes plan)
+               diff (plan-diff-text plan))
+         (reject-plan plan)
+         (setf status :discarded)
+         (%emit-event report "plan" "subtype" "discarded" "plan_id" (plan-id plan))
+         (%plan-stderr-line error-output "plan ~a: discarded" (plan-id plan)))
+        (t
+         (setf changes (plan-changes plan)
+               diff (plan-diff-text plan))
+         (multiple-value-bind (result-status result) (%headless-approve report plan inv)
+           (case result-status
+             ((:applied :empty)
+              (setf status :applied)
+              (if changes
+                  (%plan-stderr-line error-output "plan ~a: applied ~a" (plan-id plan)
+                                     (%files-count (length changes)))
+                  (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))
+             (:rebased (setf status :rebased conflicts result))))))
+      (setf (%report-plan report) (%plan-object plan status changes diff conflicts))
+      (let ((failure (%report-plan-failure report))
+            (duration (round (* 1000 (- (get-internal-real-time) (or start (get-internal-real-time))))
+                             internal-time-units-per-second)))
+        (case (%report-format report)
+          (:text
+           (when (and (null failure) (eq status :applied))
+             (write-string diff output)
+             (force-output output)))
+          (t
+           (%write-json-line report (%result-object report
+                                                    (if failure "error_during_execution" "success")
+                                                    ""
+                                                    (and failure (princ-to-string failure))
+                                                    duration))))
+        (when failure
+          (error failure))
+        0))))
 
 (defun %run-headless (inv &key output input providers user-config-dir getenv start data-dir
                                (error-output *error-output*))
@@ -410,6 +711,11 @@ result, then signals its failure."
     (error 'code-usage-error
            :message "-p (--print) is required: cl-stack-code 0.1 runs headless only (the interactive mode arrives in H3b)"))
   (check-session-flags inv)
+  (when (%plan-action-only-p inv)
+    (return-from %run-headless
+      (%run-plan-action inv :output output :getenv getenv :data-dir data-dir
+                            :user-config-dir user-config-dir :error-output error-output
+                            :start start)))
   (let* ((prompt (%read-prompt inv input))
          (cwd (%resolve-cwd (invocation-cwd inv)))
          (config (or user-config-dir (user-config-directory :getenv getenv)))
@@ -429,6 +735,13 @@ result, then signals its failure."
          (history (session-turns store))
          (report (make-%report :format (invocation-output-format inv) :output output
                                :session (session-id store)))
+         ;; H5a: plan mode (or a plan flag) opens or reopens the session's plan.
+         (plan-and-reopened
+           (when (%plan-run-p inv mode)
+             (multiple-value-list
+              (%headless-plan inv mode cwd store source sessions-dir data-dir getenv
+                              error-output))))
+         (plan (first plan-and-reopened))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (sources nil))
@@ -443,13 +756,15 @@ result, then signals its failure."
                (agent:*off-loop-specials*
                  (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                         agent:*off-loop-specials*)))
-           (setf sources (make-code-tools cwd :settings settings))
+           (setf sources (make-code-tools (if plan (plan-tool-root plan cwd) cwd)
+                                          :settings settings))
            (let ((offered (loop for source in sources
                                 append (mapcar #'llm:llm-tool-name
                                                (agent:list-agent-tools source)))))
              (multiple-value-bind (instructions files)
                  (assemble-system-prompt cwd :tools offered :backend backend
-                                             :settings settings :user-config-dir config)
+                                             :settings settings :user-config-dir config
+                                             :plan plan)
                (let ((agent (agent:make-ai-agent
                              :name "cl-stack-code"
                              :backend backend
@@ -468,10 +783,21 @@ result, then signals its failure."
                               "permission_mode" (permission-mode-name mode)
                               "tools" (coerce offered 'vector)
                               "instructions" (map 'vector #'uiop:native-namestring files))
+                 (when plan
+                   (%emit-event report "plan"
+                                "subtype" (if (second plan-and-reopened) "reopened" "opened")
+                                "plan_id" (plan-id plan)
+                                "kind" (string-downcase (string (plan-kind plan)))
+                                "area" (uiop:native-namestring (plan-root plan))
+                                "base" (plan-base plan)))
                  (multiple-value-bind (run failure interrupted)
                      (%drive agent (append history (list (llm:user-turn prompt))) report mode)
+                   (when plan
+                     (%headless-plan-finish report plan inv run
+                                            (or (%report-failure report) failure)
+                                            interrupted error-output))
                    (%commit-headless-turn report store prompt history failure interrupted
-                                          designator mode error-output)
+                                          designator mode error-output plan)
                    (%report-run-end report run failure interrupted max-turns start))))))
       (when (second sources)
         (tools:close-shell-tools (second sources)))
