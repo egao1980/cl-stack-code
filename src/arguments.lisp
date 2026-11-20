@@ -10,6 +10,9 @@ NIL to read the prompt from input (no free argument, or \"-\").")
    (output-format :initarg :output-format :reader invocation-output-format
                   :initform :text
                   :documentation ":TEXT, :JSON or :STREAM-JSON.")
+   (output-format-given-p :initarg :output-format-given-p
+                          :reader invocation-output-format-given-p :initform nil
+                          :documentation "True when --output-format was on the command line.")
    (cwd :initarg :cwd :reader invocation-cwd :initform nil
         :documentation "--cwd as given, or NIL.")
    (help-p :initarg :help-p :reader invocation-help-p :initform nil)
@@ -35,9 +38,9 @@ ours to rebind, so it goes in as :BACKEND)."
      :backend backend
      :name "cl-stack-code"
      :version +version+
-     :description "Coding agent on cl-stack. 0.1 runs headless only: -p PROMPT."
+     :description "Coding agent on cl-stack: an interactive terminal session, or -p PROMPT for a headless run."
      :options
-     (list (opt "print" "Run headless and print the result (required in 0.1)"
+     (list (opt "print" "Run headless and print the result (without it: the interactive session)"
                 :short #\p :kind :flag)
            (opt "output-format" "text (default), json or stream-json")
            (opt "model" "Model: provider or provider:model (default anthropic)")
@@ -104,6 +107,7 @@ are present is checked by RUN-CLI, not here."
          :print-p (and (get-opt :print) t)
          :prompt (%prompt free)
          :output-format (%output-format (get-opt :output-format))
+         :output-format-given-p (and (get-opt :output-format) t)
          :cwd (get-opt :cwd)
          :settings (make-settings
                     :model (get-opt :model)
