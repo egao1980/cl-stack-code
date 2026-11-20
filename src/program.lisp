@@ -208,6 +208,34 @@
 ;;;                    "Changed in both: P1, P2" and +DRIFT-CHOICES+. Events
 ;;;                    as for the plan dialogs ((:reply CHOICE) /
 ;;;                    (:interrupt)).
+;;;
+;;; H4b: the Lisp image (src/lisp-image.lisp; left to the implementation).
+;;;   Start            With SETTINGS-LISP-IMAGE non-NIL, MAKE-CODE-PROGRAM
+;;;                    runs CHECK-LISP-IMAGE-SETTINGS; with the image on it
+;;;                    makes the three sources (MAKE-CODE-TOOLS, the lisp
+;;;                    tools' :ON-IMAGE-EVENT sending IMAGE-EVENT-MESSAGE with
+;;;                    TUI-SEND once the TUI runs; events before that are
+;;;                    sent at TUI-INIT), runs START-LISP-IMAGE, adds the
+;;;                    system prompt section, and gives the state
+;;;                    LISP-IMAGE-STATE. All before the terminal is touched
+;;;                    (CODE-USAGE-ERROR, LISP-IMAGE-ERROR).
+;;;   Effects          (:post-image-events) → POST-IMAGE-EVENTS into the run
+;;;                    on the agent thread while it is going.
+;;;                    (:image-turn) → TAKE-IMAGE-EVENTS; none → (:turn-end
+;;;                    :reason :stop); else a turn (as :run does, without
+;;;                    EXPAND-MENTIONS) whose message is the first event's
+;;;                    turn, the others posted right after; its record's
+;;;                    prompt is the first event's text. Every :run posts the
+;;;                    queued events right after starting its turn.
+;;;   Turn ends        After a :turn-end that leaves the program idle, the
+;;;                    queued events' count goes out as (:image-pending N)
+;;;                    when it is > 0.
+;;;   Layout           IMAGE-BANNER-TEXT, when non-NIL, is one row directly
+;;;                    above the "─" rule (below the queued, steering and
+;;;                    spinner rows), cut to the width.
+;;;   Close            CLOSE-CODE-PROGRAM also runs CLOSE-LISP-TOOLS (a
+;;;                    spawned image is killed, an attached one keeps
+;;;                    running).
 
 
 (defclass code-program ()
