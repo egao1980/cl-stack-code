@@ -41,7 +41,8 @@
       (h:tui-resize tui 90 14)
       (ok (wait-for* tui (lambda () (= 14 (length (screen tui))))))
       (ok (wait-for* tui (lambda () (search "Message, @file" (nth 12 (screen tui))))))
-      (ok (search " in · " (nth 13 (screen tui))) "the status line is still last"))))
+      (ok (wait-for* tui (lambda () (search " in · " (nth 13 (screen tui)))))
+          "the status line is still last"))))
 
 ;;; Turns.
 
