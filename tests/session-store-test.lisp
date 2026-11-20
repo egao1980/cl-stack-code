@@ -158,7 +158,7 @@
                       (read-from-string (file-string (session-file s "session.sexp")))))))
         (ok (eql 1 (getf meta :format)))
         (ok (equal (session-id s) (getf meta :id)))
-        (ok (equal "/tmp/proj/" (getf meta :project-dir))))
+        (ok (equal (uiop:native-namestring #p"/tmp/proj/") (getf meta :project-dir))))
       (ok before "one file per revision")
       (ok (equal (format nil "~a~%" (rev:revision-id r1))
                  (file-string (session-file s "refs/" "head"))))

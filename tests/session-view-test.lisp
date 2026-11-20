@@ -169,7 +169,7 @@
            (j (json:decode text)))
       (ok (= 1 (length (lines text))) "one line")
       (ok (equal "0123456789abcdef0123456789abcdef" (jget j "session_id")))
-      (ok (equal "/tmp/proj/" (jget j "project")))
+      (ok (equal (uiop:native-namestring #p"/tmp/proj/") (jget j "project")))
       (ok (equal (rev-id #\2) (jget j "head")))
       (ok (= 2 (length (jget j "turns"))))
       (let ((t1 (jget j "turns" 0))
