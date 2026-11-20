@@ -40,7 +40,15 @@ NIL to read the prompt from input (no free argument, or \"-\").")
    (on-drift :initarg :on-drift :reader invocation-on-drift :initform nil
              :documentation "--on-drift: :ABORT, :REBASE or :OVERWRITE, or NIL (not given).")
    (plan-area :initarg :plan-area :reader invocation-plan-area :initform nil
-              :documentation "--plan-area: :AUTO, :GIT or :COPY, or NIL (not given)."))
+              :documentation "--plan-area: :AUTO, :GIT or :COPY, or NIL (not given).")
+   ;; H5b
+   (rewind :initarg :rewind :reader invocation-rewind :initform nil
+           :documentation "--rewind TURN as given (\"0\", a turn number, or a turn id prefix), or NIL.")
+   (rewind-mode :initarg :rewind-mode :reader invocation-rewind-mode :initform nil
+                :documentation "--rewind-mode: :BOTH, :CONVERSATION or :FILES, or NIL (not given).")
+   (list-checkpoints-p :initarg :list-checkpoints-p :reader invocation-list-checkpoints-p
+                       :initform nil
+                       :documentation "--list-checkpoints: print the resumed session's checkpoints."))
   (:documentation "One parsed command line."))
 
 (defparameter +output-format-names+ '("text" "json" "stream-json")
@@ -85,7 +93,12 @@ ours to rebind, so it goes in as :BACKEND)."
            (opt "reject" "With --resume or --continue and no prompt: discard the session's open plan"
                 :kind :flag)
            (opt "on-drift" "With --apply, when the working copy changed under the plan: abort (default), rebase or overwrite")
-           (opt "plan-area" "Plan mode: auto (default), git or copy")))))
+           (opt "plan-area" "Plan mode: auto (default), git or copy")
+           ;; H5b
+           (opt "rewind" "With --resume or --continue and no prompt: rewind the session to turn N (0 = its start)")
+           (opt "rewind-mode" "With --rewind: both (default), conversation or files")
+           (opt "list-checkpoints" "With --resume or --continue: print the session's checkpoints, newest first"
+                :kind :flag)))))
 
 (defun %output-format (value)
   (cond ((null value) :text)
@@ -118,6 +131,9 @@ ours to rebind, so it goes in as :BACKEND)."
 
 (defparameter +plan-area-names+ '("auto" "git" "copy")
   "H5a: the --plan-area values.")
+
+(defparameter +rewind-mode-names+ '("both" "conversation" "files")
+  "H5b: the --rewind-mode values.")
 
 (defun %choice-flag (flag value names)
   "VALUE (one of NAMES) as a keyword, NIL when not given; anything else →
@@ -166,6 +182,9 @@ are present is checked by RUN-CLI, not here."
          :reject-p (and (get-opt :reject) t)
          :on-drift (%choice-flag "--on-drift" (get-opt :on-drift) +on-drift-names+)
          :plan-area (%choice-flag "--plan-area" (get-opt :plan-area) +plan-area-names+)
+         :rewind (get-opt :rewind)
+         :rewind-mode (%choice-flag "--rewind-mode" (get-opt :rewind-mode) +rewind-mode-names+)
+         :list-checkpoints-p (and (get-opt :list-checkpoints) t)
          :settings (make-settings
                     :model (get-opt :model)
                     :max-turns (%max-turns (get-opt :max-turns))
@@ -226,7 +245,7 @@ permission mode (flags over settings); otherwise CODE-USAGE-ERROR:
   --apply with --reject                   → \"--apply and --reject cannot be used together\"
   --reject with a prompt, or without --resume / --continue
                                           → \"--reject needs --resume or --continue and no prompt\"
-  --on-drift without --apply              → \"--on-drift needs --apply\"
+  --on-drift without --apply or --rewind  → \"--on-drift needs --apply or --rewind\"
   --apply with a prompt and MODE not :PLAN, or --plan-area with MODE not :PLAN
                                           → \"--apply and --plan-area need --permission-mode plan\"
 An action-only invocation (--apply or --reject, --resume or --continue, no
@@ -240,10 +259,34 @@ prompt) does not need plan mode; it acts on the session's open plan."
       (%usage-fail "--apply and --reject cannot be used together"))
     (when (and reject-p (or prompt (not resumed)))
       (%usage-fail "--reject needs --resume or --continue and no prompt"))
-    (when (and (invocation-on-drift invocation) (not apply-p))
-      (%usage-fail "--on-drift needs --apply"))
+    (when (and (invocation-on-drift invocation) (not apply-p) (not (invocation-rewind invocation)))
+      (%usage-fail "--on-drift needs --apply or --rewind"))
     (when (and (not plan-mode-p)
                (or (and apply-p (or prompt (not resumed)))
                    (invocation-plan-area invocation)))
       (%usage-fail "--apply and --plan-area need --permission-mode plan"))
     t))
+
+;;; H5b: rewind flags.
+
+(defun check-rewind-flags (invocation)
+  "→ T when INVOCATION's rewind flags go together; otherwise CODE-USAGE-ERROR,
+checked in this order:
+  --rewind-mode without --rewind          → \"--rewind-mode needs --rewind\"
+  --rewind or --list-checkpoints with --fork-session
+                                          → \"--rewind and --list-checkpoints cannot be combined with --fork-session\"
+  --rewind with --apply or --reject       → \"--rewind cannot be combined with --apply or --reject\"
+  --rewind with a prompt, or without --resume / --continue
+                                          → \"--rewind needs --resume or --continue and no prompt\"
+  --rewind X where X is neither a decimal number (0 included) nor a hex
+  prefix of at least 4 characters         → \"bad --rewind \\\"X\\\": use a turn number or a turn id from /tree\"
+  --list-checkpoints with --rewind or a prompt
+                                          → \"--list-checkpoints cannot be combined with --rewind or a prompt\"
+  --list-checkpoints without --resume / --continue
+                                          → \"--list-checkpoints needs --resume or --continue\"
+Without any rewind flag → T. Whether the session and the turn exist is
+checked later (SESSION-NOT-FOUND, SESSION-TURN-NOT-FOUND,
+CHECKPOINT-NOT-FOUND). RUN-CLI refuses --rewind without -p itself (\"--rewind
+needs -p (use /rewind in the interactive mode)\")."
+  (declare (ignore invocation))
+  (%not-implemented 'check-rewind-flags))

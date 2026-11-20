@@ -171,6 +171,44 @@
 ;;;   Transcript       A :plan entry renders as "● plan <id8>: N file[s]
 ;;;                    changed", then its diff through MD:RENDER-DIFF-LINES
 ;;;                    at W − 2, indented by 2 (TRANSCRIPT-LINES).
+;;;
+;;; H5b: checkpoints and rewind (src/checkpoints.lisp).
+;;;   Checkpointer     MAKE-CODE-PROGRAM makes one (as -p does: project
+;;;                    directory, CHECKPOINT-SETTINGS, the data directory)
+;;;                    before the terminal is touched; CLOSE-CODE-PROGRAM
+;;;                    closes it.
+;;;   Turns            On the agent thread: BEGIN-CHECKPOINT-TURN when a :run
+;;;                    starts a turn (after %ENSURE-PLAN), END-CHECKPOINT-
+;;;                    TURN right after the turn is committed (before the
+;;;                    :turn-end reaches the UI, so disk state is current
+;;;                    when the UI goes idle), with the store the turn went
+;;;                    to. A checkpoint error is an (:error M); the turn
+;;;                    stands.
+;;;   Plans            (:approve-plan …) passes :CHECKPOINTER to APPROVE-PLAN,
+;;;                    then RECORD-PLAN-CHECKPOINTS with the session's head.
+;;;   Effects          (:checkpoints) → (:notice …) of CHECKPOINT-SUMMARY-
+;;;                    LINES at the width of the last frame (see the core).
+;;;                    (:tree) passes SESSION-TREE-LINES :MARKED the
+;;;                    conversation revision ids of SESSION-CHECKPOINTS.
+;;;                    (:rewind N) (H3c, no parts): T = the line's length −
+;;;                    N; when TURN-CHECKPOINT T is a retained checkpoint
+;;;                    whose files are not the same as the tip's, (:rewind-
+;;;                    prompt :n N :turn T :paths P) with P the paths that
+;;;                    differ; otherwise H3c's conversation rewind ("rewound
+;;;                    N turn[s]"). (:rewind N :parts P :on-drift M) →
+;;;                    REWIND-TO; a moved conversation drops the run and
+;;;                    sends (:session-reset :entries (SESSION-ENTRIES)),
+;;;                    then (:rewound …). A PLAN-DRIFT without M sends
+;;;                    (:rewind-drift :paths P) and takes ABORT-APPROVAL
+;;;                    (no :rewound follows). Errors are (:error M).
+;;;   Dialog           STATE-REWIND-PROMPT :rewind: a W:CONFIRM-DIALOG
+;;;                    titled "Rewind to turn T" with message "Files to
+;;;                    restore: P1, P2" and +REWIND-CHOICES+; :drift: titled
+;;;                    "Rewind: the working copy changed" with message
+;;;                    "Changed in both: P1, P2" and +DRIFT-CHOICES+. Events
+;;;                    as for the plan dialogs ((:reply CHOICE) /
+;;;                    (:interrupt)).
+
 
 (defclass code-program ()
   ((state :initarg :state :reader code-program-state
@@ -708,8 +746,12 @@ run starts on the session's conversation."
                                                                     :width width))))))))
       (:fork (let ((at (first args)))
                (%on-loop program (lambda () (%fork program at)))))
-      (:rewind (let ((n (first args)))
-                 (%on-loop program (lambda () (%rewind program n)))))
+      (:rewind (destructuring-bind (n &key (parts nil parts-p) on-drift) args
+                 (if parts-p
+                     ;; H5b
+                     (%on-loop program (lambda () (%rewind-parts-effect program n parts on-drift)))
+                     (%on-loop program (lambda () (%rewind program n))))))
+      (:checkpoints (%on-loop program (lambda () (%checkpoints-effect program))))
       (:clone (%on-loop program (lambda () (%clone program))))
       (:export (let ((file (first args)))
                  (%on-loop program (lambda () (%export program file)))))
@@ -1163,3 +1205,15 @@ STATE-PLAN-PROMPT (made once per prompt), focus it. → NIL."
             (%cp-dialog-invocation program) key))
     (setf (w:widget-focused-p (code-program-input program)) nil)
     nil))
+
+;;; H5b: checkpoints and rewind (see the "H5b" part of the file header).
+
+(defun %checkpoints-effect (program)
+  "(:checkpoints): send the /checkpoints notice."
+  (declare (ignore program))
+  (%not-implemented '%checkpoints-effect))
+
+(defun %rewind-parts-effect (program n parts on-drift)
+  "(:rewind N :parts PARTS :on-drift M): REWIND-TO and its answers."
+  (declare (ignore program n parts on-drift))
+  (%not-implemented '%rewind-parts-effect))

@@ -32,6 +32,12 @@
 means unset.")
    (append-system-prompt :initarg :append-system-prompt
                          :reader settings-append-system-prompt :initform nil)
+   ;; H5b
+   (checkpoints :initarg :checkpoints :reader settings-checkpoints :initform nil
+                :documentation "The \"checkpoints\" object as a plist of the
+keys this layer sets: :ENABLED (T or NIL), :KEEP (an integer >= 1), :KIND
+(:AUTO :JJ :GIT :COPY). An absent key is unset; a present :ENABLED NIL means
+false. See CHECKPOINT-SETTINGS.")
    (files :initarg :files :reader settings-files :initform nil
           :documentation "Settings files this layer was read from, in order."))
   (:documentation "One settings layer, or the merge of several."))
@@ -45,13 +51,73 @@ means unset.")
   (typep x 'settings))
 
 (defun make-settings (&key model max-turns permission-mode allow ask deny env
-                        append-system-prompt files)
-  "A SETTINGS layer. NIL means unset for every scalar."
+                        append-system-prompt files checkpoints)
+  "A SETTINGS layer. NIL means unset for every scalar. CHECKPOINTS (H5b): a
+plist of the checkpoints keys this layer sets."
   (make-instance 'settings :model model :max-turns max-turns
                            :permission-mode permission-mode
                            :allow allow :ask ask :deny deny :env env
                            :append-system-prompt append-system-prompt
+                           :checkpoints (copy-list checkpoints)
                            :files files))
+
+;;; H5b: the checkpoints object.
+;;;
+;;;   "checkpoints": {"enabled": true, "keep": 50, "kind": "auto"}
+;;;
+;;; enabled  boolean (default true): record checkpoints. Rewinds of files
+;;;          recorded earlier work either way.
+;;; keep     integer >= 1 (default +DEFAULT-CHECKPOINT-KEEP+): checkpoints a
+;;;          session keeps; older ones are garbage-collected.
+;;; kind     "auto" (default), "jj", "git" or "copy": how the files part is
+;;;          recorded (RESOLVE-CHECKPOINT-KIND).
+;;; Layers merge per key (the last layer that sets a key wins). A bad value
+;;; signals SETTINGS-ERROR with key path "checkpoints", "checkpoints.enabled",
+;;; "checkpoints.keep" or "checkpoints.kind".
+
+(defparameter +default-checkpoint-keep+ 50
+  "H5b: checkpoints.keep when no layer sets it.")
+
+(defparameter +checkpoint-kind-names+ '("auto" "jj" "git" "copy")
+  "H5b: the checkpoints.kind values.")
+
+(defun %parse-checkpoints (file value)
+  (unless (hash-table-p value)
+    (%settings-fail file "checkpoints" "must be an object with enabled, keep and kind"))
+  (let ((out '()))
+    (multiple-value-bind (enabled present) (%json-present value "enabled")
+      (when present
+        (unless (member enabled '(t nil))
+          (%settings-fail file "checkpoints.enabled" "must be true or false"))
+        (setf out (list* :enabled enabled out))))
+    ;; JSON false decodes as NIL, which %JSON-PRESENT reports as present.
+    (multiple-value-bind (keep present) (%json-present value "keep")
+      (when present
+        (unless (and (integerp keep) (>= keep 1))
+          (%settings-fail file "checkpoints.keep" "must be an integer >= 1"))
+        (setf out (list* :keep keep out))))
+    (multiple-value-bind (kind present) (%json-present value "kind")
+      (when present
+        (unless (and (stringp kind) (member kind +checkpoint-kind-names+ :test #'string=))
+          (%settings-fail file "checkpoints.kind" "must be one of ~{~a~^, ~}"
+                          +checkpoint-kind-names+))
+        (setf out (list* :kind (intern (string-upcase kind) :keyword) out))))
+    out))
+
+(defun %merge-checkpoints (plists)
+  "Per key, the last plist that has it wins."
+  (let ((out '()))
+    (dolist (plist plists out)
+      (loop for (key value) on plist by #'cddr
+            do (setf (getf out key) value)))))
+
+(defun checkpoint-settings (settings)
+  "→ (values enabled keep kind) of SETTINGS's checkpoints object with the
+defaults applied: enabled T, keep +DEFAULT-CHECKPOINT-KEEP+, kind :AUTO."
+  (let ((plist (and settings (settings-checkpoints settings))))
+    (values (getf plist :enabled t)
+            (getf plist :keep +default-checkpoint-keep+)
+            (getf plist :kind :auto))))
 
 
 (defparameter +permission-mode-keywords+
@@ -138,7 +204,9 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
              (permissions (scalar "permissions" #'hash-table-p
                                   "an object with allow, ask and deny arrays"))
              (env (multiple-value-bind (value present) (%json-present object "env")
-                    (and present (%parse-env file value)))))
+                    (and present (%parse-env file value))))
+             (checkpoints (multiple-value-bind (value present) (%json-present object "checkpoints")
+                            (and present (%parse-checkpoints file value)))))
         (make-settings
          :model model
          :max-turns max-turns
@@ -148,6 +216,7 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
          :ask (and permissions (%parse-rule-array file permissions "ask" :ask))
          :deny (and permissions (%parse-rule-array file permissions "deny" :deny))
          :env env
+         :checkpoints checkpoints
          :files (and file (list file)))))))
 
 (defun read-settings-file (pathname)
@@ -212,6 +281,7 @@ gives the value (NIL = unset). Fresh conses; the layers are not modified."
        :ask (%merge-rules (mapcar #'settings-ask layers))
        :deny (%merge-rules (mapcar #'settings-deny layers))
        :env (%merge-env (mapcar #'settings-env layers))
+       :checkpoints (%merge-checkpoints (mapcar #'settings-checkpoints layers))
        :files (loop for layer in layers append (settings-files layer))))))
 
 ;;; Where the files are.

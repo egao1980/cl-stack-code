@@ -165,5 +165,5 @@
   (with-project (project config) '()
     (multiple-value-bind (exit out err) (code project config '("--version") :cwd nil :model nil)
       (ok (eql 0 exit))
-      (ok (equal (nl "cl-stack-code 0.4.1") out))
+      (ok (equal (nl "cl-stack-code 0.5.0") out))
       (ok (equal "" err)))))

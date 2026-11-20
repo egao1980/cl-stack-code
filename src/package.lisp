@@ -16,6 +16,7 @@
                     (#:tty #:tui-backend-tty)
                     (#:rev #:revision-protocol)
                     (#:git #:revision-backend-git)
+                    (#:jj #:revision-backend-jj)
                     (#:dt #:datetime-protocol))
   (:export
    ;; entry
@@ -287,9 +288,90 @@
    #:state-plan
    #:state-plan-prompt
    #:+plan-choices+
-   #:+drift-choices+))
+   #:+drift-choices+
+
+   ;; H5b: checkpoints
+   #:checkpoint
+   #:checkpoint-p
+   #:checkpoint-id
+   #:checkpoint-ordinal
+   #:checkpoint-reason
+   #:checkpoint-turn
+   #:checkpoint-turn-id
+   #:checkpoint-files-kind
+   #:checkpoint-files-id
+   #:checkpoint-message
+   #:checkpoint-recorded-at
+   #:checkpoint-expired-p
+   #:checkpoint-revision
+   #:+checkpoint-format+
+   #:+checkpoint-kinds+
+   #:+checkpoint-reasons+
+   #:+checkpoint-roles+
+   #:+checkpoint-ref+
+   #:+expired-ref+
+   #:+checkpoint-ref-prefix+
+   #:+default-checkpoint-keep+
+   #:+rewind-parts+
+   #:checkpoint-store
+   #:checkpoint-store-p
+   #:checkpoint-store-session
+   #:checkpoints-directory
+   #:resolve-checkpoint-kind
+   #:checkpointer
+   #:checkpointer-p
+   #:make-checkpointer
+   #:checkpointer-project-dir
+   #:checkpointer-kind
+   #:checkpointer-keep
+   #:checkpointer-enabled-p
+   #:checkpointer-data-dir
+   #:close-checkpointer
+   #:files-state
+   #:files-state-kind
+   #:files-state-id
+   #:read-files-state
+   #:record-checkpoint
+   #:begin-checkpoint-turn
+   #:end-checkpoint-turn
+   #:record-plan-checkpoints
+   #:gc-checkpoints
+   #:session-checkpoints
+   #:tip-checkpoint
+   #:find-checkpoint
+   #:turn-checkpoint
+   #:rewind-to
+   #:rewind-description
+   #:checkpoint-summary-lines
+   #:plan-rewind
+
+   ;; H5b: settings
+   #:settings-checkpoints
+   #:checkpoint-settings
+
+   ;; H5b: conditions
+   #:checkpoint-error
+   #:checkpoint-error-session
+   #:checkpoint-not-found
+   #:checkpoint-not-found-designator
+   #:checkpoint-expired
+   #:checkpoint-expired-checkpoint
+
+   ;; H5b: the command line
+   #:invocation-rewind
+   #:invocation-rewind-mode
+   #:invocation-list-checkpoints-p
+   #:check-rewind-flags
+
+   ;; H5b: the interactive core
+   #:state-rewind
+   #:state-rewind-prompt
+   #:+rewind-choices+))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.4.1"
+(defun %not-implemented (what)
+  (error "cl-stack-code: ~a is not implemented (H5b contract)" what))
+
+(defparameter +version+ "0.5.0"
   "The product version, as in the .asd.")

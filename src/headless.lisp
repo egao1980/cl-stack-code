@@ -99,6 +99,60 @@
 ;;;                    num_turns 0, "result" "", and "plan".
 ;;;   Turn record      PLAN-RECORD of the plan after --apply, so a later
 ;;;                    resume does not reopen an applied plan.
+;;;
+;;; H5b: checkpoints and rewind (src/checkpoints.lisp).
+;;;   Checkpointer     Every run makes one (MAKE-CHECKPOINTER on the project
+;;;                    directory with CHECKPOINT-SETTINGS and the data
+;;;                    directory) after the session is resolved and before
+;;;                    anything is written to OUTPUT; an explicit
+;;;                    checkpoints.kind that does not fit → CHECKPOINT-ERROR,
+;;;                    exit 1. CLOSE-CHECKPOINTER when the run ends.
+;;;   Turns            BEGIN-CHECKPOINT-TURN before the run (after the plan
+;;;                    is opened in plan mode), END-CHECKPOINT-TURN right
+;;;                    after %COMMIT-HEADLESS-TURN with the committed revision
+;;;                    and the store it went to. Nothing in the output
+;;;                    changes.
+;;;   --apply          APPROVE-PLAN :CHECKPOINTER, then RECORD-PLAN-CHECKPOINTS
+;;;                    with the turn the plan belongs to: after a run, the
+;;;                    revision %COMMIT-HEADLESS-TURN committed (before
+;;;                    END-CHECKPOINT-TURN); action only, the head
+;;;                    (src/checkpoints.lisp, "Plan mode").
+;;;   --list-checkpoints  With --resume / --continue, with or without -p:
+;;;                    CHECK-REWIND-FLAGS, then CHECKPOINT-SUMMARY-LINES of
+;;;                    the session, one per line on output, exit 0 (one line
+;;;                    "no checkpoints yet" when there are none).
+;;;   --rewind TURN    Action only, after CHECK-SESSION-FLAGS: CHECK-REWIND-
+;;;                    FLAGS (exit 2), the session (--resume / --continue),
+;;;                    then REWIND-TO TURN with PARTS from --rewind-mode
+;;;                    (both, the default → (:conversation :files);
+;;;                    conversation; files). No run, no LLM call, INPUT not
+;;;                    read, no turn committed. PLAN-DRIFT is answered per
+;;;                    --on-drift: abort (default) → ABORT-APPROVAL, rebase →
+;;;                    REBASE-PLAN, overwrite → OVERWRITE-PLAN.
+;;;     text           OUTPUT: the unified diff of what was written (the
+;;;                    rewind plan's PLAN-DIFF-TEXT before approval; after a
+;;;                    rebase, the merged one); nothing for a conversation-
+;;;                    only or empty rewind. ERROR-OUTPUT: "cl-stack-code:
+;;;                    session S rewound to turn T: <REWIND-DESCRIPTION>".
+;;;     stream-json    {"type":"rewind","session_id",<the rewind object>}
+;;;                    then the "result"; json: only the "result". The result
+;;;                    has num_turns 0, "result" "", and "rewind": the rewind
+;;;                    object {"turn": T, "parts": ["conversation","files"],
+;;;                    "conversation": "moved"|"unchanged"|"skipped",
+;;;                    "files": "applied"|"merged"|"empty"|"aborted"|"skipped",
+;;;                    "changes": [{"path","kind"}], "conflicts": [paths],
+;;;                    "drift": [paths], "checkpoint": id or null}.
+;;;     drift, abort   Exit 1, result subtype "error_during_execution",
+;;;                    ERROR-OUTPUT "cl-stack-code: rewind to turn T: the
+;;;                    working copy changed at P, Q; nothing restored (use
+;;;                    --on-drift rebase or --on-drift overwrite)". Nothing
+;;;                    written, the head not moved.
+;;;     errors         No files state for TURN with files asked for →
+;;;                    CHECKPOINT-NOT-FOUND ("session S has no checkpoint for
+;;;                    turn T", exit 2); an expired one → CHECKPOINT-EXPIRED
+;;;                    (exit 1); an unknown TURN → SESSION-TURN-NOT-FOUND
+;;;                    (exit 1); nothing is written to OUTPUT before them.
+
 
 ;;; Outcomes of a run that started, as conditions. RUN-CLI handles them like
 ;;; every other error: the message goes to ERROR-OUTPUT, the exit code comes
@@ -712,6 +766,12 @@ result, then signals its failure."
     (error 'code-usage-error
            :message "-p (--print) is required: cl-stack-code 0.1 runs headless only (the interactive mode arrives in H3b)"))
   (check-session-flags inv)
+  ;; H5b: --rewind is an action of its own.
+  (when (or (invocation-rewind inv) (invocation-rewind-mode inv))
+    (return-from %run-headless
+      (%run-rewind-action inv :output output :getenv getenv :data-dir data-dir
+                              :user-config-dir user-config-dir :error-output error-output
+                              :start start)))
   (when (%plan-action-only-p inv)
     (return-from %run-headless
       (%run-plan-action inv :output output :getenv getenv :data-dir data-dir
@@ -831,6 +891,14 @@ USER-DATA-DIRECTORY: sessions live under it."
                 ((invocation-version-p inv)
                  (format output "cl-stack-code ~a~%" +version+)
                  0)
+                ;; H5b
+                ((invocation-list-checkpoints-p inv)
+                 (%list-checkpoints inv :output output :getenv getenv :data-dir data-dir
+                                        :user-config-dir user-config-dir))
+                ((and (not (invocation-print-p inv))
+                      (or (invocation-rewind inv) (invocation-rewind-mode inv)))
+                 (error 'code-usage-error
+                        :message "--rewind needs -p (use /rewind in the interactive mode)"))
                 ((invocation-list-sessions-p inv)
                  (%list-sessions inv :output output :getenv getenv :data-dir data-dir))
                 ((not (invocation-print-p inv))
@@ -850,3 +918,17 @@ USER-DATA-DIRECTORY: sessions live under it."
 (defun main ()
   "Binary entry point: quit with RUN-CLI's exit code."
   (uiop:quit (run-cli (uiop:command-line-arguments))))
+
+;;; H5b: --rewind and --list-checkpoints (see the "H5b" part of the file
+;;; header).
+
+(defun %run-rewind-action (inv &key output getenv data-dir user-config-dir error-output start)
+  "--rewind TURN on the resumed session, without a run. → exit code."
+  (declare (ignore inv output getenv data-dir user-config-dir error-output start))
+  (%not-implemented '%run-rewind-action))
+
+(defun %list-checkpoints (inv &key output getenv data-dir user-config-dir)
+  "--list-checkpoints: the resumed session's CHECKPOINT-SUMMARY-LINES on
+OUTPUT. → 0."
+  (declare (ignore inv output getenv data-dir user-config-dir))
+  (%not-implemented '%list-checkpoints))

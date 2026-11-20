@@ -204,6 +204,76 @@
 ;;;             open: :error "plan <id8> is open: /approve or /reject it
 ;;;             first" and nothing else.
 ;;; While busy /plan, /approve and /reject add the same :error as /clear.
+;;;
+;;; H5b: checkpoints and rewind (src/checkpoints.lisp).
+;;;
+;;; Events
+;;;   (:rewind-prompt :n N :turn T :paths P)
+;;;                           /rewind [N] without a part: the program found
+;;;                           that turn T's files differ from the tip's at P
+;;;   (:rewind-drift :paths P)  a files rewind found the working copy changed
+;;;                           at P since the tip checkpoint
+;;;   (:rewound :turn T :parts PARTS :conversation C :files F :changes CH
+;;;             :conflicts X)  a rewind finished (REWIND-TO's result)
+;;;
+;;; Effects
+;;;   (:checkpoints)          the program answers (:notice <CHECKPOINT-SUMMARY-
+;;;                           LINES joined by LF>), "checkpoints are off" when
+;;;                           the checkpointer is disabled and there are none
+;;;   (:rewind N :parts P [:on-drift M])
+;;;                           REWIND-TO the turn N back on the head's line
+;;;                           (its line number, 0 when N is the line's
+;;;                           length) with PARTS P; PLAN-DRIFT → (:rewind-
+;;;                           drift :paths …) and ABORT-APPROVAL unless M
+;;;                           (:rebase / :overwrite) picks the restart; then
+;;;                           (:rewound …) and, when the conversation moved,
+;;;                           H3c's (:session-reset :entries …) first.
+;;;                           (:rewind N) without :parts stays H3c's effect;
+;;;                           the program turns it into (:rewind-prompt …)
+;;;                           when turn T has a checkpoint whose files differ
+;;;                           from the tip's, and rewinds the conversation
+;;;                           only (H3c) otherwise.
+;;;
+;;; State
+;;;   STATE-REWIND            NIL, or (:n N :turn T :parts P :paths PATHS)
+;;;   STATE-REWIND-PROMPT     NIL, :rewind (the rewind dialog,
+;;;                           +REWIND-CHOICES+) or :drift (+DRIFT-CHOICES+)
+;;;
+;;; Commands
+;;;   /checkpoints  (:checkpoints); also while busy (like /tree)
+;;;   /rewind [N] [PART]
+;;;             PART one of conversation, files, both (→ PARTS
+;;;             (:conversation), (:files), (:conversation :files)); N as in
+;;;             H3c (default 1). With a PART: (:rewind N :parts P) and
+;;;             STATE-REWIND (:n N :parts P). Without a PART: H3c's (:rewind
+;;;             N). A second word that is not a PART, or more words: :error
+;;;             "usage: /rewind [N] [conversation|files|both]". A bad N keeps
+;;;             H3c's error. PARTS with :files while a plan is open: :error
+;;;             "plan <id8> is open: /approve or /reject it first". Busy:
+;;;             H3c's "/rewind is not available while a turn runs (Esc
+;;;             interrupts it)".
+;;;
+;;; Rules
+;;;   :rewind-prompt  STATE-REWIND (:n N :turn T :paths P), STATE-REWIND-
+;;;             PROMPT :rewind.
+;;;   :reply    With no approvals and no plan prompt, and STATE-REWIND-PROMPT
+;;;             :rewind: :both → (:rewind N :parts (:conversation :files)),
+;;;             :conversation → (:rewind N :parts (:conversation)), :files →
+;;;             (:rewind N :parts (:files)) (STATE-REWIND gets :parts);
+;;;             :cancel → :notice "rewind canceled", STATE-REWIND NIL.
+;;;             :drift: :rebase / :overwrite → (:rewind N :parts P :on-drift
+;;;             :rebase / :overwrite) with STATE-REWIND's N and P; :abort →
+;;;             :notice "nothing restored", STATE-REWIND NIL. Every answer sets
+;;;             STATE-REWIND-PROMPT NIL.
+;;;   :interrupt  With no approvals and no plan prompt: :rewind as :cancel,
+;;;             :drift as :abort.
+;;;   :rewind-drift  STATE-REWIND-PROMPT :drift (STATE-REWIND gets :paths);
+;;;             :error "the working copy changed since the last checkpoint:
+;;;             P1, P2".
+;;;   :rewound  :notice "rewound to turn T: <REWIND-DESCRIPTION>", or
+;;;             "nothing restored" for F :aborted; STATE-REWIND and
+;;;             STATE-REWIND-PROMPT NIL.
+
 
 (defparameter +help-text+
   (format nil "~{~a~^~%~}"
@@ -215,7 +285,8 @@
             "  /session              show the session id"
             "  /tree                 show the session's turns as a tree"
             "  /fork [AT]            branch off before turn AT (a number or an id from /tree; default the last)"
-            "  /rewind [N]           go back N turns (default 1); later turns stay in /tree"
+            "  /rewind [N] [PART]    go back N turns (default 1): conversation, files or both; later turns stay in /tree"
+            "  /checkpoints          list the session's checkpoints (the file states /rewind restores)"
             "  /clone                continue in a copy of this session"
             "  /export FILE          write the conversation as markdown, or JSON for a .json FILE"
             "  /steer MESSAGE        send MESSAGE into the running turn (also Ctrl-T)"
@@ -250,6 +321,13 @@ for feedback.")
     (:abort "Cancel"))
   "H5a: the drift dialog's choices.")
 
+(defparameter +rewind-choices+
+  '((:both "Conversation and files")
+    (:conversation "Conversation only")
+    (:files "Files only")
+    (:cancel "Cancel"))
+  "H5b: the rewind dialog's choices.")
+
 (defclass interactive-state ()
   ((transcript :initform '() :accessor state-transcript
                :documentation "ENTRY list, oldest first.")
@@ -282,7 +360,14 @@ not taken yet, oldest first.")
    (plan :initform nil :accessor state-plan
          :documentation "NIL, or (:id ID :kind K :root ROOT :changes C :diff TEXT).")
    (plan-prompt :initform nil :accessor state-plan-prompt
-                :documentation "NIL, :PLAN or :DRIFT: the plan dialog to show."))
+                :documentation "NIL, :PLAN or :DRIFT: the plan dialog to show.")
+   ;; H5b
+   (rewind :initform nil :accessor state-rewind
+           :documentation "NIL, or (:n N :turn T :parts P :paths PATHS) of the rewind being
+asked about or run.")
+   (rewind-prompt :initform nil :accessor state-rewind-prompt
+                  :documentation "NIL, :REWIND (the rewind dialog, +REWIND-CHOICES+) or :DRIFT
+(the rewind's drift dialog, +DRIFT-CHOICES+)."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
@@ -309,6 +394,10 @@ none). → effects (see the file header)."
       ((string= command "/tree") (list (list :tree)))
       ((string= command "/fork")
        (list (list :fork (if (zerop (length argument)) nil argument))))
+      ;; H5b
+      ((string= command "/checkpoints") (list (list :checkpoints)))
+      ((and (string= command "/rewind") (%rewind-part-argument-p argument))
+       (%rewind-command state argument))
       ((string= command "/rewind")
        (let ((n (cond ((zerop (length argument)) 1)
                       ((every #'digit-char-p argument) (parse-integer argument))
@@ -421,7 +510,8 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
   (multiple-value-bind (command argument) (%split-command text)
     (let ((busy (state-busy-p state)))
       (cond
-        ((member command '("/session" "/tree" "/fork" "/rewind" "/clone" "/export" "/steer")
+        ((member command '("/session" "/tree" "/fork" "/rewind" "/clone" "/export" "/steer"
+                                 "/checkpoints")
                  :test #'string=)
          (%session-command state command argument))
         ;; H5a
@@ -555,6 +645,7 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               (:submit (%submit state (first args)))
               (:interrupt (cond ((state-approvals state) (%reply state :reject-all nil))
                                 ((state-plan-prompt state) (%plan-event state event))
+                                ((state-rewind-prompt state) (%rewind-event state event))
                                 ((state-busy-p state) (list (list :cancel)))
                                 (t '())))
               (:quit (%quit-effects state))
@@ -564,9 +655,11 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               (:invocation (%core-invocation state (first args)))
               (:turn-end (destructuring-bind (&key reason pending message) args
                            (%on-turn-end state reason pending message)))
-              (:reply (if (and (null (state-approvals state)) (state-plan-prompt state))
-                          (%plan-event state event)
-                          (%reply state (first args) (second args))))
+              (:reply (cond ((state-approvals state) (%reply state (first args) (second args)))
+                            ((state-plan-prompt state) (%plan-event state event))
+                            ;; H5b
+                            ((state-rewind-prompt state) (%rewind-event state event))
+                            (t (%reply state (first args) (second args)))))
               (:model-set (setf (state-model state) (first args))
                (%add-entry state :kind :notice :text (format nil "model: ~a" (first args)))
                '())
@@ -574,7 +667,9 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               (:error (%add-entry state :kind :error :text (first args)) '())
               ((:steer :steered :session :session-reset) (%session-event state event))
               ((:plan-opened :plan-projected :plan-drift :plan-closed)
-               (%plan-event state event))))))
+               (%plan-event state event))
+              ;; H5b
+              ((:rewind-prompt :rewind-drift :rewound) (%rewind-event state event))))))
     (values state effects)))
 
 (defun %home-relative (dir)
@@ -751,3 +846,27 @@ middle, not its end: the project directory name stays (#4)."
       (:reply (%plan-reply state (first args)))
       (:interrupt
        (%plan-reply state (if (eq :drift (state-plan-prompt state)) :abort :continue))))))
+
+;;; H5b: rewind (see the "H5b" part of the file header).
+
+(defparameter +rewind-part-names+ '("conversation" "files" "both")
+  "The PART words of /rewind [N] [PART].")
+
+(defun %rewind-part-argument-p (argument)
+  "True when the /rewind ARGUMENT is not H3c's: it has more than one word, or
+its one word is a PART."
+  (let ((words (remove "" (uiop:split-string argument :separator '(#\Space #\Tab))
+                       :test #'string=)))
+    (or (rest words)
+        (and words (member (first words) +rewind-part-names+ :test #'string=)))))
+
+(defun %rewind-command (state argument)
+  "/rewind with a PART (or extra words): → effects."
+  (declare (ignore state argument))
+  (%not-implemented '%rewind-command))
+
+(defun %rewind-event (state event)
+  "Apply EVENT, one of (:rewind-prompt …) (:rewind-drift …) (:rewound …), or a
+(:reply …) / (:interrupt) answering the rewind prompt. → effects."
+  (declare (ignore state event))
+  (%not-implemented '%rewind-event))

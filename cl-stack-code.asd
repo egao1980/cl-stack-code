@@ -1,6 +1,6 @@
 (defsystem "cl-stack-code"
-  :version "0.4.1"
-  :description "Coding agent CLI on cl-stack: plan mode (edits and shell commands in a copy of the project, a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
+  :version "0.5.0"
+  :description "Coding agent CLI on cl-stack: checkpoints (every turn that changes files records a composite revision of the conversation and the files: a pathlib snapshot, a git commit on a private ref, or a jj working-copy commit) and per-part rewinds (conversation, files or both, drift-checked), plan mode (edits and shell commands in a copy of the project, a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "ai-agent-protocol" "0.14.0")
@@ -13,10 +13,11 @@
                (:version "cli-backend-clingon" "0.2.0")
                "json-protocol"
                "json-backend-jzon"
-               (:version "cl-stack-pathlib" "0.6.0")
+               (:version "cl-stack-pathlib" "0.7.0")
                (:version "diff-protocol" "0.3.0")
-               (:version "revision-protocol" "0.3.0")
-               (:version "revision-backend-git" "0.4.0")
+               (:version "revision-protocol" "0.4.0")
+               (:version "revision-backend-git" "0.5.1")
+               (:version "revision-backend-jj" "0.3.1")
                (:version "datetime-protocol" "0.1.3")
                (:version "tui-protocol" "0.2.0")
                "tui-protocol/widgets"
@@ -43,6 +44,7 @@
                (:file "sessions")
                (:file "session-views")
                (:file "plans")
+               (:file "checkpoints")
                (:file "interactive")
                (:file "headless")
                (:file "program"))
@@ -65,6 +67,7 @@
                "diff-protocol"
                "revision-protocol"
                "revision-backend-git"
+               "revision-backend-jj"
                "cl-stack-pathlib"
                "datetime-protocol"
                "tui-protocol"
@@ -109,7 +112,13 @@
                (:file "plan-test")
                (:file "plan-cli-test")
                (:file "plan-core-test")
-               (:file "plan-program-test"))
+               (:file "plan-program-test")
+               ;; H5b
+               (:file "checkpoint-support")
+               (:file "checkpoint-test")
+               (:file "checkpoint-cli-test")
+               (:file "checkpoint-core-test")
+               (:file "checkpoint-program-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

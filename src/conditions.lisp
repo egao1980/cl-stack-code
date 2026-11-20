@@ -195,3 +195,50 @@ Exit 1.")
                                         (plan-drift-paths c)))))))
 
 (defmethod condition-exit-code ((condition plan-not-found)) 2)
+
+;;; H5b: checkpoints (src/checkpoints.lisp).
+
+(define-condition checkpoint-error (code-error)
+  ((session :initarg :session :reader checkpoint-error-session :initform nil
+            :documentation "The session id, or NIL."))
+  (:documentation "Root of the checkpoint errors: a checkpoint store or
+file that cannot be read or written, an explicit checkpoints.kind that does
+not fit the project (\"checkpoints.kind git: DIR is not a git worktree\",
+\"checkpoints.kind jj: DIR is not a jj workspace\"). Exit 1.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c) "checkpoint error")))))
+
+(define-condition checkpoint-not-found (checkpoint-error)
+  ((designator :initarg :designator :reader checkpoint-not-found-designator
+               :initform nil
+               :documentation "The turn (\"0\", a number, an id prefix) or
+checkpoint id asked for, as given."))
+  (:documentation "No checkpoint for that checkpoint id or prefix
+(FIND-CHECKPOINT), or no files state for that turn (a files rewind of a
+turn that TURN-CHECKPOINT answers NIL for). The default message is
+\"session S has no checkpoint for turn T\" (or \"session S has no checkpoint
+X\" for FIND-CHECKPOINT). Exit 2: it comes from the command line.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "session ~a has no checkpoint for turn ~a"
+                                        (or (checkpoint-error-session c) "?")
+                                        (checkpoint-not-found-designator c)))))))
+
+(define-condition checkpoint-expired (checkpoint-error)
+  ((checkpoint :initarg :checkpoint :reader checkpoint-expired-checkpoint
+               :initform nil
+               :documentation "The CHECKPOINT whose files are gone."))
+  (:documentation "A files rewind needs a checkpoint whose files were
+garbage-collected (retention, CHECKPOINTER-KEEP), or whose backend no
+longer has them (a jj commit dropped from jj's operation log, a git commit
+whose private ref was deleted and the object pruned). Nothing was restored.
+The default message is \"checkpoint <id8> for turn T was garbage-collected\".
+Exit 1.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (let ((k (checkpoint-expired-checkpoint c)))
+                                  (format nil "checkpoint ~a for turn ~a was garbage-collected"
+                                          (if k (subseq (checkpoint-id k) 0 8) "?")
+                                          (if k (checkpoint-turn k) "?"))))))))
+
+(defmethod condition-exit-code ((condition checkpoint-not-found)) 2)

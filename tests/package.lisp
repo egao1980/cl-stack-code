@@ -18,6 +18,7 @@
                     (#:pp #:pty-protocol)
                     (#:rev #:revision-protocol)
                     (#:git #:revision-backend-git)
+                    (#:jj #:revision-backend-jj)
                     (#:p #:cl-stack-pathlib)
                     (#:dt #:datetime-protocol)))
 

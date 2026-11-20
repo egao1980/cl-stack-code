@@ -174,6 +174,13 @@
               :documentation "<plans dir>/<id>/ (a directory pathname).")
    (opened-at :initarg :opened-at :reader plan-opened-at
               :documentation "Universal time the plan was opened.")
+   ;; H5b
+   (rewind :initarg :rewind :initform nil :reader plan-rewind
+           :documentation "NIL for a plan of plan mode. A rewind plan (src/checkpoints.lisp)
+holds (:session S :to CHECKPOINT-ID :from CHECKPOINT-ID): the session it
+rewinds, the checkpoint whose files the area holds and the tip checkpoint
+whose files are its base. Serialized as the optional :REWIND key of
+plan.sexp (+PLAN-FORMAT+ stays 1).")
    (store :initarg :store :initform nil :accessor %plan-store
           :documentation ":copy: the DIRECTORY-SNAPSHOT-STORE; :git: the GIT-STORE
 on the project (opened lazily by the implementation)."))
@@ -332,6 +339,8 @@ target). EXPECTED-HASH (when given) goes to FS-WRITE-ATOMIC."
                     :session (plan-session-id plan)
                     :opened-at (plan-opened-at plan)
                     :version +version+)))
+    (when (plan-rewind plan)
+      (setf form (append form (list :rewind (copy-list (plan-rewind plan))))))
     (p:write-text (%plan-file (plan-directory plan))
                   (with-standard-io-syntax
                     (let ((*package* (find-package :keyword)))
@@ -356,14 +365,15 @@ naming the file."
                           (read-from-string (uiop:read-file-string file :external-format :utf-8))))
                     (error (e) (bad e)))))
         (destructuring-bind (&key format id kind project-dir root base status session opened-at
-                             &allow-other-keys)
+                               rewind &allow-other-keys)
             (if (%plist-p form) form (bad "not a property list"))
           (unless (and (eql format +plan-format+)
                        (stringp id) (member kind '(:copy :git))
                        (stringp project-dir) (stringp root) (stringp base)
                        (member status '(:open :applied :discarded))
                        (or (null session) (stringp session))
-                       (integerp opened-at))
+                       (integerp opened-at)
+                       (%plist-p rewind))
             (bad "unexpected contents"))
           (make-instance 'plan
                          :id id :kind kind
@@ -371,7 +381,8 @@ naming the file."
                          :root (uiop:parse-native-namestring root :ensure-directory t)
                          :base base :status status :session-id session
                          :directory (uiop:ensure-directory-pathname directory)
-                         :opened-at opened-at))))))
+                         :opened-at opened-at
+                         :rewind (copy-list rewind)))))))
 
 ;;; Stores.
 
@@ -810,11 +821,19 @@ base) and move the plan ref to it by CAS."
     (%cas-ref store (%plan-ref plan) new (plan-base plan))
     new))
 
-(defun approve-plan (plan &key message)
+(defun approve-plan (plan &key message checkpointer)
   "Apply PLAN to the working copy. → (values result status), status
 :APPLIED, :EMPTY, :REBASED or :ABORTED; PLAN-DRIFT with restarts REBASE-PLAN,
-OVERWRITE-PLAN and ABORT-APPROVAL."
+OVERWRITE-PLAN and ABORT-APPROVAL.
+
+H5b: with an enabled CHECKPOINTER, a third value: the FILES-STATE of the
+working copy read before anything was written when the status is :APPLIED,
+NIL otherwise. The caller records the plan's checkpoints with
+RECORD-PLAN-CHECKPOINTS (src/checkpoints.lisp, \"Plan mode\")."
   (check-type message (or null string))
+  (when (and checkpointer (checkpointer-enabled-p checkpointer))
+    (return-from approve-plan
+      (%approve-plan-with-checkpoints plan message checkpointer)))
   (%check-open plan)
   (%with-plan-store (plan)
     (let* ((base (%base-view plan))
