@@ -139,7 +139,7 @@
 (deftest program-clone-switches-sessions
   (with-project (project config) '()
     (let ((dir (project-sessions project config)))
-      (with-code-tui (tui program backend :steps '("answer one" "answer more")) (project config)
+      (with-code-tui (tui program backend :cols 160 :steps '("answer one" "answer more")) (project config)
         (send-line tui "one")
         (ok (wait-screen tui "answer one"))
         (ok (wait-idle tui program))
@@ -274,6 +274,9 @@
         (ctrl tui :t)
         (ok (wait-screen tui "steering: steer me"))
         (h:tui-press tui :escape)
+        ;; A lone Esc is reported only after the input read times out; let it
+        ;; register before the gated reply goes on.
+        (sleep 0.5)
         (open-gate gate)
         (ok (wait-screen tui "interrupted"))
         (ok (wait-idle tui program))
@@ -291,7 +294,7 @@
            (s (create-session dir)))
       (commit s "earlier")
       (let ((gate (make-gate)))
-        (with-code-tui (tui program backend :gates (list gate) :argv (list "--resume" (session-id s))
+        (with-code-tui (tui program backend :cols 160 :gates (list gate) :argv (list "--resume" (session-id s))
                             :steps (list (list :gate gate "mine")))
             (project config)
           (send-line tui "my turn")
