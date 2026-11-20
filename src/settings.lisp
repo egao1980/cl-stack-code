@@ -38,6 +38,12 @@ means unset.")
 keys this layer sets: :ENABLED (T or NIL), :KEEP (an integer >= 1), :KIND
 (:AUTO :JJ :GIT :COPY). An absent key is unset; a present :ENABLED NIL means
 false. See CHECKPOINT-SETTINGS.")
+   ;; H4b
+   (lisp-image :initarg :lisp-image :reader settings-lisp-image :initform nil
+               :documentation "The \"lispImage\" object as a plist of the keys this
+layer sets: :IMAGE (a designator from PARSE-LISP-IMAGE-DESIGNATOR), :BACKEND
+(\"swank\" or \"slynk\"), :OBSERVE (T or NIL), :ON-DEBUGGER (:TURN or :NOTICE).
+See LISP-IMAGE-SETTINGS.")
    (files :initarg :files :reader settings-files :initform nil
           :documentation "Settings files this layer was read from, in order."))
   (:documentation "One settings layer, or the merge of several."))
@@ -51,14 +57,16 @@ false. See CHECKPOINT-SETTINGS.")
   (typep x 'settings))
 
 (defun make-settings (&key model max-turns permission-mode allow ask deny env
-                        append-system-prompt files checkpoints)
+                        append-system-prompt files checkpoints lisp-image)
   "A SETTINGS layer. NIL means unset for every scalar. CHECKPOINTS (H5b): a
-plist of the checkpoints keys this layer sets."
+plist of the checkpoints keys this layer sets. LISP-IMAGE (H4b): a plist of the
+lispImage keys this layer sets."
   (make-instance 'settings :model model :max-turns max-turns
                            :permission-mode permission-mode
                            :allow allow :ask ask :deny deny :env env
                            :append-system-prompt append-system-prompt
                            :checkpoints (copy-list checkpoints)
+                           :lisp-image (copy-list lisp-image)
                            :files files))
 
 ;;; H5b: the checkpoints object.
@@ -118,6 +126,97 @@ defaults applied: enabled T, keep +DEFAULT-CHECKPOINT-KEEP+, kind :AUTO."
     (values (getf plist :enabled t)
             (getf plist :keep +default-checkpoint-keep+)
             (getf plist :kind :auto))))
+
+;;; H4b: the lispImage object (given code).
+;;;
+;;;   "lispImage": {"image": "spawn", "backend": "swank", "observe": false,
+;;;                 "onDebugger": "turn"}
+;;;
+;;; image       "off" (default), "spawn", or "attach:PORT" / "attach:HOST:PORT"
+;;;             (PARSE-LISP-IMAGE-DESIGNATOR): the live image the lisp tools
+;;;             start with. --lisp-image sets it from the command line.
+;;; backend     "swank" (default) or "slynk".
+;;; observe     boolean (default false): the lisp tools in observe mode
+;;;             (lisp-mcp/agent :mode :observe). Only with "attach:…".
+;;;             --lisp-observe sets it.
+;;; onDebugger  "turn" (default) or "notice": what an image event does in the
+;;;             interactive mode when no turn runs (see src/lisp-image.lisp).
+;;; Layers merge per key. A bad value signals SETTINGS-ERROR with key path
+;;; "lispImage", "lispImage.image", "lispImage.backend", "lispImage.observe"
+;;; or "lispImage.onDebugger".
+
+(defparameter +lisp-image-backend-names+ '("swank" "slynk")
+  "H4b: the lispImage.backend values.")
+
+(defparameter +on-debugger-names+ '("turn" "notice")
+  "H4b: the lispImage.onDebugger values.")
+
+(defun parse-lisp-image-designator (string)
+  "STRING → (:OFF), (:SPAWN) or (:ATTACH HOST PORT); NIL when it is none of
+\"off\", \"spawn\", \"attach:PORT\", \"attach:HOST:PORT\". HOST defaults to
+\"127.0.0.1\"; PORT is a decimal integer 1..65535; HOST is not empty and has no
+colon."
+  (when (stringp string)
+    (cond ((string= string "off") (list :off))
+          ((string= string "spawn") (list :spawn))
+          ((uiop:string-prefix-p "attach:" string)
+           (let* ((rest (subseq string (length "attach:")))
+                  (colon (position #\: rest))
+                  (host (if colon (subseq rest 0 colon) "127.0.0.1"))
+                  (port-text (if colon (subseq rest (1+ colon)) rest))
+                  (port (and (plusp (length port-text))
+                             (every #'digit-char-p port-text)
+                             (parse-integer port-text))))
+             (and port (<= 1 port 65535)
+                  (plusp (length host))
+                  (not (find #\: host))
+                  (list :attach host port))))
+          (t nil))))
+
+(defun %parse-lisp-image (file value)
+  (unless (hash-table-p value)
+    (%settings-fail file "lispImage" "must be an object with image, backend, observe and onDebugger"))
+  (let ((out '()))
+    (multiple-value-bind (image present) (%json-present value "image")
+      (when present
+        (let ((designator (parse-lisp-image-designator image)))
+          (unless designator
+            (%settings-fail file "lispImage.image"
+                            "must be \"off\", \"spawn\" or \"attach:[HOST:]PORT\""))
+          (setf out (list* :image designator out)))))
+    (multiple-value-bind (backend present) (%json-present value "backend")
+      (when present
+        (unless (and (stringp backend)
+                     (member backend +lisp-image-backend-names+ :test #'string=))
+          (%settings-fail file "lispImage.backend" "must be one of ~{~a~^, ~}"
+                          +lisp-image-backend-names+))
+        (setf out (list* :backend backend out))))
+    (multiple-value-bind (observe present) (%json-present value "observe")
+      (when present
+        (unless (member observe '(t nil))
+          (%settings-fail file "lispImage.observe" "must be true or false"))
+        (setf out (list* :observe observe out))))
+    (multiple-value-bind (policy present) (%json-present value "onDebugger")
+      (when present
+        (unless (and (stringp policy) (member policy +on-debugger-names+ :test #'string=))
+          (%settings-fail file "lispImage.onDebugger" "must be one of ~{~a~^, ~}"
+                          +on-debugger-names+))
+        (setf out (list* :on-debugger (intern (string-upcase policy) :keyword) out))))
+    out))
+
+(defun lisp-image-settings (settings)
+  "→ (values image backend observe on-debugger) of SETTINGS's lispImage
+object with the defaults applied: image (:OFF), backend \"swank\", observe
+NIL, on-debugger :TURN."
+  (let ((plist (and settings (settings-lisp-image settings))))
+    (values (getf plist :image (list :off))
+            (getf plist :backend "swank")
+            (getf plist :observe nil)
+            (getf plist :on-debugger :turn))))
+
+(defun lisp-image-enabled-p (settings)
+  "True when SETTINGS's lispImage.image is spawn or attach."
+  (not (eq :off (first (lisp-image-settings settings)))))
 
 
 (defparameter +permission-mode-keywords+
@@ -206,7 +305,9 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
              (env (multiple-value-bind (value present) (%json-present object "env")
                     (and present (%parse-env file value))))
              (checkpoints (multiple-value-bind (value present) (%json-present object "checkpoints")
-                            (and present (%parse-checkpoints file value)))))
+                            (and present (%parse-checkpoints file value))))
+             (lisp-image (multiple-value-bind (value present) (%json-present object "lispImage")
+                           (and present (%parse-lisp-image file value)))))
         (make-settings
          :model model
          :max-turns max-turns
@@ -217,6 +318,7 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
          :deny (and permissions (%parse-rule-array file permissions "deny" :deny))
          :env env
          :checkpoints checkpoints
+         :lisp-image lisp-image
          :files (and file (list file)))))))
 
 (defun read-settings-file (pathname)
@@ -282,6 +384,7 @@ gives the value (NIL = unset). Fresh conses; the layers are not modified."
        :deny (%merge-rules (mapcar #'settings-deny layers))
        :env (%merge-env (mapcar #'settings-env layers))
        :checkpoints (%merge-checkpoints (mapcar #'settings-checkpoints layers))
+       :lisp-image (%merge-checkpoints (mapcar #'settings-lisp-image layers))
        :files (loop for layer in layers append (settings-files layer))))))
 
 ;;; Where the files are.

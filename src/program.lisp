@@ -208,6 +208,34 @@
 ;;;                    "Changed in both: P1, P2" and +DRIFT-CHOICES+. Events
 ;;;                    as for the plan dialogs ((:reply CHOICE) /
 ;;;                    (:interrupt)).
+;;;
+;;; H4b: the Lisp image (src/lisp-image.lisp; left to the implementation).
+;;;   Start            With SETTINGS-LISP-IMAGE non-NIL, MAKE-CODE-PROGRAM
+;;;                    runs CHECK-LISP-IMAGE-SETTINGS; with the image on it
+;;;                    makes the three sources (MAKE-CODE-TOOLS, the lisp
+;;;                    tools' :ON-IMAGE-EVENT sending IMAGE-EVENT-MESSAGE with
+;;;                    TUI-SEND once the TUI runs; events before that are
+;;;                    sent at TUI-INIT), runs START-LISP-IMAGE, adds the
+;;;                    system prompt section, and gives the state
+;;;                    LISP-IMAGE-STATE. All before the terminal is touched
+;;;                    (CODE-USAGE-ERROR, LISP-IMAGE-ERROR).
+;;;   Effects          (:post-image-events) → POST-IMAGE-EVENTS into the run
+;;;                    on the agent thread while it is going.
+;;;                    (:image-turn) → TAKE-IMAGE-EVENTS; none → (:turn-end
+;;;                    :reason :stop); else a turn (as :run does, without
+;;;                    EXPAND-MENTIONS) whose message is the first event's
+;;;                    turn, the others posted right after; its record's
+;;;                    prompt is the first event's text. Every :run posts the
+;;;                    queued events right after starting its turn.
+;;;   Turn ends        After a :turn-end that leaves the program idle, the
+;;;                    queued events' count goes out as (:image-pending N)
+;;;                    when it is > 0.
+;;;   Layout           IMAGE-BANNER-TEXT, when non-NIL, is one row directly
+;;;                    above the "─" rule (below the queued, steering and
+;;;                    spinner rows), cut to the width.
+;;;   Close            CLOSE-CODE-PROGRAM also runs CLOSE-LISP-TOOLS (a
+;;;                    spawned image is killed, an attached one keeps
+;;;                    running).
 
 
 (defclass code-program ()
@@ -291,7 +319,10 @@
    (checkpointer :initarg :checkpointer :initform nil :reader %cp-checkpointer
                  :documentation "The CHECKPOINTER, from MAKE-CODE-PROGRAM.")
    (turn-pre :initform nil :accessor %cp-turn-pre
-             :documentation "Loop thread: BEGIN-CHECKPOINT-TURN's state for the running turn."))
+             :documentation "Loop thread: BEGIN-CHECKPOINT-TURN's state for the running turn.")
+   ;; H4b
+   (image-link :initarg :image-link :initform nil :reader %cp-image-link
+               :documentation "The image link (src/lisp-image.lisp) when the image is on, else NIL."))
   (:documentation "The interactive mode as a tui-protocol program."))
 
 (defun %make-input (program-cell)
@@ -322,6 +353,10 @@ configuration errors of -p signal here."
                     (resolve-model designator :providers providers :env env)))
          (backend (first resolved))
          (mode (or (settings-permission-mode settings) :default))
+         ;; H4b: the checks, before the session is written.
+         (link (when (settings-lisp-image settings)
+                 (check-lisp-image-settings settings mode)
+                 (and (lisp-image-enabled-p settings) (%make-image-link))))
          (project-dir (or (find-project-root cwd) cwd))
          (session (%session-for-run invocation source sessions-dir project-dir))
          ;; H5b: before the terminal is touched.
@@ -334,13 +369,20 @@ configuration errors of -p signal here."
          (let ((program
                  (let ((event:*event-backend* event-backend)
                        (event:*event-loop* event-loop))
-                   (setf sources (make-code-tools cwd :settings settings))
+                   (setf sources (make-code-tools cwd :settings settings
+                                                      :on-image-event (and link (%link-callback link))))
+                   ;; H4b: the image starts before the terminal is touched; its
+                   ;; events wait in the link until TUI-INIT.
+                   (when link
+                     (setf (%link-tools link) (third sources))
+                     (start-lisp-image (third sources) settings))
                    (let* ((offered (loop for source in sources
                                          append (mapcar #'llm:llm-tool-name
                                                         (agent:list-agent-tools source))))
                           (instructions (assemble-system-prompt
                                          cwd :tools offered :backend backend
-                                             :settings settings :user-config-dir config))
+                                             :settings settings :user-config-dir config
+                                             :lisp-image (third sources)))
                           (store (make-settings-rule-store
                                   (third (settings-file-paths cwd :user-config-dir config))))
                           (agent (agent:make-ai-agent
@@ -361,7 +403,8 @@ configuration errors of -p signal here."
                                      :rules (append (settings-allow settings)
                                                     (settings-ask settings)
                                                     (settings-deny settings))
-                                     :session-id (session-id session))
+                                     :session-id (session-id session)
+                                     :image (lisp-image-state settings))
                              :input (%make-input cell)
                              :session session :sessions-dir sessions-dir
                              :project-dir project-dir :designator designator
@@ -376,6 +419,7 @@ configuration errors of -p signal here."
                              :data-dir data-dir
                              :user-config-dir config
                              :checkpointer checkpointer
+                             :image-link link
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -393,6 +437,7 @@ configuration errors of -p signal here."
            (setf done t)
            program)
       (unless done
+        (%link-close link)
         (when (second sources)
           (tools:close-shell-tools (second sources)))
         (close-checkpointer checkpointer)
@@ -580,9 +625,11 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
           (:invocation (%send program (list :invocation payload))))
       (error (e) (%send program (list :error (%message-text e)))))))
 
-(defun %loop-start-turn (program text)
+(defun %loop-start-turn (program text &key message more)
   "Loop thread: send TEXT (mentions expanded) as the next user message. A new
-run starts on the session's conversation."
+run starts on the session's conversation. H4b: MESSAGE (an LLM-TURN) is sent
+instead, as it is, with TEXT as the record's prompt, and the turns MORE are
+posted right after it; then the queued image events are posted."
   (let ((ok (%turn-callback program))
         (err (%turn-error-callback program)))
     (setf (%cp-turn-prompt program) text)
@@ -603,7 +650,7 @@ run starts on the session's conversation."
                        (if (%cp-plan program)
                            (plan-tool-root (%cp-plan program) (%cp-cwd program))
                            (%cp-cwd program))))
-               (prompt (expand-mentions text root))
+               (prompt (or message (expand-mentions text root)))
                (run (%cp-run program)))
           (setf (%cp-handle program)
                 (if run
@@ -616,10 +663,38 @@ run starts on the session's conversation."
                             (%cp-turn-usage program) (list 0 0 0 0)
                             (%cp-turn-steering program) '())
                       (agent:run-ai-agent-async (%cp-agent program)
-                                                (append history (list (llm:user-turn prompt)))
+                                                (append history
+                                                        (list (if (stringp prompt)
+                                                                  (llm:user-turn prompt)
+                                                                  prompt)))
                                                 :on-event (%program-agent-event program)
-                                                :callback ok :error-callback err)))))
+                                                :callback ok :error-callback err))))
+          ;; H4b: the run is going now (:started came synchronously, a
+          ;; continued run's finish reason is cleared), and its first step is
+          ;; still to come: these posts follow the turn's message.
+          (let ((run (%cp-run program)))
+            (when run
+              (dolist (turn more)
+                (agent:agent-run-post run turn))
+              (%post-if-going (%cp-lisp-tools program) run))))
       (error (e) (funcall err e)))))
+
+(defun %cp-lisp-tools (program)
+  "H4b: PROGRAM's LISP-TOOLS, or NIL."
+  (third (%cp-sources program)))
+
+(defun %loop-start-image-turn (program)
+  "H4b, loop thread: a turn whose message is the first queued image event's
+turn, the others posted right after; none queued → (:turn-end :reason :stop).
+Events taken here and lost to a failing start stay in the transcript as
+notices (lisp-mcp/agent has no way to queue them again)."
+  (let* ((tools (%cp-lisp-tools program))
+         (events (and tools (lt:take-image-events tools))))
+    (if (null events)
+        (%send program (list :turn-end :reason :stop))
+        (%loop-start-turn program (lt:image-event-text (first events))
+                          :message (lt:image-event-turn (first events))
+                          :more (mapcar #'lt:image-event-turn (rest events))))))
 
 (defun %proposed-p (inv)
   (eq :proposed (agent:agent-invocation-status inv)))
@@ -808,6 +883,11 @@ from the tip's (H5b), else H3c's conversation rewind."
       (:approve-plan (destructuring-bind (&key on-drift) args
                        (%on-loop program (lambda () (%approve-plan-effect program on-drift)))))
       (:reject-plan (%on-loop program (lambda () (%reject-plan-effect program))))
+      ;; H4b
+      (:post-image-events
+       (%on-loop program (lambda () (%post-if-going (%cp-lisp-tools program) (%cp-run program)))))
+      (:image-turn (setf (%cp-interrupted program) nil)
+       (%on-loop program (lambda () (%loop-start-image-turn program))))
       (:quit nil))))
 
 (defun %interrupt-wins (program event)
@@ -831,6 +911,13 @@ goes back to the input)."
     (incf (%cp-generation program))
     (dolist (effect effects)
       (%run-effect program effect)))
+  ;; H4b: a turn end that leaves the program idle with image events queued.
+  (when (eq :turn-end (first event))
+    (let ((tools (%cp-lisp-tools program)))
+      (when (and tools (not (state-busy-p (code-program-state program))))
+        (let ((n (length (lt:lisp-tools-pending-events tools))))
+          (when (plusp n)
+            (%apply-event program (list :image-pending n)))))))
   nil)
 
 (defun %sync-widgets (program)
@@ -881,6 +968,12 @@ goes back to the input)."
   (setf (%cp-thread program)
         (bt:make-thread (lambda () (%agent-thread-main program))
                         :name "cl-stack-code agent"))
+  ;; H4b: image events go to the TUI from now on; the ones that came before
+  ;; it ran are sent first.
+  (let ((link (%cp-image-link program))
+        (run tui:*tui*))
+    (when link
+      (%link-attach link (lambda (event) (tui:tui-send (image-event-message event) run)))))
   (let ((prompt (%cp-prompt program)))
     (when prompt
       (%apply-event program (list :submit prompt))))
@@ -1036,8 +1129,11 @@ goes back to the input)."
          (extra (if (and busy (not dialog))
                     (append (%steering-rows state) (%queued-rows state))
                     '()))
-         (spinner-y (and busy (not dialog) (1- rule-y)))
-         (top (max 0 (- rule-y (if spinner-y 1 0) (length extra)))))
+         ;; H4b: the banner row sits directly above the rule.
+         (banner (image-banner-text state))
+         (banner-y (and banner (1- rule-y)))
+         (spinner-y (and busy (not dialog) (1- (or banner-y rule-y))))
+         (top (max 0 (- rule-y (if banner-y 1 0) (if spinner-y 1 0) (length extra)))))
     (when (or (zerop width) (zerop height))
       (return-from tui:tui-view nil))
     (setf (%cp-width program) width)
@@ -1049,6 +1145,8 @@ goes back to the input)."
       (w:widget-view (or dialog input) (tui:sub-canvas canvas 0 bottom-y width bottom)))
     (when (>= rule-y 0)
       (tui:draw-text canvas 0 rule-y (make-string width :initial-element #\─)))
+    (when (and banner-y (>= banner-y 0))
+      (tui:draw-text canvas 0 banner-y (%cut banner width)))
     (when (and spinner-y (>= spinner-y 0))
       (w:widget-view (%cp-spinner program) (tui:sub-canvas canvas 0 spinner-y width 1))
       (loop for row in extra
@@ -1068,7 +1166,7 @@ goes back to the input)."
     (not (bt:thread-alive-p thread))))
 
 (defun close-code-program (program)
-  "Close PROGRAM's shell tools and event loop. Idempotent. → NIL."
+  "Close PROGRAM's shell tools, lisp tools and event loop. Idempotent. → NIL."
   (unless (%cp-closed program)
     (setf (%cp-stopping program) t)
     (let* ((thread (%cp-thread program))
@@ -1082,6 +1180,9 @@ goes back to the input)."
                                                    (event:stop eb el))))
                         (%join-thread thread 10)))))
       (setf (%cp-closed program) t)
+      ;; H4b: no event is sent after this; a spawned image is killed, an
+      ;; attached one keeps running.
+      (%link-close (%cp-image-link program))
       (let ((shell (second (%cp-sources program))))
         (when shell
           (tools:close-shell-tools shell)))
@@ -1144,7 +1245,10 @@ instructions to the area and drop the run; send (:plan-opened …)."
                                                           :session-id (session-id session))))
            (agent (%cp-agent program))
            (settings (merge-settings (%cp-settings program)
-                                     (make-settings :permission-mode :plan)))
+                                     (make-settings :permission-mode :plan
+                                                   ;; H4b: the image stays with the
+                                                   ;; working directory's sources.
+                                                   :lisp-image '(:image (:off)))))
            (sources (make-code-tools (plan-tool-root plan cwd) :settings settings)))
       (handler-bind ((error (lambda (e)
                               (declare (ignore e))

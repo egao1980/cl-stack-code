@@ -273,6 +273,42 @@
 ;;;   :rewound  :notice "rewound to turn T: <REWIND-DESCRIPTION>", or
 ;;;             "nothing restored" for F :aborted; STATE-REWIND and
 ;;;             STATE-REWIND-PROMPT NIL.
+;;;
+;;; H4b: the Lisp image (src/lisp-image.lisp).
+;;;
+;;; State
+;;;   STATE-IMAGE             NIL (no image), or (:name N :description D
+;;;                           :observe B :on-debugger :turn|:notice
+;;;                           :debuggers DS); DS is a list of (:connection C
+;;;                           :thread T :level L :condition X), newest first
+;;;
+;;; Events
+;;;   (:image-event :kind K :connection C :thread T :level L :condition X
+;;;                 :job J :notice N)
+;;;                           the source queued an image event (K :debugger
+;;;                           or :job)
+;;;   (:image-return :connection C :thread T :level L)
+;;;                           the image left a debugger level
+;;;   (:image-pending N)      a turn ended and N events are still queued
+;;;
+;;; Effects
+;;;   (:post-image-events)    post the queued events into the running turn
+;;;   (:image-turn)           start a turn whose message is the queued events
+;;;
+;;; Rules (STATE-IMAGE NIL: these events change nothing and give no effects)
+;;;   :image-event  A :notice entry N. K :debugger: (:connection C :thread T
+;;;             :level L :condition X) goes to the front of DS, replacing an
+;;;             entry with the same connection, thread and level. Then: busy
+;;;             → ((:post-image-events)); idle and :on-debugger :turn → busy,
+;;;             ((:image-turn)); idle and :notice → no effect (the events
+;;;             reach the model with the next message).
+;;;   :image-return  Every DS entry of that connection and thread whose
+;;;             level is >= L leaves DS. No entry, no effect.
+;;;   :image-pending  Idle, N > 0 and :on-debugger :turn → busy,
+;;;             ((:image-turn)); otherwise nothing.
+;;;   Status line: with STATE-IMAGE, the left side is " <model> · <mode> ·
+;;;   <%IMAGE-MARKER> · <cwd>"; the marker says (debugger) while DS is not
+;;;   empty. IMAGE-BANNER-TEXT is the banner row.
 
 
 (defparameter +help-text+
@@ -367,14 +403,19 @@ not taken yet, oldest first.")
 asked about or run.")
    (rewind-prompt :initform nil :accessor state-rewind-prompt
                   :documentation "NIL, :REWIND (the rewind dialog, +REWIND-CHOICES+) or :DRIFT
-(the rewind's drift dialog, +DRIFT-CHOICES+)."))
+(the rewind's drift dialog, +DRIFT-CHOICES+).")
+   ;; H4b
+   (image :initarg :image :initform nil :accessor state-image
+          :documentation "NIL, or the image plist (see the \"H4b\" part of the file header)."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
-                                    cwd rules session-id)
-  "→ a fresh INTERACTIVE-STATE: empty transcript, idle, usage zero."
+                                    cwd rules session-id image)
+  "→ a fresh INTERACTIVE-STATE: empty transcript, idle, usage zero. IMAGE
+(H4b): LISP-IMAGE-STATE's plist, or NIL."
   (make-instance 'interactive-state :model model :permission-mode permission-mode
-                                    :cwd cwd :rules rules :session-id session-id))
+                                    :cwd cwd :rules rules :session-id session-id
+                                    :image (copy-tree image)))
 
 (defun %session-command (state command argument)
   "H3c: run the session command COMMAND (\"/session\" \"/tree\" \"/fork\"
@@ -669,7 +710,10 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               ((:plan-opened :plan-projected :plan-drift :plan-closed)
                (%plan-event state event))
               ;; H5b
-              ((:rewind-prompt :rewind-drift :rewound) (%rewind-event state event))))))
+              ((:rewind-prompt :rewind-drift :rewound) (%rewind-event state event))
+              ;; H4b
+              ((:image-event :image-return :image-pending)
+               (if (state-image state) (%image-event state event) '()))))))
     (values state effects)))
 
 (defun %home-relative (dir)
@@ -721,9 +765,11 @@ right \"<input> in · <output> out \", the summed input and output tokens.
 With WIDTH (the status line's columns) a cwd that does not fit loses its
 middle, not its end: the project directory name stays (#4)."
   (let* ((cwd (state-cwd state))
-         (prefix (format nil " ~a · ~a · "
+         (prefix (format nil " ~a · ~a · ~@[~a · ~]"
                          (state-model state)
-                         (permission-mode-name (state-permission-mode state))))
+                         (permission-mode-name (state-permission-mode state))
+                         ;; H4b
+                         (and (state-image state) (%image-marker state))))
          (dir (if cwd
                   (%home-relative (uiop:native-namestring
                                    (uiop:ensure-directory-pathname cwd)))

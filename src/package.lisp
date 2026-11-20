@@ -17,7 +17,8 @@
                     (#:rev #:revision-protocol)
                     (#:git #:revision-backend-git)
                     (#:jj #:revision-backend-jj)
-                    (#:dt #:datetime-protocol))
+                    (#:dt #:datetime-protocol)
+                    (#:lt #:lisp-mcp/agent))
   (:export
    ;; entry
    #:run-cli
@@ -367,9 +368,30 @@
    ;; H5b: the interactive core
    #:state-rewind
    #:state-rewind-prompt
-   #:+rewind-choices+))
+   #:+rewind-choices+
+
+   ;; H4b: the Lisp image
+   #:settings-lisp-image
+   #:lisp-image-settings
+   #:lisp-image-enabled-p
+   #:parse-lisp-image-designator
+   #:+lisp-image-backend-names+
+   #:+on-debugger-names+
+   #:+lisp-image-connection+
+   #:check-lisp-image-settings
+   #:make-code-lisp-tools
+   #:start-lisp-image
+   #:lisp-image-description
+   #:lisp-image-state
+   #:image-event-notice
+   #:image-event-message
+   #:image-banner-text
+   #:state-image
+   #:lisp-image-error
+   #:lisp-image-error-image
+   #:lisp-image-error-cause))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.5.0"
+(defparameter +version+ "0.6.0"
   "The product version, as in the .asd.")

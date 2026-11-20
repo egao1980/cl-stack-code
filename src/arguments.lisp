@@ -98,7 +98,21 @@ ours to rebind, so it goes in as :BACKEND)."
            (opt "rewind" "With --resume or --continue and no prompt: rewind the session to turn N (0 = its start)")
            (opt "rewind-mode" "With --rewind: both (default), conversation or files")
            (opt "list-checkpoints" "With --resume or --continue: print the session's checkpoints, newest first"
+                :kind :flag)
+           ;; H4b
+           (opt "lisp-image" "Live Lisp image for the lisp tools: spawn, attach:[HOST:]PORT or off")
+           (opt "lisp-observe" "With --lisp-image attach:…: the lisp tools only observe the image"
                 :kind :flag)))))
+
+(defun %lisp-image-flag (value observe)
+  "H4b: the flag layer's lispImage plist from --lisp-image VALUE and
+--lisp-observe; a VALUE PARSE-LISP-IMAGE-DESIGNATOR refuses →
+CODE-USAGE-ERROR \"unknown --lisp-image \\\"X\\\": use spawn, attach:[HOST:]PORT or off\"."
+  (append (when value
+            (list :image (or (parse-lisp-image-designator value)
+                             (%usage-fail "unknown --lisp-image ~s: use spawn, attach:[HOST:]PORT or off"
+                                          value))))
+          (when observe (list :observe t))))
 
 (defun %output-format (value)
   (cond ((null value) :text)
@@ -191,7 +205,10 @@ are present is checked by RUN-CLI, not here."
                     :permission-mode (%permission-mode (get-opt :permission-mode))
                     :append-system-prompt (get-opt :append-system-prompt)
                     :allow (%flag-rules (get-opt :allowed-tools) :allow)
-                    :deny (%flag-rules (get-opt :disallowed-tools) :deny)))))))
+                    :deny (%flag-rules (get-opt :disallowed-tools) :deny)
+                    ;; H4b
+                    :lisp-image (%lisp-image-flag (get-opt :lisp-image)
+                                                  (get-opt :lisp-observe))))))))
 
 (defun %usage-text (stream)
   "Write the --help text to STREAM."

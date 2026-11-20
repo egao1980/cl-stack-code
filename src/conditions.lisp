@@ -242,3 +242,16 @@ Exit 1.")
                                           (if k (checkpoint-turn k) "?"))))))))
 
 (defmethod condition-exit-code ((condition checkpoint-not-found)) 2)
+
+;;; H4b: the Lisp image (src/lisp-image.lisp).
+
+(define-condition lisp-image-error (code-error)
+  ((image :initarg :image :reader lisp-image-error-image :initform nil
+          :documentation "The image designator: (:SPAWN) or (:ATTACH HOST PORT).")
+   (cause :initarg :cause :reader lisp-image-error-cause :initform nil
+          :documentation "The condition that stopped it, or NIL."))
+  (:documentation "The product could not start its Lisp image:
+\"cannot start the Lisp image: <cause>\" (spawn) or \"cannot attach to the
+Lisp image at HOST:PORT: <cause>\" (attach). Exit 1.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c) "cannot start the Lisp image")))))

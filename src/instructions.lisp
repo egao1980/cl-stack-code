@@ -113,14 +113,15 @@ then, as its own section, +PLAN-MODE-FEEDBACK+. → list of two strings."
                   (uiop:native-namestring (plan-project-dir plan)))
           +plan-mode-feedback+)))
 
-(defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan)
+(defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan lisp-image)
   "→ (values prompt files). Sections joined by one blank line: steer's
 BUILD-SYSTEM-PROMPT for TOOLS (offered names) and BACKEND, the # Environment
 section, each instruction file as <instructions path=\"…\">…</instructions>,
 then SETTINGS-APPEND-SYSTEM-PROMPT. FILES is INSTRUCTION-FILES. H5a: with a
 PLAN, the # Environment section is %PLAN-ENVIRONMENT-SECTIONS (the area's
 directories, the plan line, then +PLAN-MODE-FEEDBACK+); the instruction files
-are still CWD's own."
+are still CWD's own. H4b: with LISP-IMAGE (the LISP-MCP/AGENT:LISP-TOOLS source),
+%LISP-IMAGE-SECTIONS follow the environment sections."
   (let* ((settings (or settings (make-settings)))
          (cwd (%truename-directory cwd))
          (files (instruction-files cwd :user-config-dir user-config-dir))
@@ -131,6 +132,7 @@ are still CWD's own."
                         (%plan-environment-sections cwd plan settings)
                         (list (%environment-section cwd (find-project-root cwd)
                                                     (settings-permission-mode settings))))
+                    (and lisp-image (%lisp-image-sections lisp-image settings))
                     (mapcar #'%instruction-block files)
                     (and append-prompt (plusp (length append-prompt))
                          (list append-prompt)))))

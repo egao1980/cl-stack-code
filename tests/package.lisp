@@ -20,6 +20,8 @@
                     (#:git #:revision-backend-git)
                     (#:jj #:revision-backend-jj)
                     (#:p #:cl-stack-pathlib)
-                    (#:dt #:datetime-protocol)))
+                    (#:dt #:datetime-protocol)
+                    (#:lt #:lisp-mcp/agent)
+                    (#:repl #:repl-protocol)))
 
 (in-package #:cl-stack-code/tests)
