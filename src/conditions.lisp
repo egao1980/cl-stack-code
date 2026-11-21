@@ -255,3 +255,48 @@ Exit 1.")
 Lisp image at HOST:PORT: <cause>\" (attach). Exit 1.")
   (:report (lambda (c s)
              (format s "~a" (or (code-error-message c) "cannot start the Lisp image")))))
+
+;;; H3d: the SDK and --rpc (src/client.lisp, src/rpc.lisp). Given code.
+;;; --rpc maps each of them to a JSON-RPC error code (+RPC-ERROR-CODES+).
+
+(define-condition client-closed (code-error) ()
+  (:documentation "A client function was called after CLOSE-CLIENT (or while
+it closed). JSON-RPC -32014.")
+  (:default-initargs :message "the client is closed"))
+
+(define-condition session-not-open (code-error)
+  ((id :initarg :id :reader session-not-open-id :initform nil
+       :documentation "The session id the caller gave."))
+  (:documentation "No session with that id is open in this client (or the
+session was closed). Open it with CLIENT-RESUME-SESSION (session/resume).
+JSON-RPC -32002.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "session ~a is not open (session/resume opens it)"
+                                        (session-not-open-id c)))))))
+
+(define-condition turn-busy (code-error)
+  ((session-id :initarg :session-id :reader turn-busy-session-id :initform nil))
+  (:documentation "The session has a turn running or waiting for approvals:
+one turn per session at a time. JSON-RPC -32003.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "session ~a has a turn running (wait for its result, steer it or interrupt it)"
+                                        (turn-busy-session-id c)))))))
+
+(define-condition turn-not-running (code-error)
+  ((session-id :initarg :session-id :reader turn-not-running-session-id :initform nil))
+  (:documentation "Steering needs a running turn. JSON-RPC -32004.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "session ~a has no turn running (start one with turn/start)"
+                                        (turn-not-running-session-id c)))))))
+
+(define-condition approval-not-found (code-error)
+  ((id :initarg :id :reader approval-not-found-id :initform nil
+       :documentation "The tool call id the caller answered."))
+  (:documentation "No approval with that id is waiting in the session.
+JSON-RPC -32005.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "no approval ~a is waiting" (approval-not-found-id c)))))))

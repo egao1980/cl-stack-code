@@ -389,9 +389,85 @@
    #:state-image
    #:lisp-image-error
    #:lisp-image-error-image
-   #:lisp-image-error-cause))
+   #:lisp-image-error-cause
+
+   ;; H3d: the SDK (src/client.lisp)
+   #:code-client
+   #:make-client
+   #:close-client
+   #:with-client
+   #:client-cwd
+   #:client-closed-p
+   #:client-sessions
+   #:code-session
+   #:code-session-id
+   #:code-session-client
+   #:code-session-cwd
+   #:code-session-model
+   #:code-session-permission-mode
+   #:code-session-init
+   #:code-session-store
+   #:code-turn
+   #:code-turn-session
+   #:code-turn-prompt
+   #:code-turn-events
+   #:code-turn-result
+   #:code-turn-done-p
+   #:event-type
+   #:event-value
+   #:+event-types+
+   #:+approval-decision-names+
+   #:client-new-session
+   #:client-resume-session
+   #:client-fork-session
+   #:client-close-session
+   #:client-find-session
+   #:client-list-sessions
+   #:client-busy-p
+   #:client-turn
+   #:client-wait
+   #:client-query
+   #:client-steer
+   #:client-interrupt
+   #:client-pending-approvals
+   #:client-respond-approval
+   #:client-approve-plan
+   #:client-reject-plan
+   #:client-checkpoints
+   #:client-rewind
+   #:client-settings
+   #:client-tools
+
+   ;; H3d: conditions
+   #:client-closed
+   #:session-not-open
+   #:session-not-open-id
+   #:turn-busy
+   #:turn-busy-session-id
+   #:turn-not-running
+   #:turn-not-running-session-id
+   #:approval-not-found
+   #:approval-not-found-id
+
+   ;; H3d: JSON-RPC (src/rpc.lisp)
+   #:invocation-rpc-p
+   #:check-rpc-flags
+   #:+rpc-protocol-version+
+   #:+rpc-methods+
+   #:+rpc-event-method+
+   #:+rpc-error-codes+
+   #:rpc-error-for
+   #:make-rpc-handler
+   #:serve-rpc
+   #:rpc-client
+   #:connect-rpc-client
+   #:rpc-client-call
+   #:rpc-client-events
+   #:rpc-client-wait-event
+   #:rpc-client-process
+   #:close-rpc-client))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.6.0"
+(defparameter +version+ "0.7.0"
   "The product version, as in the .asd.")

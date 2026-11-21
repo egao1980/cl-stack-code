@@ -216,7 +216,15 @@ count is 0."
   (plan-pre nil)                              ; --apply: APPROVE-PLAN's PRE, recorded after the commit
   (rewind nil)                                ; the result's "rewind" object, or NIL
   ;; H4b
-  (image-tools nil))                          ; the LISP-TOOLS, or NIL
+  (image-tools nil)                           ; the LISP-TOOLS, or NIL
+  ;; H3d: one emitter, a sink per destination.
+  (sink nil)                                  ; NIL: -p (stream-json lines); else (lambda (object))
+  (denial-reason #'%headless-denial-reason))  ; decision → the denial's "reason"
+
+(defun %headless-denial-reason (decision)
+  "-p: the headless refusal of an ask is \"headless\", a rule or policy
+\"denied\"."
+  (if (member decision '(:unattended :rejected)) "headless" "denied"))
 
 (defun %write-json-line (report object)
   (let ((out (%report-output report)))
@@ -225,11 +233,19 @@ count is 0."
     (force-output out)))
 
 (defun %emit-event (report type &rest keys-and-values)
-  "Write one stream-json event (only in stream-json)."
-  (when (eq (%report-format report) :stream-json)
-    (%write-json-line report (apply #'%json-object "type" type
-                                    "session_id" (%report-session report)
-                                    keys-and-values))))
+  "Build one event object and hand it to the report's sink: -p writes it as a
+stream-json line (only in stream-json); the SDK's sink delivers it to the
+session's callbacks (src/client.lisp). → the object, or NIL when -p does not
+write it."
+  (let ((sink (%report-sink report)))
+    (when (or sink (eq (%report-format report) :stream-json))
+      (let ((object (apply #'%json-object "type" type
+                           "session_id" (%report-session report)
+                           keys-and-values)))
+        (if sink
+            (funcall sink object)
+            (%write-json-line report object))
+        object))))
 
 (defun %step-tool-calls (report response)
   "Tool-call parts of the assistant turn RESPONSE committed (the run coalesced
@@ -266,14 +282,16 @@ ai-agent-protocol 0.13), :DENY a rule or policy (or a tool's own refusal)."
   (let ((condition (getf payload :condition))
         (inv (getf payload :invocation)))
     (when (and condition inv)
-      (push (%json-object "id" (agent:agent-invocation-id inv)
-                          "name" (agent:agent-invocation-name inv)
-                          "input" (%tool-input (agent:agent-invocation-arguments inv))
-                          "reason" (if (member (agent:tool-permission-denied-decision condition)
-                                               '(:unattended :rejected))
-                                       "headless"
-                                       "denied"))
-            (%report-denials report)))))
+      (%push-denial report inv (funcall (%report-denial-reason report)
+                                        (agent:tool-permission-denied-decision condition))))))
+
+(defun %push-denial (report inv reason)
+  "Put INV on the report's permission_denials with REASON."
+  (push (%json-object "id" (agent:agent-invocation-id inv)
+                      "name" (agent:agent-invocation-name inv)
+                      "input" (%tool-input (agent:agent-invocation-arguments inv))
+                      "reason" reason)
+        (%report-denials report)))
 
 (defun %on-invocation (report inv)
   (let ((status (agent:agent-invocation-status inv))
@@ -625,24 +643,29 @@ in the report for RECORD-PLAN-CHECKPOINTS. → (values status result)."
                                           c)))))
           (approve-plan plan :checkpointer checkpointer))
       (setf (%report-plan-pre report) pre)
-      (ecase status
-        ((:applied :empty)
-         (%emit-event report "plan" "subtype" "applied" "plan_id" (plan-id plan)
-                                    "changes" (%changes-json result)))
-        (:rebased
-         (%emit-event report "plan" "subtype" "rebased" "plan_id" (plan-id plan)
-                                    "conflicts" (coerce result 'vector))
-         (setf (%report-plan-failure report)
-               (make-condition 'plan-error :plan plan :message (%rebase-line plan result))))
-        (:aborted
-         (%emit-event report "plan" "subtype" "drift" "plan_id" (plan-id plan)
-                                    "paths" (coerce drift 'vector))
-         (setf (%report-plan-failure report)
-               (make-condition 'plan-drift
-                               :plan plan :paths drift
-                               :message (format nil "plan ~a: the working copy changed at ~{~a~^, ~}; nothing applied (use --on-drift rebase or --on-drift overwrite)"
-                                                (plan-id plan) drift)))))
-      (values status result))))
+      (let ((event nil))
+        (ecase status
+          ((:applied :empty)
+           (setf event
+                 (%emit-event report "plan" "subtype" "applied" "plan_id" (plan-id plan)
+                                            "changes" (%changes-json result))))
+          (:rebased
+           (setf event
+                 (%emit-event report "plan" "subtype" "rebased" "plan_id" (plan-id plan)
+                                            "conflicts" (coerce result 'vector)))
+           (setf (%report-plan-failure report)
+                 (make-condition 'plan-error :plan plan :message (%rebase-line plan result))))
+          (:aborted
+           (setf event
+                 (%emit-event report "plan" "subtype" "drift" "plan_id" (plan-id plan)
+                                            "paths" (coerce drift 'vector)))
+           (setf (%report-plan-failure report)
+                 (make-condition 'plan-drift
+                                 :plan plan :paths drift
+                                 :message (format nil "plan ~a: the working copy changed at ~{~a~^, ~}; nothing applied (use --on-drift rebase or --on-drift overwrite)"
+                                                  (plan-id plan) drift)))))
+        ;; H3d: the event object too (the SDK returns it).
+        (values status result event)))))
 
 (defun %plan-stderr-line (error-output control &rest args)
   (format error-output "cl-stack-code: ~?~%" control args)
@@ -892,23 +915,11 @@ result, then signals its failure."
                              :settings (%agent-settings cwd settings)))
                      (root (find-project-root cwd)))
                  (apply #'%emit-event report "system"
-                        "subtype" "init"
-                        "version" +version+
-                        "cwd" (uiop:native-namestring cwd)
-                        "project_root" (if root (uiop:native-namestring root) :null)
-                        "model" designator
-                        "permission_mode" (permission-mode-name mode)
-                        "tools" (coerce offered 'vector)
-                        "instructions" (map 'vector #'uiop:native-namestring files)
-                        ;; H4b: only with the image on.
-                        (and link (list "lisp_image" (%lisp-image-object settings))))
+                        (%system-init-keys cwd root designator mode offered files
+                                           (and link settings)))
                  (when plan
-                   (%emit-event report "plan"
-                                "subtype" (if (second plan-and-reopened) "reopened" "opened")
-                                "plan_id" (plan-id plan)
-                                "kind" (string-downcase (string (plan-kind plan)))
-                                "area" (uiop:native-namestring (plan-root plan))
-                                "base" (plan-base plan)))
+                   (apply #'%emit-event report "plan"
+                          (%plan-open-keys plan (second plan-and-reopened))))
                  (let ((pre (begin-checkpoint-turn checkpointer store)))
                    (multiple-value-bind (run failure interrupted)
                        (%drive agent (append history (list (llm:user-turn prompt))) report mode)
@@ -933,6 +944,29 @@ result, then signals its failure."
         (tools:close-shell-tools (second sources)))
       (close-checkpointer checkpointer)
       (event:close-event-loop event-backend event-loop))))
+
+(defun %system-init-keys (cwd root designator mode offered files image-settings)
+  "The \"system\" init event's keys and values (after \"type\" and
+\"session_id\"); IMAGE-SETTINGS (the settings, when the image is on) adds
+\"lisp_image\". Shared by -p and the SDK (src/client.lisp)."
+  (list* "subtype" "init"
+         "version" +version+
+         "cwd" (uiop:native-namestring cwd)
+         "project_root" (if root (uiop:native-namestring root) :null)
+         "model" designator
+         "permission_mode" (permission-mode-name mode)
+         "tools" (coerce offered 'vector)
+         "instructions" (map 'vector #'uiop:native-namestring files)
+         ;; H4b: only with the image on.
+         (and image-settings (list "lisp_image" (%lisp-image-object image-settings)))))
+
+(defun %plan-open-keys (plan reopened-p)
+  "The plan \"opened\" / \"reopened\" event's keys and values."
+  (list "subtype" (if reopened-p "reopened" "opened")
+        "plan_id" (plan-id plan)
+        "kind" (string-downcase (string (plan-kind plan)))
+        "area" (uiop:native-namestring (plan-root plan))
+        "base" (plan-base plan)))
 
 (defun %headless-image-event (report event)
   "H4b, loop thread: EVENT's image_event line (none for :debugger-return),
@@ -983,6 +1017,11 @@ USER-DATA-DIRECTORY: sessions live under it."
                 ((invocation-version-p inv)
                  (format output "cl-stack-code ~a~%" +version+)
                  0)
+                ;; H3d: a JSON-RPC server until INPUT ends (src/rpc.lisp).
+                ((invocation-rpc-p inv)
+                 (%run-rpc inv :output output :input input :error-output error-output
+                               :providers providers :user-config-dir user-config-dir
+                               :getenv getenv :data-dir data-dir))
                 ;; H5b
                 ((invocation-list-checkpoints-p inv)
                  (%list-checkpoints inv :output output :getenv getenv :data-dir data-dir

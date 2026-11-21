@@ -22,6 +22,9 @@
                     (#:p #:cl-stack-pathlib)
                     (#:dt #:datetime-protocol)
                     (#:lt #:lisp-mcp/agent)
-                    (#:repl #:repl-protocol)))
+                    (#:repl #:repl-protocol)
+                    ;; H3d
+                    (#:rpc #:rpc-protocol)
+                    (#:stdio #:rpc-backend-stdio)))
 
 (in-package #:cl-stack-code/tests)
