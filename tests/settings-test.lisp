@@ -197,3 +197,55 @@
              (mapcar #'permission-mode-name '(:default :accept-edits :bypass-permissions :plan))))
   (ok (null (parse-permission-mode "acceptedits")) "exact case")
   (ok (equal "default" (permission-mode-name nil))))
+
+;;; modelParams: sampling parameters for every model call.
+
+(deftest settings-model-params-parse
+  (let* ((s (parse-settings "{\"modelParams\": {\"temperature\": 0.7, \"top_p\": 0.8,
+                              \"top_k\": 20, \"repeat_penalty\": 1.0, \"seed\": null,
+                              \"chat_template_kwargs\": {\"enable_thinking\": false}}}"))
+         (params (settings-model-params s)))
+    (ok (equal '("chat_template_kwargs" "repeat_penalty" "seed" "temperature" "top_k" "top_p")
+               (mapcar #'car params))
+        "wire names, sorted")
+    (ok (eq :null (cdr (assoc "seed" params :test #'string=))) "null → unset")
+    (let ((llm (model-params-llm-settings s)))
+      (ok (llm:llm-settings-p llm))
+      (ok (= 0.7d0 (llm:llm-settings-temperature llm)))
+      (ok (= 0.8d0 (llm:llm-settings-top-p llm)))
+      (let ((extra (llm:llm-settings-extra llm)))
+        (ok (equal '("chat_template_kwargs" "repeat_penalty" "top_k")
+                   (loop for k in extra by #'cddr collect k))
+            "the rest goes into :extra; unset keys are left out")
+        (ok (eql 20 (loop for (k v) on extra by #'cddr
+                          when (string= k "top_k") return v)))
+        (let ((kwargs (second extra)))
+          (ok (hash-table-p kwargs))
+          (ok (multiple-value-bind (v present) (gethash "enable_thinking" kwargs)
+                (and present (null v)))
+              "JSON false stays false (NIL)"))))))
+
+(deftest settings-model-params-none
+  (ok (null (model-params-llm-settings (parse-settings "{}"))))
+  (ok (null (model-params-llm-settings (parse-settings "{\"modelParams\": {\"top_k\": null}}"))))
+  (ok (null (model-params-llm-settings nil))))
+
+(deftest-parametrize settings-model-params-wrong-types
+    ((json key)
+     :ids ("not-object" "temperature" "top_p")
+     ("{\"modelParams\": [1]}" "modelParams")
+     ("{\"modelParams\": {\"temperature\": \"hot\"}}" "modelParams.temperature")
+     ("{\"modelParams\": {\"top_p\": true}}" "modelParams.top_p"))
+  (let ((c (failure (parse-settings json))))
+    (ok (typep c 'settings-error))
+    (ok (equal key (and (typep c 'settings-error) (settings-error-key c))))))
+
+(deftest settings-model-params-merge
+  (let* ((user (parse-settings "{\"modelParams\": {\"temperature\": 1.0, \"top_k\": 20, \"min_p\": 0.0}}"))
+         (project (parse-settings "{\"modelParams\": {\"temperature\": 0.7, \"min_p\": null}}"))
+         (flags (make-settings :model-params '(("presence_penalty" . 1.5))))
+         (merged (merge-settings user project flags))
+         (llm (model-params-llm-settings merged)))
+    (ok (= 0.7d0 (llm:llm-settings-temperature llm)) "the later layer wins per key")
+    (ok (equalp '("top_k" 20 "presence_penalty" 1.5) (llm:llm-settings-extra llm))
+        "untouched keys kept, null unsets, flag keys added")))

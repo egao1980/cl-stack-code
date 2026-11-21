@@ -44,6 +44,10 @@ false. See CHECKPOINT-SETTINGS.")
 layer sets: :IMAGE (a designator from PARSE-LISP-IMAGE-DESIGNATOR), :BACKEND
 (\"swank\" or \"slynk\"), :OBSERVE (T or NIL), :ON-DEBUGGER (:TURN or :NOTICE).
 See LISP-IMAGE-SETTINGS.")
+   (model-params :initarg :model-params :reader settings-model-params :initform nil
+                 :documentation "The \"modelParams\" object as an alist (wire-name
+. value) in first-set order; a :NULL value means unset. See
+MODEL-PARAMS-LLM-SETTINGS.")
    (files :initarg :files :reader settings-files :initform nil
           :documentation "Settings files this layer was read from, in order."))
   (:documentation "One settings layer, or the merge of several."))
@@ -57,16 +61,19 @@ See LISP-IMAGE-SETTINGS.")
   (typep x 'settings))
 
 (defun make-settings (&key model max-turns permission-mode allow ask deny env
-                        append-system-prompt files checkpoints lisp-image)
+                        append-system-prompt files checkpoints lisp-image
+                        model-params)
   "A SETTINGS layer. NIL means unset for every scalar. CHECKPOINTS (H5b): a
 plist of the checkpoints keys this layer sets. LISP-IMAGE (H4b): a plist of the
-lispImage keys this layer sets."
+lispImage keys this layer sets. MODEL-PARAMS: an alist (wire-name . value) of
+the modelParams keys this layer sets (:NULL = unset)."
   (make-instance 'settings :model model :max-turns max-turns
                            :permission-mode permission-mode
                            :allow allow :ask ask :deny deny :env env
                            :append-system-prompt append-system-prompt
                            :checkpoints (copy-list checkpoints)
                            :lisp-image (copy-list lisp-image)
+                           :model-params (copy-alist model-params)
                            :files files))
 
 ;;; H5b: the checkpoints object.
@@ -219,6 +226,54 @@ NIL, on-debugger :TURN."
   (not (eq :off (first (lisp-image-settings settings)))))
 
 
+;;; The modelParams object: sampling parameters for every model call.
+;;;
+;;;   "modelParams": {"temperature": 1.0, "top_p": 0.95, "top_k": 20,
+;;;                   "min_p": 0.0, "presence_penalty": 0.0,
+;;;                   "repeat_penalty": 1.0,
+;;;                   "chat_template_kwargs": {"enable_thinking": true}}
+;;;
+;;; Keys are wire names. temperature and top_p (numbers) become the
+;;; LLM-SETTINGS slots; every other key goes into LLM-SETTINGS-EXTRA, which
+;;; the provider backend copies into the request body as written (values of
+;;; any JSON type; objects go as objects). Layers merge per key, the later
+;;; layer wins; a null value marks the key unset. --model-param KEY=VALUE is
+;;; the flag layer (VALUE read as JSON, else taken as a string). A bad value
+;;; signals SETTINGS-ERROR with key path "modelParams" or "modelParams.KEY".
+
+(defparameter +model-param-number-keys+ '("temperature" "top_p")
+  "modelParams keys that must be numbers (they are LLM-SETTINGS slots).")
+
+(defun %check-model-param (file key value)
+  (when (and (member key +model-param-number-keys+ :test #'string=)
+             (not (eq value :null))
+             (not (realp value)))
+    (%settings-fail file (format nil "modelParams.~a" key) "must be a number or null"))
+  (cons key value))
+
+(defun %parse-model-params (file value)
+  (unless (hash-table-p value)
+    (%settings-fail file "modelParams" "must be an object of model parameters"))
+  (let ((out '()))
+    (maphash (lambda (key v) (push (%check-model-param file key v) out)) value)
+    (sort out #'string< :key #'car)))
+
+(defun model-params-llm-settings (settings)
+  "→ an LLM-PROTOCOL:LLM-SETTINGS for SETTINGS's modelParams, or NIL when no
+key is set: temperature → :TEMPERATURE, top_p → :TOP-P, every other key into
+:EXTRA as a plist of wire-name strings in key order."
+  (let ((temperature nil) (top-p nil) (extra '()))
+    (dolist (entry (and settings (settings-model-params settings)))
+      (destructuring-bind (key . value) entry
+        (unless (eq value :null)
+          (cond ((string= key "temperature") (setf temperature value))
+                ((string= key "top_p") (setf top-p value))
+                (t (setf extra (list* value key extra)))))))
+    (when (or temperature top-p extra)
+      (llm:make-llm-settings :temperature temperature :top-p top-p
+                             :extra (reverse extra)))))
+
+
 (defparameter +permission-mode-keywords+
   '(:default :accept-edits :bypass-permissions :plan)
   "Mode keywords in +PERMISSION-MODE-NAMES+ order.")
@@ -307,7 +362,10 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
              (checkpoints (multiple-value-bind (value present) (%json-present object "checkpoints")
                             (and present (%parse-checkpoints file value))))
              (lisp-image (multiple-value-bind (value present) (%json-present object "lispImage")
-                           (and present (%parse-lisp-image file value)))))
+                           (and present (%parse-lisp-image file value))))
+             (model-params (multiple-value-bind (value present)
+                               (%json-present object "modelParams")
+                             (and present (%parse-model-params file value)))))
         (make-settings
          :model model
          :max-turns max-turns
@@ -319,6 +377,7 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
          :env env
          :checkpoints checkpoints
          :lisp-image lisp-image
+         :model-params model-params
          :files (and file (list file)))))))
 
 (defun read-settings-file (pathname)
@@ -385,6 +444,7 @@ gives the value (NIL = unset). Fresh conses; the layers are not modified."
        :env (%merge-env (mapcar #'settings-env layers))
        :checkpoints (%merge-checkpoints (mapcar #'settings-checkpoints layers))
        :lisp-image (%merge-checkpoints (mapcar #'settings-lisp-image layers))
+       :model-params (%merge-env (mapcar #'settings-model-params layers))
        :files (loop for layer in layers append (settings-files layer))))))
 
 ;;; Where the files are.

@@ -53,6 +53,8 @@
    #:settings-env
    #:settings-append-system-prompt
    #:settings-files
+   #:settings-model-params
+   #:model-params-llm-settings
    #:parse-settings
    #:read-settings-file
    #:merge-settings
@@ -547,5 +549,5 @@
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.8.0"
+(defparameter +version+ "0.9.0"
   "The product version, as in the .asd.")

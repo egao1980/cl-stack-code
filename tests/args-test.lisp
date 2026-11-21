@@ -10,8 +10,8 @@
   (invocation-settings (parse-arguments argv)))
 
 (deftest version-constant
-  (ok (equal "0.8.0" +version+))
-  (ok (equal "0.8.0" (asdf:component-version (asdf:find-system "cl-stack-code")))))
+  (ok (equal "0.9.0" +version+))
+  (ok (equal "0.9.0" (asdf:component-version (asdf:find-system "cl-stack-code")))))
 
 (deftest args-print-and-prompt
   (let ((i (inv "-p" "fix" "the" "test")))
@@ -96,3 +96,13 @@
   (ok (invocation-help-p (inv "--help")))
   (ok (invocation-version-p (inv "--version")))
   (ok (null (invocation-print-p (inv "--version")))))
+
+(deftest args-model-param
+  (let ((params (settings-model-params
+                 (inv-settings "-p" "--model-param" "top_k=20" "--model-param" "top_k=40"
+                               "--model-param" "mode=fast" "--model-param" "seed=null" "x"))))
+    (ok (equal '(("top_k" . 40) ("mode" . "fast") ("seed" . :null)) params)
+        "JSON values, else strings; the later flag wins"))
+  (ok (typep (failure (inv "-p" "--model-param" "top_k" "x")) 'code-usage-error) "no =")
+  (ok (typep (failure (inv "-p" "--model-param" "=1" "x")) 'code-usage-error) "empty key")
+  (ok (typep (failure (inv "-p" "--model-param" "temperature=hot" "x")) 'code-usage-error)))

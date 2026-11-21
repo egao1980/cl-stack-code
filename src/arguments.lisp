@@ -84,6 +84,8 @@ ours to rebind, so it goes in as :BACKEND)."
            (opt "disallowed-tools" "Deny rules, same syntax; repeatable" :kind :list)
            (opt "permission-mode" "default, acceptEdits, bypassPermissions or plan")
            (opt "append-system-prompt" "Text appended to the system prompt")
+           (opt "model-param" "Model parameter KEY=VALUE for every model call (VALUE as JSON, else a string), e.g. top_k=20; repeatable"
+                :kind :list)
            ;; H3c
            (opt "continue" "Continue the last session of this project" :short #\c :kind :flag)
            (opt "resume" "Resume the session with this id (or a unique prefix of it)" :short #\r)
@@ -119,6 +121,25 @@ CODE-USAGE-ERROR \"unknown --lisp-image \\\"X\\\": use spawn, attach:[HOST:]PORT
                              (%usage-fail "unknown --lisp-image ~s: use spawn, attach:[HOST:]PORT or off"
                                           value))))
           (when observe (list :observe t))))
+
+(defun %model-param-flags (values)
+  "The flag layer's modelParams alist from --model-param KEY=VALUE strings,
+later ones winning. VALUE is read as JSON, else taken as a string. No \"=\",
+an empty KEY, or a non-number temperature / top_p → CODE-USAGE-ERROR."
+  (%merge-env
+   (list
+    (loop for text in values
+          collect (let ((sign (position #\= text)))
+                    (unless (and sign (plusp sign))
+                      (%usage-fail "bad --model-param ~s: use KEY=VALUE" text))
+                    (let* ((key (subseq text 0 sign))
+                           (raw (subseq text (1+ sign)))
+                           (value (handler-case (json:decode raw)
+                                    (error () raw))))
+                      (handler-case (%check-model-param nil key value)
+                        (settings-error ()
+                          (%usage-fail "bad --model-param ~s: ~a must be a number"
+                                       text key)))))))))
 
 (defun %output-format (value)
   (cond ((null value) :text)
@@ -213,6 +234,7 @@ are present is checked by RUN-CLI, not here."
                     :append-system-prompt (get-opt :append-system-prompt)
                     :allow (%flag-rules (get-opt :allowed-tools) :allow)
                     :deny (%flag-rules (get-opt :disallowed-tools) :deny)
+                    :model-params (%model-param-flags (get-opt :model-param))
                     ;; H4b
                     :lisp-image (%lisp-image-flag (get-opt :lisp-image)
                                                   (get-opt :lisp-observe))))))))
@@ -353,7 +375,7 @@ otherwise CODE-USAGE-ERROR, checked in this order:
   --list-checkpoints           → \"--rpc approves plans and rewinds with plan/approve, plan/reject and rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints\"
 Every other flag goes with --rpc: --cwd (the default working directory of
 new sessions), --model, --max-turns, --permission-mode, --allowed-tools,
---disallowed-tools, --append-system-prompt, --lisp-image, --lisp-observe
+--disallowed-tools, --append-system-prompt, --model-param, --lisp-image, --lisp-observe
 (the flag layer of every session) and --plan-area (the area kind of plan
 sessions, whatever the mode)."
   (let ((i invocation))

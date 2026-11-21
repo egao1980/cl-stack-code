@@ -454,6 +454,7 @@ SOURCE, or a new session (--session-id or a random id)."
 
 (defun %agent-settings (cwd settings)
   (agent:make-agent-settings
+   :llm (model-params-llm-settings settings)
    :max-steps (or (settings-max-turns settings) +default-max-turns+)
    :extra (list :permission-policy (settings-permission-policy settings)
                 :max-steps-wrap-up nil

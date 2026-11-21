@@ -165,5 +165,25 @@
   (with-project (project config) '()
     (multiple-value-bind (exit out err) (code project config '("--version") :cwd nil :model nil)
       (ok (eql 0 exit))
-      (ok (equal (nl "cl-stack-code 0.8.0") out))
+      (ok (equal (nl "cl-stack-code 0.9.0") out))
       (ok (equal "" err)))))
+
+(deftest cli-model-params-reach-generate
+  (with-project (project config)
+      '((".cl-stack-code/settings.json"
+         "{\"modelParams\": {\"temperature\": 1.0, \"top_p\": 0.95, \"top_k\": 20}}"))
+    (let* ((backend (nth-value 3 (code project config
+                                       '("-p" "--model-param" "temperature=0.7"
+                                         "--model-param" "chat_template_kwargs={\"enable_thinking\":false}"
+                                         "hi")
+                                       :steps '("x"))))
+           (llm (request-settings (first-request backend))))
+      (ok (llm:llm-settings-p llm) "the agent's LLM settings reach GENERATE")
+      (ok (= 0.7d0 (llm:llm-settings-temperature llm)) "the flag beats the settings file")
+      (ok (= 0.95d0 (llm:llm-settings-top-p llm)))
+      (ok (equal '("top_k" "chat_template_kwargs")
+                 (loop for k in (llm:llm-settings-extra llm) by #'cddr collect k)))))
+  (testing "no modelParams → no LLM settings"
+    (with-project (project config) '()
+      (let ((backend (nth-value 3 (code project config '("-p" "hi") :steps '("x")))))
+        (ok (null (request-settings (first-request backend))))))))
