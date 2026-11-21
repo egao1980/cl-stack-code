@@ -18,7 +18,11 @@
                     (#:git #:revision-backend-git)
                     (#:jj #:revision-backend-jj)
                     (#:dt #:datetime-protocol)
-                    (#:lt #:lisp-mcp/agent))
+                    (#:lt #:lisp-mcp/agent)
+                    ;; H8d
+                    (#:sup #:supervisor-protocol)
+                    (#:ss #:supervisor-protocol/search)
+                    (#:pp #:process-protocol))
   (:export
    ;; entry
    #:run-cli
@@ -465,9 +469,83 @@
    #:rpc-client-events
    #:rpc-client-wait-event
    #:rpc-client-process
-   #:close-rpc-client))
+   #:close-rpc-client
+
+   ;; H8d: units (src/units.lisp, src/unit-panel.lisp)
+   #:+unit-panel-key+
+   #:+unit-log-scrollback+
+   #:+unit-tick-interval+
+   #:+unit-stats-interval+
+   #:+unit-rpc-actions+
+   #:+unit-action-choices+
+   #:+unit-panel-columns+
+   #:+unit-list-help+
+   #:+unit-log-help+
+   #:units-directory
+   #:make-code-supervisor
+   #:code-unit-tools
+   #:unit-status-word
+   #:unit-tree
+   #:unit-last-line
+   #:format-unit-uptime
+   #:format-unit-rss
+   #:format-unit-cpu
+   #:unit-row-text
+   #:unit-panel-lines
+   #:unit-log-lines
+   #:unit-log-title
+   #:parse-ps-cpu-time
+   #:sample-unit-resources
+   #:unit-cpu-percent
+   #:unit-object
+   #:unit-objects
+   #:unit-event-object
+   #:unit-record-object
+   #:unit-gap-object
+   #:unit-control-arguments
+   #:unit-action-permission
+   #:unit-action-message
+   #:unit-failure-notice
+   #:state-units-running
+   ;; H8d: the panel and the program
+   #:unit-panel
+   #:unit-panel-open-p
+   #:unit-panel-mode
+   #:unit-panel-selected
+   #:unit-panel-unit
+   #:unit-panel-query
+   #:unit-panel-hits
+   #:unit-panel-hit-index
+   #:code-program-supervisor
+   #:code-program-unit-tools
+   #:code-program-panel
+   ;; H8d: the SDK
+   #:code-session-supervisor
+   #:code-session-unit-tools
+   #:client-units
+   #:client-subscribe-units
+   #:client-unsubscribe-units
+   #:client-read-unit
+   #:client-search-units
+   #:client-control-unit
+   ;; H8d: conditions
+   #:unit-not-found
+   #:unit-not-found-unit
+   #:unit-control-denied
+   #:unit-control-denied-unit
+   #:unit-control-denied-action
+   #:unit-control-denied-rule
+   #:unit-control-needs-confirmation
+   #:unit-control-needs-confirmation-unit
+   #:unit-control-needs-confirmation-action
+   #:unit-control-needs-confirmation-resource
+   #:unit-control-failed
+   #:unit-control-failed-unit
+   #:unit-control-failed-action
+   #:subscription-not-found
+   #:subscription-not-found-id))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.7.0"
+(defparameter +version+ "0.8.0"
   "The product version, as in the .asd.")

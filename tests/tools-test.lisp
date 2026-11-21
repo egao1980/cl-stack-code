@@ -28,7 +28,7 @@
 (deftest tools-offered
   (with-project (project config) '()
     (let ((backend (nth-value 3 (code project config '("-p" "hi") :steps '("x")))))
-      (ok (equal (append at:+file-tool-names+ at:+shell-tool-names+)
+      (ok (equal (append at:+file-tool-names+ at:+shell-tool-names+ at:+unit-tool-names+)
                  (request-tool-names (first (scripted-requests backend))))))))
 
 (deftest tools-make-code-tools
@@ -189,7 +189,8 @@
 (deftest tools-hidden-by-bare-deny
   (with-project (project config) '()
     (let ((backend (nth-value 3 (code project config '("-p" "--disallowed-tools" "bash" "hi") :steps '("x")))))
-      (ok (equal (append at:+file-tool-names+ (remove "bash" at:+shell-tool-names+ :test #'equal))
+      (ok (equal (append at:+file-tool-names+ (remove "bash" at:+shell-tool-names+ :test #'equal)
+                         at:+unit-tool-names+)
                  (request-tool-names (first (scripted-requests backend))))))))
 
 (deftest tools-settings-env-in-shell

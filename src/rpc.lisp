@@ -67,6 +67,53 @@
 ;;;   settings/get     {session_id? | cwd?}       → CLIENT-SETTINGS of the session, else of cwd
 ;;;                                                  (relative to the server's), else the server's
 ;;;   tools/list       {session_id}               → {"tools": [objects]}
+;;;
+;;; H8d: units (src/units.lisp). Each session has its own supervisor; these
+;;; methods are thin adapters over the CLIENT-…-UNIT(S) functions, which use
+;;; the same objects and the same permission decision as the TUI panel.
+;;;   units/list       {session_id, kind? (a kind name), state? ("live"
+;;;                    "finished" or a state name), owner? (a glob over the
+;;;                    "owner" field), resources? (boolean)}
+;;;                                               → {"units": [UNIT-OBJECTs in UNIT-TREE order],
+;;;                                                  "seq": SUPERVISOR-LAST-SEQ, "running": N}
+;;;   units/subscribe  {session_id, since? (integer ≥ 0)}
+;;;                                               → {"subscription": "sub-N", "seq": S,
+;;;                                                  "complete": boolean}
+;;;                    Without since: only events after S (the last seq when
+;;;                    subscribing). With since: every retained event with seq
+;;;                    > since first (replay), then live ones, in seq order,
+;;;                    each exactly once (SUP:SUBSCRIBE :SINCE: no gap, no
+;;;                    duplicate); complete is false when events after since
+;;;                    were no longer retained (re-list). Each event is the
+;;;                    notification "event" with UNIT-EVENT-OBJECT (type
+;;;                    "unit", "subscription", "session_id"). A session's
+;;;                    subscriptions end when it closes.
+;;;   units/unsubscribe {session_id, subscription}
+;;;                                               → {"unsubscribed": true}; unknown → -32018
+;;;   units/read       {session_id, unit | ref, start_line?, limit? (1..2000,
+;;;                    default 200; 40 with ref), tail? (1..2000), streams?
+;;;                    (["stdout","stderr"])}
+;;;                                               → {"unit", "status", "records": [UNIT-RECORD-
+;;;                                                  OBJECTs], "gaps": [UNIT-GAP-OBJECTs],
+;;;                                                  "next_line", "last_line", "ended",
+;;;                                                  "memory"} (CLIENT-READ-UNIT)
+;;;   units/search     {session_id, query, units? [ids or globs], kinds?
+;;;                    [+UNIT-SEARCH-KINDS+], streams?, since?, until? (RFC 3339
+;;;                    or "90s" "10m" "2h" "1d"), k? (1..50, default 10),
+;;;                    context? (0..10, default 2)}
+;;;                                               → {"hits": [hit objects], "total": N}
+;;;                                                  (CLIENT-SEARCH-UNITS)
+;;;   units/control    {session_id, unit, action (+UNIT-RPC-ACTIONS+), input?
+;;;                    (string, for "input"), confirmed? (boolean)}
+;;;                                               → {"result": the unit tool's text,
+;;;                                                  "unit": UNIT-OBJECT after the action}
+;;;                    The decision is UNIT-ACTION-PERMISSION: deny → -32016;
+;;;                    ask without confirmed → -32017 (nothing done); allow, or
+;;;                    ask with confirmed → done. A failed action → -32019.
+;;;   Errors: an unknown unit → -32015 (data "unit"); a bad action, a bad
+;;;   argument or both / neither of unit and ref → -32602 "METHOD: KEY must
+;;;   be …" (or the unit tool's TOOL-INPUT-ERROR text).
+
 ;;;   Any other method → -32601.
 ;;;
 ;;; Errors (RPC-ERROR-FOR condition → (values code message data))
@@ -122,7 +169,10 @@
     "approval/respond"
     "plan/approve" "plan/reject"
     "checkpoint/list" "rewind"
-    "settings/get" "tools/list")
+    "settings/get" "tools/list"
+    ;; H8d
+    "units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
+    "units/control")
   "Every --rpc method, in this order (initialize's \"methods\").")
 
 (defparameter +rpc-error-codes+
@@ -140,6 +190,12 @@
     (lisp-image-error . -32012)
     (session-locked . -32013)
     (client-closed . -32014)
+    ;; H8d
+    (unit-not-found . -32015)
+    (unit-control-denied . -32016)
+    (unit-control-needs-confirmation . -32017)
+    (subscription-not-found . -32018)
+    (unit-control-failed . -32019)
     (code-usage-error . -32602)
     (code-error . -32000)
     (error . -32603))
@@ -180,6 +236,18 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
                                    (if file (uiop:native-namestring file) :null))
                           "key" (%null (settings-error-key condition))))
     (model-not-found (list "designator" (%null (model-not-found-designator condition))))
+    ;; H8d
+    (unit-not-found (list "unit" (%null (unit-not-found-unit condition))))
+    (unit-control-denied (list "unit" (%null (unit-control-denied-unit condition))
+                               "action" (%null (unit-control-denied-action condition))
+                               "rule" (%null (unit-control-denied-rule condition))))
+    (unit-control-needs-confirmation
+     (list "unit" (%null (unit-control-needs-confirmation-unit condition))
+           "action" (%null (unit-control-needs-confirmation-action condition))
+           "resource" (%null (unit-control-needs-confirmation-resource condition))))
+    (unit-control-failed (list "unit" (%null (unit-control-failed-unit condition))
+                               "action" (%null (unit-control-failed-action condition))))
+    (subscription-not-found (list "subscription" (%null (subscription-not-found-id condition))))
     (t '())))
 
 (defun rpc-error-for (condition)
@@ -204,7 +272,9 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
         (:boolean "a boolean")
         (:object "an object")
         (:strings "an array of strings")
-        (:turn "an integer or a string"))))
+        (:turn "an integer or a string")
+        ;; H8d: units/subscribe since
+        (:count "an integer ≥ 0"))))
 
 (defun %bad-param (method key type)
   (error 'rpc-protocol:rpc-invalid-params
@@ -366,7 +436,72 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
          (lambda (client method params)
            (%json-object "tools"
                          (coerce (client-tools (%session-param client method params))
-                                 'vector)))))
+                                 'vector))))
+   ;; H8d
+   (cons "units/list"
+         (lambda (client method params)
+           (let* ((kind (%param method params "kind" :string))
+                  (state (%param method params "state" :string))
+                  (owner (%param method params "owner" :string))
+                  (resources (%param method params "resources" :boolean))
+                  (session (%session-param client method params))
+                  (sup (code-session-supervisor session))
+                  ;; The seq before the list: subscribing with since = seq
+                  ;; misses no change after it.
+                  (seq (sup:supervisor-last-seq sup))
+                  (units (client-units session :kind kind :state state :owner owner
+                                               :resources resources)))
+             (%json-object "units" (coerce units 'vector)
+                           "seq" seq
+                           "running" (count-if #'sup:unit-live-p (sup:supervisor-units sup))))))
+   (cons "units/subscribe"
+         (lambda (client method params)
+           (let ((since (%param method params "since" :integer)))
+             (when (and since (minusp since))
+               (%bad-param method "since" :count))
+             (multiple-value-bind (id seq complete)
+                 (client-subscribe-units (%session-param client method params) :since since)
+               (%json-object "subscription" id "seq" seq "complete" (and complete t))))))
+   (cons "units/unsubscribe"
+         (lambda (client method params)
+           (let ((id (%param method params "subscription" :string :required t)))
+             (client-unsubscribe-units (%session-param client method params) id)
+             (%json-object "unsubscribed" t))))
+   (cons "units/read"
+         (lambda (client method params)
+           (let ((unit (%param method params "unit" :string))
+                 (ref (%param method params "ref" :string))
+                 (start-line (%param method params "start_line" :integer))
+                 (limit (%param method params "limit" :integer))
+                 (tail (%param method params "tail" :integer))
+                 (streams (%param method params "streams" :strings)))
+             (client-read-unit (%session-param client method params)
+                               :unit unit :ref ref :start-line start-line :limit limit
+                               :tail tail :streams (and streams (coerce streams 'list))))))
+   (cons "units/search"
+         (lambda (client method params)
+           (let ((query (%param method params "query" :string :required t))
+                 (units (%param method params "units" :strings))
+                 (kinds (%param method params "kinds" :strings))
+                 (streams (%param method params "streams" :strings))
+                 (since (%param method params "since" :string))
+                 (until (%param method params "until" :string))
+                 (k (%param method params "k" :integer))
+                 (context (%param method params "context" :integer)))
+             (client-search-units (%session-param client method params) query
+                                  :units (and units (coerce units 'list))
+                                  :kinds (and kinds (coerce kinds 'list))
+                                  :streams (and streams (coerce streams 'list))
+                                  :since since :until until :k k :context context))))
+   (cons "units/control"
+         (lambda (client method params)
+           (let ((unit (%param method params "unit" :string :required t))
+                 (action (%param method params "action" (cons :member +unit-rpc-actions+)
+                                 :required t))
+                 (input (%param method params "input" :string))
+                 (confirmed (%param method params "confirmed" :boolean)))
+             (client-control-unit (%session-param client method params) unit action
+                                  :input input :confirmed confirmed)))))
   "Method name → (lambda (client method params)) → the result object.")
 
 (defun make-rpc-handler (client)

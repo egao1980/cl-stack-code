@@ -44,7 +44,9 @@
 (deftest rpc-constants
   (ok (equal '("initialize" "session/new" "session/resume" "session/list" "session/fork"
                "session/close" "turn/start" "turn/steer" "turn/interrupt" "approval/respond"
-               "plan/approve" "plan/reject" "checkpoint/list" "rewind" "settings/get" "tools/list")
+               "plan/approve" "plan/reject" "checkpoint/list" "rewind" "settings/get" "tools/list"
+               "units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
+               "units/control")
              +rpc-methods+))
   (ok (equal "event" +rpc-event-method+))
   (ok (eql 1 +rpc-protocol-version+))
@@ -124,7 +126,7 @@
              (new (response-for objects 2)))
         (ok (every (lambda (o) (equal "2.0" (gethash "jsonrpc" o))) objects) "only JSON-RPC on output")
         (ok (equal "cl-stack-code" (event-value init "result" "name")))
-        (ok (equal "0.7.0" (event-value init "result" "version")))
+        (ok (equal "0.8.0" (event-value init "result" "version")))
         (ok (eql 1 (event-value init "result" "protocol")))
         (ok (equal +rpc-methods+ (coerce (event-value init "result" "methods") 'list)))
         (ok (equal +event-types+ (coerce (event-value init "result" "events") 'list)))
@@ -343,7 +345,7 @@
         (ok (equalp #("API_KEY") (event-value s "settings" "env")))
         (ok (not (has "s3cr3t" (json:encode s))))
         (ok (equal "mock" (event-value server "settings" "model")) "no session: the server's")
-        (ok (equal (append at:+file-tool-names+ at:+shell-tool-names+)
+        (ok (equal (append at:+file-tool-names+ at:+shell-tool-names+ at:+unit-tool-names+)
                    (map 'list (lambda (o) (event-value o "name")) tools)))))))
 
 (deftest rpc-configuration-errors

@@ -300,3 +300,66 @@ JSON-RPC -32005.")
   (:report (lambda (c s)
              (format s "~a" (or (code-error-message c)
                                 (format nil "no approval ~a is waiting" (approval-not-found-id c)))))))
+
+;;; H8d: units (src/units.lisp). All are CODE-ERRORs; --rpc maps them through
+;;; +RPC-ERROR-CODES+ (-32015 … -32019).
+
+(define-condition unit-not-found (code-error)
+  ((unit :initarg :unit :reader unit-not-found-unit :initform nil
+         :documentation "The unit id (or ref) as given."))
+  (:documentation "No unit with that id in the session's supervisor (or a ref
+that names none). The message names the id and units/list (or /ps).")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "no unit ~s in this session: see units/list"
+                                        (unit-not-found-unit c)))))))
+
+(define-condition unit-control-denied (code-error)
+  ((unit :initarg :unit :reader unit-control-denied-unit :initform nil)
+   (action :initarg :action :reader unit-control-denied-action :initform nil
+           :documentation "The action name (\"stop\" \"restart\" \"input\" \"close_input\").")
+   (rule :initarg :rule :reader unit-control-denied-rule :initform nil
+         :documentation "FORMAT-PERMISSION-RULE of the deciding rule (a string), or NIL."))
+  (:documentation "A permission rule denies this unit_control action, exactly as
+it would deny the agent's unit_control call.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "~a ~a denied~@[ by ~a~]"
+                                        (unit-control-denied-action c)
+                                        (unit-control-denied-unit c)
+                                        (unit-control-denied-rule c)))))))
+
+(define-condition unit-control-needs-confirmation (code-error)
+  ((unit :initarg :unit :reader unit-control-needs-confirmation-unit :initform nil)
+   (action :initarg :action :reader unit-control-needs-confirmation-action :initform nil)
+   (resource :initarg :resource :reader unit-control-needs-confirmation-resource :initform nil
+             :documentation "The permission resource (\"stop:shell-job-1\")."))
+  (:documentation "The rules ask for this action (the agent would get an
+approval request): the caller confirms with its user and calls again with
+confirmed true. The TUI shows its confirm dialog instead.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "~a ~a needs confirmation: call again with confirmed true"
+                                        (unit-control-needs-confirmation-action c)
+                                        (unit-control-needs-confirmation-unit c)))))))
+
+(define-condition unit-control-failed (code-error)
+  ((unit :initarg :unit :reader unit-control-failed-unit :initform nil)
+   (action :initarg :action :reader unit-control-failed-action :initform nil))
+  (:documentation "The action was allowed but could not be carried out (input
+to a finished unit or a thread, stdin already closed, a restart that cannot
+launch). The message is the unit tool's own text.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "~a ~a failed"
+                                        (unit-control-failed-action c)
+                                        (unit-control-failed-unit c)))))))
+
+(define-condition subscription-not-found (code-error)
+  ((id :initarg :id :reader subscription-not-found-id :initform nil))
+  (:documentation "units/unsubscribe (CLIENT-UNSUBSCRIBE-UNITS) of an id that is
+not an open subscription of the session.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "no units subscription ~s in this session"
+                                        (subscription-not-found-id c)))))))
