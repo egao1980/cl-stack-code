@@ -24,11 +24,16 @@
     (and row (>= (length row) 22) (string-trim " " (subseq row 2 22)))))
 
 (defun select-unit (tui id)
-  "Press Down until ID is selected (at most 10 times). → true when it is."
+  "Press Down until ID is selected (at most 10 times), waiting after each press
+for the selection to move (the screen redraws asynchronously). → true when it is."
   (loop repeat 10
-        until (equal id (selected-id tui))
+        for before = (selected-id tui)
+        until (equal id before)
         do (h:tui-press tui :arrow-down)
-           (wait-for* tui (lambda () (selected-id tui)) :timeout 2))
+           (wait-for* tui (lambda ()
+                            (let ((now (selected-id tui)))
+                              (and now (not (equal now before)))))
+                      :timeout 2))
   (equal id (selected-id tui)))
 
 (deftest units-panel-snapshot

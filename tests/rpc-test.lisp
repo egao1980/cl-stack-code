@@ -345,7 +345,7 @@
         (ok (equalp #("API_KEY") (event-value s "settings" "env")))
         (ok (not (has "s3cr3t" (json:encode s))))
         (ok (equal "mock" (event-value server "settings" "model")) "no session: the server's")
-        (ok (equal (append at:+file-tool-names+ at:+shell-tool-names+)
+        (ok (equal (append at:+file-tool-names+ at:+shell-tool-names+ at:+unit-tool-names+)
                    (map 'list (lambda (o) (event-value o "name")) tools)))))))
 
 (deftest rpc-configuration-errors
