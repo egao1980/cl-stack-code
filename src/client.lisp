@@ -342,98 +342,1090 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
      (unwind-protect (progn ,@body)
        (close-client ,var))))
 
-;;; Stubs.
+;;; Implementation.
+;;;
+;;; The client's thread slot holds a %LOOP (the loop thread and its stop
+;;; flag); every session's state is a %SESS. Everything below that touches a
+;;; %SESS runs on the loop thread (%CALL takes every public function there).
+;;; A turn's events come from a per-turn %REPORT (src/headless.lisp) whose
+;;; sink delivers them to the callbacks; idle events (init, plan, rewind,
+;;; image events between turns) use a turn-less report.
+
+(defstruct (%loop (:constructor %make-loop ()))
+  (thread nil)
+  (stopping nil))
+
+(defstruct (%sess (:conc-name %s-))
+  cwd config settings mode designator data-dir getenv
+  sessions-dir project-dir max-turns
+  agent sources link checkpointer cwd-instructions
+  ;; H5a
+  plan plan-sources plan-turn-p
+  ;; the run (kept across turns: CONTINUE-AI-AGENT-ASYNC)
+  run handle
+  (committed (make-hash-table :test 'eq))
+  (usage (list 0 0 0 0))                ; since the last commit
+  (steering '())                        ; texts taken since the last commit
+  (posted '())                          ; (llm-turn . text) not taken yet
+  ;; the current turn
+  (state :idle)                         ; :idle :running :waiting :ending
+  turn report pre start interrupted
+  (pending '())                         ; (invocation . approval_request), oldest first
+  ;; closing
+  closed close-pending)
+
+;;; The loop thread and dispatch.
+
+(defun %loop-thread-p (client)
+  (let ((loop (%client-thread client)))
+    (and loop (eq (bt:current-thread) (%loop-thread loop)))))
+
+(defun %client-thread-main (client http maker)
+  (let* ((null-stream (make-broadcast-stream))
+         (*standard-output* null-stream)
+         (*error-output* null-stream)
+         (*trace-output* null-stream)
+         (eb (%client-event-backend client))
+         (el (%client-event-loop client))
+         (event:*event-backend* eb)
+         (event:*event-loop* el)
+         (http-protocol:*http-backend* (or http (http-backend-async:make-async-backend)))
+         (http-backend-async:*event-backend-maker*
+           (or maker #'event-backend-libuv:make-libuv-backend))
+         (agent:*off-loop-specials*
+           (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
+                  agent:*off-loop-specials*)))
+    (handler-bind ((agent:agent-approval-required
+                     (lambda (c)
+                       ;; Only a bypassPermissions session answers; otherwise
+                       ;; the run pauses and the caller answers.
+                       (let ((session (%session-of-run client (agent:agent-error-run c))))
+                         (when (and session
+                                    (eq :bypass-permissions
+                                        (%s-mode (%session-state session))))
+                           (agent:invoke-approve c)))))
+                   (warning
+                     (lambda (w)
+                       (let ((restart (find-restart 'muffle-warning w)))
+                         (when restart (invoke-restart restart))))))
+      (loop until (%loop-stopping (%client-thread client))
+            do (handler-case (event:run eb el :stop-when-idle nil)
+                 (error () nil))))))
+
+(defun %session-of-run (client run)
+  (and run
+       (find run (%client-sessions client)
+             :key (lambda (s) (%s-run (%session-state s))) :test #'eq)))
+
+(defun %call (client fn &key internal)
+  "Run FN on CLIENT's loop thread and return its values; at once when called
+there. Its error is signalled again in the caller (the same object)."
+  (let ((loop (%client-thread client)))
+    (when (and (not internal)
+               (or (client-closed-p client) (null loop) (%loop-stopping loop)))
+      (error 'client-closed))
+    (if (eq (bt:current-thread) (%loop-thread loop))
+        (funcall fn)
+        (let ((lock (bt:make-lock "client call"))
+              (cv (bt:make-condition-variable))
+              (box nil))
+          (event:wake-call (%client-event-backend client) (%client-event-loop client)
+                           (lambda ()
+                             (let ((r (handler-case (cons :ok (multiple-value-list (funcall fn)))
+                                        (error (e) (cons :error e)))))
+                               (bt:with-lock-held (lock)
+                                 (setf box r)
+                                 (bt:condition-notify cv)))))
+          (bt:with-lock-held (lock)
+            (loop until (or box (not (bt:thread-alive-p (%loop-thread loop))))
+                  do (bt:condition-wait cv lock :timeout 0.2)))
+          (case (car box)
+            (:ok (values-list (cdr box)))
+            (:error (error (cdr box)))
+            (t (error 'client-closed)))))))
+
+(defmacro %on-client-loop ((client) &body body)
+  `(%call ,client (lambda () ,@body)))
+
+;;; The client.
+
+(defun %given-directory (given)
+  (if (pathnamep given) (uiop:native-namestring given) given))
 
 (defun make-client (&key cwd settings providers user-config-dir data-dir
                          (getenv #'uiop:getenv) on-event on-approval (plan-area :auto))
-  (declare (ignore cwd settings providers user-config-dir data-dir getenv on-event
-                   on-approval plan-area))
-  (%not-implemented 'make-client))
+  (let* ((dir (truename (%resolve-cwd (%given-directory cwd))))
+         (client (make-instance 'code-client
+                                :cwd dir
+                                :settings (or settings (make-settings))
+                                :providers providers
+                                :user-config-dir user-config-dir
+                                :data-dir data-dir
+                                :getenv (or getenv #'uiop:getenv)
+                                :on-event on-event
+                                :on-approval on-approval
+                                :plan-area (or plan-area :auto)))
+         (eb (event-backend-libuv:make-libuv-backend))
+         (el (event:make-event-loop eb))
+         (loop (%make-loop))
+         (http http-protocol:*http-backend*)
+         (maker http-backend-async:*event-backend-maker*))
+    (setf (%client-event-backend client) eb
+          (%client-event-loop client) el
+          (%client-thread client) loop)
+    (handler-bind ((error (lambda (e)
+                            (declare (ignore e))
+                            (event:close-event-loop eb el))))
+      (setf (%loop-thread loop)
+            (bt:make-thread (lambda () (%client-thread-main client http maker))
+                            :name "cl-stack-code client")))
+    client))
 
 (defun close-client (client)
-  (declare (ignore client))
-  (%not-implemented 'close-client))
+  (let ((loop (%client-thread client)))
+    (when (or (client-closed-p client) (null loop) (%loop-stopping loop))
+      (return-from close-client nil))
+    (let ((turns (handler-case
+                     (%call client
+                            (lambda ()
+                              (loop for session in (reverse (%client-sessions client))
+                                    for turn = (%close-session session)
+                                    when turn collect turn))
+                            :internal t)
+                   (error () nil))))
+      (if (%loop-thread-p client)
+          ;; Inside a callback: the turns end on this thread later.
+          (progn
+            (setf (%loop-stopping loop) t
+                  (client-closed-p client) t)
+            (event:wake-call (%client-event-backend client) (%client-event-loop client)
+                             (lambda () (event:stop (%client-event-backend client)
+                                                    (%client-event-loop client)))))
+          (progn
+            (dolist (turn turns)
+              (client-wait turn :timeout 60))
+            (setf (%loop-stopping loop) t)
+            (let ((eb (%client-event-backend client))
+                  (el (%client-event-loop client)))
+              (event:wake-call eb el (lambda () (event:stop eb el)))
+              (let ((ended (%join-thread (%loop-thread loop) 10)))
+                (setf (client-closed-p client) t)
+                (when ended
+                  (event:close-event-loop eb el)))))))
+    nil))
 
 (defun client-sessions (client)
-  (declare (ignore client))
-  (%not-implemented 'client-sessions))
-
-(defun client-new-session (client &key cwd model permission-mode session-id)
-  (declare (ignore client cwd model permission-mode session-id))
-  (%not-implemented 'client-new-session))
-
-(defun client-resume-session (client designator &key cwd model permission-mode fork session-id)
-  (declare (ignore client designator cwd model permission-mode fork session-id))
-  (%not-implemented 'client-resume-session))
-
-(defun client-fork-session (session &key at session-id)
-  (declare (ignore session at session-id))
-  (%not-implemented 'client-fork-session))
-
-(defun client-close-session (session)
-  (declare (ignore session))
-  (%not-implemented 'client-close-session))
+  (%on-client-loop (client) (reverse (%client-sessions client))))
 
 (defun client-find-session (client id)
-  (declare (ignore client id))
-  (%not-implemented 'client-find-session))
+  (%on-client-loop (client)
+    (find id (%client-sessions client) :key #'code-session-id :test #'equal)))
+
+;;; Reports, sinks and delivery.
+
+(defun %sdk-denial-reason (decision)
+  "The SDK's permission_denials reason: a person (or an interrupt) refused
+the call → \"rejected\"; a rule or policy → \"denied\"."
+  (if (member decision '(:rejected :unattended)) "rejected" "denied"))
+
+(defun %deliver (session object on-event)
+  "The client's ON-EVENT, then ON-EVENT (a turn's), on the loop thread. A
+callback error is dropped."
+  (let ((f (%client-on-event (code-session-client session))))
+    (when f
+      (handler-case (funcall f session object)
+        (error () nil))))
+  (when on-event
+    (handler-case (funcall on-event session object)
+      (error () nil)))
+  object)
+
+(defun %session-report (session &optional turn on-event)
+  "A %REPORT whose sink delivers to SESSION's callbacks (and records TURN's
+events when TURN is given)."
+  (make-%report :format :sdk
+                :output (make-broadcast-stream)
+                :session (code-session-id session)
+                :sink (if turn
+                          (lambda (object)
+                            (bt:with-lock-held ((%turn-lock turn))
+                              (push object (%turn-events turn)))
+                            (%deliver session object on-event))
+                          (lambda (object) (%deliver session object nil)))
+                :denial-reason #'%sdk-denial-reason
+                :image-tools (third (%s-sources (%session-state session)))))
+
+;;; Sessions.
+
+(defun %live (session)
+  "SESSION's state; SESSION-NOT-OPEN once it was closed."
+  (let ((st (%session-state session)))
+    (when (or (null st) (%s-closed st))
+      (error 'session-not-open :id (code-session-id session)))
+    st))
+
+(defun %session-dir (client cwd)
+  "CWD (relative to the client's) as a directory truename; the client's when
+NIL. Not a directory → CODE-USAGE-ERROR."
+  (if (null cwd)
+      (client-cwd client)
+      (let* ((given (%given-directory cwd))
+             (path (and (stringp given) (plusp (length given))
+                        (uiop:parse-native-namestring given :ensure-directory t)))
+             (dir (and path (uiop:directory-exists-p
+                             (uiop:merge-pathnames* path (client-cwd client))))))
+        (if dir
+            (truename dir)
+            (error 'code-usage-error
+                   :message (format nil "--cwd ~a is not a directory" given))))))
+
+(defun %client-data-root (client)
+  "The data directory: MAKE-CLIENT's DATA-DIR, else USER-DATA-DIRECTORY."
+  (or (%client-data-dir client)
+      (user-data-directory :getenv (%client-getenv client))))
+
+(defun %client-config (client)
+  (or (%client-user-config-dir client)
+      (user-config-directory :getenv (%client-getenv client))))
+
+(defun %merged-settings (client dir &key model permission-mode)
+  "The settings files of DIR under the client's flag layer, then the session
+overrides."
+  (let ((loaded (load-settings dir :user-config-dir (%client-config client)
+                                   :cli (%client-settings client))))
+    (if (or model permission-mode)
+        (merge-settings loaded (make-settings :model model :permission-mode permission-mode))
+        loaded)))
+
+(defun %sessions-dir-of-client (client dir)
+  (%sessions-dir dir (%client-data-dir client) (%client-getenv client)))
+
+(defun %check-new-id (sessions-dir id)
+  "SESSION-ID as --session-id: a bad one or an existing one → CODE-USAGE-ERROR."
+  (when id
+    (let ((normal (normalize-session-id id)))
+      (unless normal
+        (%usage-fail "bad session id ~s: use 32 hex digits or a UUID" id))
+      (when (%session-exists-p sessions-dir normal)
+        (%usage-fail "session ~a already exists: use --resume ~a" normal normal)))))
+
+(defun %open-code-session (client dir settings designator store-fn &key turns forked-from)
+  "Set SESSION up as MAKE-CODE-PROGRAM sets up the interactive mode; STORE-FN
+makes its store once the configuration passed. → the CODE-SESSION, its init
+event delivered."
+  (let* ((getenv (%client-getenv client))
+         (config (%client-config client))
+         (data-dir (%client-data-dir client))
+         (env (%env-lookup settings getenv))
+         (resolved (multiple-value-list
+                    (resolve-model designator :providers (%client-providers client) :env env)))
+         (backend (first resolved))
+         (mode (or (settings-permission-mode settings) :default))
+         (link (when (settings-lisp-image settings)
+                 (check-lisp-image-settings settings mode)
+                 (and (lisp-image-enabled-p settings) (%make-image-link))))
+         (project-dir (or (find-project-root dir) dir))
+         (store nil)
+         (checkpointer nil)
+         (sources nil)
+         (done nil))
+    (unwind-protect
+         (progn
+           (setf store (funcall store-fn project-dir)
+                 checkpointer (%make-run-checkpointer settings dir data-dir getenv)
+                 sources (make-code-tools dir :settings settings
+                                              :on-image-event (and link (%link-callback link))))
+           (when link
+             (setf (%link-tools link) (third sources))
+             (start-lisp-image (third sources) settings))
+           (let ((offered (loop for source in sources
+                                append (mapcar #'llm:llm-tool-name
+                                               (agent:list-agent-tools source)))))
+             (multiple-value-bind (instructions files)
+                 (assemble-system-prompt dir :tools offered :backend backend
+                                             :settings settings :user-config-dir config
+                                             :lisp-image (third sources))
+               (let* ((rules (make-settings-rule-store
+                              (third (settings-file-paths dir :user-config-dir config))))
+                      (agent (agent:make-ai-agent
+                              :name "cl-stack-code"
+                              :backend backend
+                              :model (third resolved)
+                              :instructions instructions
+                              :tools sources
+                              :permissions (%agent-permissions settings)
+                              :settings (%agent-settings dir settings)
+                              :permission-store rules))
+                      (session (make-instance 'code-session
+                                              :client client
+                                              :id (session-id store)
+                                              :cwd dir
+                                              :model designator
+                                              :permission-mode mode
+                                              :store store)))
+                 (setf (%session-state session)
+                       (make-%sess :cwd dir :config config :settings settings :mode mode
+                                   :designator designator
+                                   :data-dir (%client-data-root client) :getenv getenv
+                                   :sessions-dir (%sessions-dir-of-client client dir)
+                                   :project-dir project-dir
+                                   :max-turns (or (settings-max-turns settings) +default-max-turns+)
+                                   :agent agent :sources sources :link link
+                                   :checkpointer checkpointer))
+                 (push session (%client-sessions client))
+                 (setf done t)
+                 (when link
+                   (let ((eb (%client-event-backend client))
+                         (el (%client-event-loop client)))
+                     (%link-attach link (lambda (event)
+                                          (event:wake-call eb el
+                                                           (lambda ()
+                                                             (%sdk-image-event session event)))))))
+                 (setf (code-session-init session)
+                       (apply #'%emit-event (%session-report session) "system"
+                              (append (%system-init-keys dir (find-project-root dir) designator
+                                                         mode offered files
+                                                         (and link settings))
+                                      (and turns (list "turns" turns))
+                                      (and forked-from (list "forked_from" forked-from)))))
+                 session))))
+      (unless done
+        (%link-close link)
+        (when (second sources)
+          (tools:close-shell-tools (second sources)))
+        (when checkpointer
+          (close-checkpointer checkpointer))))))
+
+(defun %head-model (store)
+  (let ((head (and store (session-head store))))
+    (and head (record-model (revision-record head)))))
+
+(defun client-new-session (client &key cwd model permission-mode session-id)
+  (%on-client-loop (client)
+    (let* ((dir (%session-dir client cwd))
+           (settings (%merged-settings client dir :model model :permission-mode permission-mode))
+           (sessions-dir (%sessions-dir-of-client client dir))
+           (inv (make-instance 'invocation :session-id session-id :settings (make-settings))))
+      ;; --session-id's checks (a bad id, an existing one).
+      (%session-source inv sessions-dir)
+      (%open-code-session client dir settings
+                          (or model (settings-model settings) +default-model+)
+                          (lambda (project-dir)
+                            (%session-for-run inv nil sessions-dir project-dir))))))
+
+(defun client-resume-session (client designator &key cwd model permission-mode fork session-id)
+  (%on-client-loop (client)
+    (let* ((dir (%session-dir client cwd))
+           (sessions-dir (%sessions-dir-of-client client dir))
+           (inv (make-instance 'invocation
+                               :continue-p (eq designator :last)
+                               :resume (and (not (eq designator :last)) designator)
+                               :fork-session-p (and fork t)
+                               :session-id (and fork session-id)
+                               :settings (make-settings)))
+           (source (if (or (eq designator :last) (stringp designator))
+                       (%session-source inv sessions-dir)
+                       (error 'session-not-found :designator designator)))
+           (open (and (not fork)
+                      (find (session-id source) (%client-sessions client)
+                            :key #'code-session-id :test #'equal))))
+      (or open
+          (let ((settings (%merged-settings client dir :model model
+                                                       :permission-mode permission-mode)))
+            (%open-code-session client dir settings
+                                (or model (%head-model source) (settings-model settings)
+                                    +default-model+)
+                                (lambda (project-dir)
+                                  (%session-for-run inv source sessions-dir project-dir))
+                                :turns (length (session-line source))
+                                :forked-from (and fork (session-id source))))))))
+
+(defun client-fork-session (session &key at session-id)
+  (let ((client (code-session-client session)))
+    (%on-client-loop (client)
+      (let* ((st (%live session))
+             (store (code-session-store session))
+             (revision (if at
+                           (resolve-turn store (if (integerp at) (princ-to-string at) at))
+                           (session-head store)))
+             (settings (%s-settings st)))
+        (%check-new-id (%s-sessions-dir st) session-id)
+        (%open-code-session client (%s-cwd st) settings (%s-designator st)
+                            (lambda (project-dir)
+                              (declare (ignore project-dir))
+                              (clone-session store :id session-id
+                                                   :at (and revision (rev:revision-id revision))))
+                            :turns (if revision
+                                       (length (session-line store (rev:revision-id revision)))
+                                       0)
+                            :forked-from (session-id store))))))
+
+(defun %close-session-resources (st)
+  (%link-close (%s-link st))
+  (let ((shell (second (%s-sources st))))
+    (when shell (tools:close-shell-tools shell)))
+  (let ((shell (second (%s-plan-sources st))))
+    (when shell (tools:close-shell-tools shell)))
+  (when (%s-checkpointer st)
+    (close-checkpointer (%s-checkpointer st))))
+
+(defun %close-session (session)
+  "Loop thread: close SESSION. → the CODE-TURN still ending (its resources
+close after its result), or NIL."
+  (let ((st (%session-state session))
+        (client (code-session-client session)))
+    (when (and st (not (%s-closed st)))
+      (setf (%s-closed st) t
+            (%client-sessions client) (remove session (%client-sessions client)))
+      (%interrupt st session)
+      (if (eq :idle (%s-state st))
+          (progn (%close-session-resources st) nil)
+          (progn (setf (%s-close-pending st) t)
+                 (%s-turn st))))))
+
+(defun client-close-session (session)
+  (let* ((client (code-session-client session))
+         (turn (%on-client-loop (client) (%close-session session))))
+    (when (and turn (not (%loop-thread-p client)))
+      (client-wait turn :timeout 60))
+    t))
 
 (defun client-list-sessions (client &key cwd)
-  (declare (ignore client cwd))
-  (%not-implemented 'client-list-sessions))
+  (%on-client-loop (client)
+    (let ((dir (%session-dir client cwd)))
+      (mapcar (lambda (store)
+                (let* ((line (session-line store))
+                       (head (session-head store))
+                       (first-prompt (and line (record-prompt (revision-record (first line)))))
+                       (time (%latest-time store)))
+                  (%json-object "session_id" (session-id store)
+                                "turns" (length line)
+                                "prompt" (if first-prompt (%first-line first-prompt) :null)
+                                "head" (if head (rev:revision-id head) :null)
+                                "updated_at" (if time (dt:instant-seconds time) :null)
+                                "open" (and (find (session-id store) (%client-sessions client)
+                                                  :key #'code-session-id :test #'equal)
+                                            t))))
+              (list-sessions (%sessions-dir-of-client client dir))))))
 
 (defun client-busy-p (session)
-  (declare (ignore session))
-  (%not-implemented 'client-busy-p))
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%session-state session)))
+      (and st (not (eq :idle (%s-state st)))))))
+
+;;; Turns.
+
+(defun %tool-root (st)
+  (if (and (%s-plan st) (%s-plan-sources st))
+      (plan-tool-root (%s-plan st) (%s-cwd st))
+      (%s-cwd st)))
+
+(defun %prompt-text (prompt mentions root)
+  "PROMPT with its @mentions expanded, then MENTIONS attached (skipping a path
+attached already)."
+  (multiple-value-bind (text attached) (expand-mentions prompt root)
+    (let ((parts (list text)))
+      (dolist (rel mentions)
+        (unless (member rel attached :test #'string=)
+          (let* ((path (%project-file root rel))
+                 (content (and path (%file-text path))))
+            (when content
+              (push rel attached)
+              (push (%attachment rel content) parts)))))
+      (apply #'concatenate 'string (nreverse parts)))))
+
+(defun %sdk-agent-event (session)
+  "The run's :ON-EVENT: the current turn's report, plus steering taken."
+  (lambda (kind payload)
+    (let ((st (%session-state session)))
+      (when (eq kind :started)
+        (setf (%s-run st) payload))
+      (let ((report (%s-report st)))
+        (when report
+          (%on-agent-event report kind payload)))
+      (when (eq kind :inbox)
+        (handler-case (%sdk-on-inbox st payload)
+          (error () nil))))))
+
+(defun %sdk-on-inbox (st turns)
+  "The run took TURNS from its inbox: the steering among them, as given."
+  (let ((texts '()))
+    (dolist (turn turns)
+      (let ((entry (assoc turn (%s-posted st) :test #'eq)))
+        (when entry
+          (push (cdr entry) texts)
+          (setf (%s-posted st) (remove entry (%s-posted st) :test #'eq)))))
+    (when texts
+      (setf texts (nreverse texts)
+            (%s-steering st) (append (%s-steering st) texts))
+      (when (%s-report st)
+        (%emit-event (%s-report st) "steering" "subtype" "taken"
+                     "texts" (coerce texts 'vector))))))
+
+(defun %sdk-callback (session)
+  (lambda (run)
+    (let ((st (%session-state session)))
+      (setf (%s-run st) run)
+      (if (and (member (agent:agent-run-finish-reason run) '(:approval :deferred))
+               (not (%s-interrupted st)))
+          (%offer-approvals session st run)
+          (%finish-turn session st run nil)))))
+
+(defun %sdk-error-callback (session)
+  (lambda (condition)
+    (let ((st (%session-state session)))
+      (%finish-turn session st (%s-run st) condition))))
+
+(defun %sdk-ensure-plan (session st report)
+  "H5a: open (or reopen) the session's plan and give the agent the area's
+tools and instructions (as %ENSURE-PLAN); the run is dropped. The plan
+\"opened\" / \"reopened\" event."
+  (unless (%s-plan st)
+    (let* ((client (code-session-client session))
+           (cwd (%s-cwd st))
+           (data-dir (%s-data-dir st))
+           (store (code-session-store session))
+           (entry (%head-plan-entry store))
+           (reopened nil)
+           (plan (or (and entry (eq :open (getf entry :status))
+                          (handler-case (prog1 (reopen-plan (plans-directory cwd :data-dir data-dir)
+                                                            (getf entry :id))
+                                          (setf reopened t))
+                            (plan-not-found () nil)))
+                     (open-plan (%s-project-dir st) :kind (%client-plan-area client)
+                                                    :data-dir data-dir
+                                                    :session-id (session-id store))))
+           (agent (%s-agent st))
+           (settings (merge-settings (%s-settings st)
+                                     (make-settings :permission-mode :plan
+                                                    :lisp-image '(:image (:off)))))
+           (sources (make-code-tools (plan-tool-root plan cwd) :settings settings)))
+      (handler-bind ((error (lambda (e)
+                              (declare (ignore e))
+                              (when (second sources)
+                                (tools:close-shell-tools (second sources))))))
+        (let* ((offered (loop for source in sources
+                              append (mapcar #'llm:llm-tool-name
+                                             (agent:list-agent-tools source))))
+               (instructions (assemble-system-prompt
+                              cwd :tools offered :backend (agent:ai-agent-backend agent)
+                                  :settings settings :user-config-dir (%s-config st)
+                                  :plan plan)))
+          (setf (%s-cwd-instructions st) (agent:ai-agent-instructions agent)
+                (agent:ai-agent-tools agent) sources
+                (agent:ai-agent-instructions agent) instructions
+                (%s-plan st) plan
+                (%s-plan-sources st) sources
+                (%s-run st) nil
+                (%s-handle st) nil)))
+      (apply #'%emit-event report "plan" (%plan-open-keys plan reopened)))))
+
+(defun %restore-cwd-tools (st)
+  "H5a: the plan closed: the working directory's tools and instructions
+again, the run dropped."
+  (let ((agent (%s-agent st))
+        (sources (%s-plan-sources st)))
+    (setf (agent:ai-agent-tools agent) (%s-sources st))
+    (when (%s-cwd-instructions st)
+      (setf (agent:ai-agent-instructions agent) (%s-cwd-instructions st)))
+    (setf (%s-plan st) nil
+          (%s-plan-sources st) nil
+          (%s-plan-turn-p st) nil
+          (%s-run st) nil
+          (%s-handle st) nil)
+    (when (second sources)
+      (tools:close-shell-tools (second sources)))))
+
+(defun %start-turn (session prompt mentions on-event)
+  (let ((st (%live session)))
+    (unless (eq :idle (%s-state st))
+      (error 'turn-busy :session-id (code-session-id session)))
+    (when (or (not (stringp prompt)) (%blank-text-p prompt))
+      (error 'code-usage-error :message "no prompt"))
+    (dolist (rel mentions)
+      (unless (and (stringp rel) (%project-file (%tool-root st) rel))
+        (%usage-fail "mention ~a is not a file under the working directory" rel)))
+    (let* ((turn (make-instance 'code-turn :session session :prompt prompt))
+           (report (%session-report session turn on-event))
+           (store (code-session-store session))
+           (ok (%sdk-callback session))
+           (err (%sdk-error-callback session)))
+      (setf (%s-turn st) turn
+            (%s-report st) report
+            (%s-state st) :running
+            (%s-interrupted st) nil
+            (%s-pending st) '()
+            (%s-start st) (get-internal-real-time)
+            (%s-plan-turn-p st) nil)
+      (handler-case
+          (progn
+            (when (eq :plan (%s-mode st))
+              (%sdk-ensure-plan session st report))
+            (setf (%s-plan-turn-p st) (and (%s-plan st) t)
+                  (%s-pre st) (handler-case (begin-checkpoint-turn (%s-checkpointer st) store)
+                                (error () nil)))
+            (let ((text (%prompt-text prompt mentions (%tool-root st)))
+                  (run (%s-run st)))
+              (if run
+                  (progn
+                    (setf (%report-run report) run
+                          (%s-handle st) (agent:continue-ai-agent-async run text :callback ok
+                                                                                 :error-callback err)))
+                  (let ((history (session-turns store))
+                        (committed (make-hash-table :test 'eq)))
+                    (dolist (old history) (setf (gethash old committed) t))
+                    (setf (%s-committed st) committed
+                          (%s-usage st) (list 0 0 0 0)
+                          (%s-steering st) '()
+                          (%s-handle st)
+                          (agent:run-ai-agent-async (%s-agent st)
+                                                    (append history (list (llm:user-turn text)))
+                                                    :on-event (%sdk-agent-event session)
+                                                    :callback ok :error-callback err))))
+              ;; H4b: image events queued while idle follow the prompt.
+              (%post-if-going (third (%s-sources st)) (%s-run st))))
+        (error (e) (%finish-turn session st (%s-run st) e)))
+      turn)))
 
 (defun client-turn (session prompt &key mentions on-event)
-  (declare (ignore session prompt mentions on-event))
-  (%not-implemented 'client-turn))
+  (%on-client-loop ((code-session-client session))
+    (%start-turn session prompt mentions on-event)))
 
 (defun client-wait (turn &key timeout)
-  (declare (ignore turn timeout))
-  (%not-implemented 'client-wait))
+  (let ((client (code-session-client (code-turn-session turn))))
+    (when (%loop-thread-p client)
+      (error 'code-usage-error :message "CLIENT-WAIT cannot run on the client's loop thread"))
+    (let ((deadline (and timeout
+                         (+ (get-internal-real-time)
+                            (round (* timeout internal-time-units-per-second))))))
+      (bt:with-lock-held ((%turn-lock turn))
+        (loop
+          (let ((result (%turn-result turn)))
+            (when result (return result)))
+          (let ((left (and deadline
+                           (/ (- deadline (get-internal-real-time))
+                              internal-time-units-per-second))))
+            (when (and left (<= left 0))
+              (return nil))
+            (bt:condition-wait (%turn-done turn) (%turn-lock turn)
+                               :timeout (if left (min left 0.1) 0.1))))))))
 
 (defun client-query (session prompt &key mentions on-event timeout)
-  (declare (ignore session prompt mentions on-event timeout))
-  (%not-implemented 'client-query))
+  (when (%loop-thread-p (code-session-client session))
+    (error 'code-usage-error :message "CLIENT-QUERY cannot run on the client's loop thread"))
+  (let* ((turn (client-turn session prompt :mentions mentions :on-event on-event))
+         (result (client-wait turn :timeout timeout)))
+    (unless result
+      (client-interrupt session)
+      (setf result (client-wait turn)))
+    (values result (code-turn-events turn))))
 
 (defun client-steer (session text)
-  (declare (ignore session text))
-  (%not-implemented 'client-steer))
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (unless (and (eq :running (%s-state st)) (%s-run st))
+        (error 'turn-not-running :session-id (code-session-id session)))
+      (let ((turn (llm:user-turn (expand-mentions text (%tool-root st)))))
+        (setf (%s-posted st) (append (%s-posted st) (list (cons turn text))))
+        (agent:agent-run-post (%s-run st) turn)
+        t))))
+
+(defun %interrupt (st session)
+  "Loop thread. → T when a turn was running or waiting."
+  (case (%s-state st)
+    (:running
+     (setf (%s-interrupted st) t)
+     (let ((target (or (%s-run st) (%s-handle st))))
+       (when target (agent:cancel-agent-run target)))
+     t)
+    (:waiting
+     (setf (%s-interrupted st) t)
+     (%finish-turn session st (%s-run st) nil)
+     t)
+    (t nil)))
 
 (defun client-interrupt (session)
-  (declare (ignore session))
-  (%not-implemented 'client-interrupt))
+  (%on-client-loop ((code-session-client session))
+    (%interrupt (%live session) session)))
+
+;;; Approvals.
+
+(defun %offer-approvals (session st run)
+  "The run paused: one approval_request per :proposed call, then ON-APPROVAL."
+  (setf (%s-state st) :waiting)
+  (let ((client (code-session-client session)))
+    (dolist (inv (copy-list (%proposed run)))
+      (when (and (%proposed-p inv) (eq :waiting (%s-state st)) (eq run (%s-run st)))
+        (let* ((report (%s-report st))
+               (id (agent:agent-invocation-id inv))
+               (name (agent:agent-invocation-name inv))
+               (input (%tool-input (agent:agent-invocation-arguments inv)))
+               (request (%emit-event report "approval_request"
+                                     "step" (gethash id (%report-call-steps report)
+                                                     (%report-step report))
+                                     "id" id
+                                     "name" name
+                                     "input" input
+                                     "summary" (tool-call-summary name input)
+                                     "preview" (or (tool-call-preview (%tool-root st) name input)
+                                                   :null))))
+          (setf (%s-pending st) (append (%s-pending st) (list (cons inv request))))
+          (let ((f (%client-on-approval client)))
+            (when f
+              (let ((decision (handler-case (funcall f session request)
+                                (error () nil))))
+                (when decision
+                  (handler-case (%respond session st id decision nil)
+                    (error () nil)))))))))))
+
+(defun %decision (decision feedback)
+  "→ (values kind feedback) of a decision; another → CODE-USAGE-ERROR."
+  (cond ((member decision '(:once :always :reject :reject-all)) (values decision feedback))
+        ((and (consp decision) (eq :reject (first decision))
+              (or (null (rest decision)) (stringp (second decision))))
+         (values :reject (or (second decision) feedback)))
+        (t (%usage-fail "bad approval decision ~s: use :once, :always, :reject, (:reject FEEDBACK) or :reject-all"
+                        decision))))
+
+(defun %resolve (st entry decision)
+  "One approval_resolved event; ENTRY leaves the pending list."
+  (%emit-event (%s-report st) "approval_resolved"
+               "id" (agent:agent-invocation-id (car entry))
+               "decision" decision)
+  (setf (%s-pending st) (remove entry (%s-pending st) :test #'eq)))
+
+(defun %respond (session st id decision feedback)
+  (multiple-value-bind (kind feedback) (%decision decision feedback)
+    (let ((entry (find id (%s-pending st) :key (lambda (e) (agent:agent-invocation-id (car e)))
+                                          :test #'equal))
+          (run (%s-run st))
+          (feedback (and (stringp feedback) (not (%blank-text-p feedback)) feedback))
+          (resolved '()))
+      (unless (and entry run (eq :waiting (%s-state st)))
+        (error 'approval-not-found :id id))
+      (ecase kind
+        (:once
+         (%resolve st entry "once")
+         (push id resolved)
+         (%approve-once run (car entry)))
+        (:always
+         (%resolve st entry "always")
+         (push id resolved)
+         (handler-case (agent:approve-invocation run (car entry) :always t)
+           (settings-error ()
+             ;; The rule could not be saved; the call is still approved once.
+             (%approve-once run (car entry))))
+         ;; The other waiting calls the rule covers were approved with it.
+         (dolist (other (copy-list (%s-pending st)))
+           (unless (%proposed-p (car other))
+             (%resolve st other "always")
+             (push (agent:agent-invocation-id (car other)) resolved))))
+        (:reject
+         (%resolve st entry "reject")
+         (push id resolved)
+         (agent:deny-invocation run (car entry) :feedback feedback)
+         (%push-denial (%s-report st) (car entry) "rejected"))
+        (:reject-all
+         (let ((all (copy-list (%s-pending st))))
+           (dolist (other all)
+             (%resolve st other "reject_all")
+             (push (agent:agent-invocation-id (car other)) resolved))
+           (dolist (other all)
+             (when (%proposed-p (car other))
+               (agent:deny-invocation run (car other) :feedback feedback))
+             (%push-denial (%s-report st) (car other) "rejected"))
+           (dolist (inv (%proposed run))
+             (agent:deny-invocation run inv :feedback feedback)))))
+      (%maybe-resume-run session st)
+      (nreverse resolved))))
+
+(defun %approve-once (run inv)
+  (when (%proposed-p inv)
+    (agent:approve-invocation run inv)))
+
+(defun %maybe-resume-run (session st)
+  "Resume the paused run when none of its calls waits any more."
+  (let ((run (%s-run st)))
+    (when (and run (eq :waiting (%s-state st))
+               (notany #'%proposed-p (agent:agent-run-invocations run)))
+      (setf (%s-state st) :running
+            (%s-pending st) '())
+      (handler-case
+          (setf (%s-handle st)
+                (agent:resume-ai-agent-async run :callback (%sdk-callback session)
+                                                 :error-callback (%sdk-error-callback session)))
+        (error (e) (%finish-turn session st run e))))))
 
 (defun client-pending-approvals (session)
-  (declare (ignore session))
-  (%not-implemented 'client-pending-approvals))
+  (%on-client-loop ((code-session-client session))
+    (mapcar #'cdr (%s-pending (%live session)))))
 
 (defun client-respond-approval (session id decision &key feedback)
-  (declare (ignore session id decision feedback))
-  (%not-implemented 'client-respond-approval))
+  (%on-client-loop ((code-session-client session))
+    (%respond session (%live session) id decision feedback)))
+
+;;; The end of a turn.
+
+(defun %sdk-commit (session st run report finish)
+  "Commit RUN's turns since the last commit (as %COMMIT-RUN); a conflict
+forks the session (the \"session\" \"forked\" event). → (values revision
+store) or NIL."
+  (let* ((committed (%s-committed st))
+         (new (remove-if (lambda (turn)
+                           (or (eq :system (llm:llm-turn-role turn)) (gethash turn committed)))
+                         (agent:agent-run-turns run))))
+    (setf (%s-usage st) (mapcar #'+ (%s-usage st) (%report-usage report)))
+    (when new
+      (handler-case
+          (let* ((old (code-session-store session))
+                 (plan (%s-plan st))
+                 (record (make-turn-record :prompt (code-turn-prompt (%s-turn st))
+                                           :turns new
+                                           :finish finish
+                                           :model (%s-designator st)
+                                           :permission-mode (or (%s-mode st) :default)
+                                           :usage (copy-list (%s-usage st))
+                                           :steering (copy-list (%s-steering st))
+                                           :plan (and plan (%s-plan-turn-p st)
+                                                      (plan-record plan)))))
+            (multiple-value-bind (revision store) (%commit-forking old record)
+              (dolist (turn new) (setf (gethash turn committed) t))
+              (setf (%s-usage st) (list 0 0 0 0)
+                    (%s-steering st) '())
+              (unless (eq store old)
+                (setf (code-session-store session) store
+                      (code-session-id session) (session-id store)
+                      (%report-session report) (session-id store))
+                (%emit-event report "session" "subtype" "forked" "from" (session-id old)))
+              (values revision store)))
+        ;; Any other commit error: the turns go into the next commit (TUI).
+        (error () nil)))))
+
+(defun %finish-turn (session st run failure)
+  "Loop thread, once per turn: deny calls left waiting, drain the steering
+(\"dropped\"), the plan projection, commit, END-CHECKPOINT-TURN, then the
+result; then the session is idle and CLIENT-WAIT answers."
+  (when (member (%s-state st) '(:idle :ending))
+    (return-from %finish-turn nil))
+  (setf (%s-state st) :ending)
+  (let* ((report (%s-report st))
+         (turn (%s-turn st))
+         (failure (or (%report-failure report) failure))
+         (interrupted (%s-interrupted st))
+         (reason (and run (agent:agent-run-finish-reason run)))
+         (paused (member reason '(:approval :deferred)))
+         (result nil))
+    ;; A paused run that ends here: its waiting calls are refused, and the
+    ;; run is not continued (the next turn starts a new one).
+    (when paused
+      (dolist (entry (copy-list (%s-pending st)))
+        (%resolve st entry "interrupt")
+        (when (%proposed-p (car entry))
+          (agent:deny-invocation run (car entry) :reason "interrupted"))
+        (%push-denial report (car entry) "rejected"))
+      (dolist (inv (%proposed run))
+        (agent:deny-invocation run inv :reason "interrupted")))
+    (when run
+      (agent:drain-agent-run-inbox run))
+    (let ((dropped (mapcar #'cdr (shiftf (%s-posted st) '()))))
+      (when dropped
+        (%emit-event report "steering" "subtype" "dropped" "texts" (coerce dropped 'vector))))
+    ;; H5a
+    (when (and (%s-plan-turn-p st) (%s-plan st))
+      (let ((plan (%s-plan st)))
+        (if (and run (not failure) (not interrupted)
+                 (not (member reason '(:canceled :approval :deferred))))
+            (%headless-plan-finish report plan (make-instance 'invocation :settings (make-settings))
+                                   run nil nil (make-broadcast-stream))
+            (setf (%report-plan report)
+                  (%plan-object plan :open (plan-changes plan) (plan-diff-text plan) '())))))
+    (multiple-value-bind (revision store)
+        (and run (%sdk-commit session st run report (%run-finish run failure interrupted)))
+      (let ((pre (shiftf (%s-pre st) nil)))
+        (when (and revision pre)
+          (handler-case (end-checkpoint-turn (%s-checkpointer st) store pre revision)
+            (error () nil)))))
+    (when paused
+      (setf (%s-run st) nil (%s-handle st) nil))
+    (multiple-value-bind (subtype condition)
+        (%outcome run failure interrupted (%s-max-turns st))
+      (setf result (%result-object report subtype
+                                   (if (and run (not failure))
+                                       (%trim-answer (agent:agent-run-text run))
+                                       "")
+                                   (and condition (princ-to-string condition))
+                                   (round (* 1000 (- (get-internal-real-time) (%s-start st)))
+                                          internal-time-units-per-second)))
+      (funcall (%report-sink report) result))
+    (setf (%s-state st) :idle
+          (%s-turn st) nil
+          (%s-report st) nil
+          (%s-interrupted st) nil
+          (%s-pending st) '())
+    (when (%s-close-pending st)
+      (setf (%s-close-pending st) nil)
+      (%close-session-resources st))
+    (bt:with-lock-held ((%turn-lock turn))
+      (setf (%turn-result turn) result)
+      ;; Every waiter wakes within its 0.1 s poll; one at once.
+      (bt:condition-notify (%turn-done turn)))
+    result))
+
+;;; H4b: image events.
+
+(defun %sdk-image-event (session event)
+  "Loop thread: an image event of SESSION's image. During a turn it goes into
+the turn (posted into the run); while idle it is delivered at once and stays
+queued for the next turn."
+  (let ((st (%session-state session)))
+    (unless (or (null st) (%s-closed st))
+      (%headless-image-event (or (%s-report st) (%session-report session)) event))))
+
+;;; Plans, checkpoints, rewinds.
+
+(defun %check-idle (session st)
+  (unless (eq :idle (%s-state st))
+    (error 'turn-busy :session-id (code-session-id session))))
+
+(defun %open-plan-of (session st)
+  (or (%s-plan st)
+      (error 'plan-not-found
+             :message (format nil "session ~a has no open plan" (code-session-id session)))))
 
 (defun client-approve-plan (session &key (on-drift :abort))
-  (declare (ignore session on-drift))
-  (%not-implemented 'client-approve-plan))
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (%check-idle session st)
+      (let* ((plan (%open-plan-of session st))
+             (report (%session-report session))
+             (store (code-session-store session)))
+        (multiple-value-bind (status result event)
+            (%headless-approve report plan
+                               (make-instance 'invocation :on-drift on-drift
+                                                          :settings (make-settings))
+                               (%s-checkpointer st))
+          (declare (ignore result))
+          (let ((pre (%report-plan-pre report)))
+            (when pre
+              (handler-case (record-plan-checkpoints (%s-checkpointer st) store pre
+                                                     (session-head store))
+                (error () nil))))
+          (when (member status '(:applied :empty))
+            (%restore-cwd-tools st))
+          event)))))
 
 (defun client-reject-plan (session)
-  (declare (ignore session))
-  (%not-implemented 'client-reject-plan))
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (%check-idle session st)
+      (let ((plan (%open-plan-of session st)))
+        (reject-plan plan)
+        (prog1 (%emit-event (%session-report session) "plan" "subtype" "discarded"
+                            "plan_id" (plan-id plan))
+          (%restore-cwd-tools st))))))
+
+(defun %checkpoint-object (k)
+  (%json-object "id" (checkpoint-id k)
+                "ordinal" (checkpoint-ordinal k)
+                "reason" (%change-kind-name (checkpoint-reason k))
+                "turn" (checkpoint-turn k)
+                "files_kind" (%keyword-name (checkpoint-files-kind k))
+                "message" (checkpoint-message k)
+                "recorded_at" (let ((at (checkpoint-recorded-at k)))
+                                (if at (dt:instant-seconds at) :null))
+                "expired" (and (checkpoint-expired-p k) t)))
 
 (defun client-checkpoints (session)
-  (declare (ignore session))
-  (%not-implemented 'client-checkpoints))
+  (%on-client-loop ((code-session-client session))
+    (%live session)
+    (mapcar #'%checkpoint-object
+            (reverse (session-checkpoints (code-session-store session))))))
 
 (defun client-rewind (session turn &key (mode :both) (on-drift :abort))
-  (declare (ignore session turn mode on-drift))
-  (%not-implemented 'client-rewind))
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (%check-idle session st)
+      (let* ((at (if (integerp turn) (princ-to-string turn) turn))
+             (result (handler-bind ((plan-drift
+                                      (lambda (c)
+                                        (invoke-restart
+                                         (find-restart (ecase on-drift
+                                                         (:abort 'abort-approval)
+                                                         (:rebase 'rebase-plan)
+                                                         (:overwrite 'overwrite-plan))
+                                                       c)))))
+                       (rewind-to (%s-checkpointer st) (code-session-store session) at
+                                  :parts (%rewind-parts mode)))))
+        ;; The next turn starts a new run on the new head.
+        (when (eq :moved (getf result :conversation))
+          (setf (%s-run st) nil (%s-handle st) nil))
+        (apply #'%emit-event (%session-report session) "rewind" (%rewind-keys result))))))
+
+;;; Introspection.
+
+(defun %image-designator-name (image)
+  (ecase (first image)
+    (:off "off")
+    (:spawn "spawn")
+    (:attach (format nil "attach:~a:~d" (second image) (third image)))))
+
+(defun %settings-object (settings)
+  "{\"settings\": S, \"files\": [...]} (see the header)."
+  (let ((mode (settings-permission-mode settings))
+        (append-prompt (settings-append-system-prompt settings)))
+    (flet ((rules (list) (map 'vector #'format-permission-rule list)))
+      (%json-object
+       "settings"
+       (%json-object
+        "model" (or (settings-model settings) :null)
+        "maxTurns" (or (settings-max-turns settings) :null)
+        "permissionMode" (if mode (permission-mode-name mode) :null)
+        "permissions" (%json-object "allow" (rules (settings-allow settings))
+                                    "ask" (rules (settings-ask settings))
+                                    "deny" (rules (settings-deny settings)))
+        "env" (coerce (sort (remove-duplicates
+                             (loop for (name . value) in (settings-env settings)
+                                   when value collect name)
+                             :test #'string=)
+                            #'string<)
+                      'vector)
+        "appendSystemPrompt" (or append-prompt :null)
+        "checkpoints" (multiple-value-bind (enabled keep kind) (checkpoint-settings settings)
+                        (%json-object "enabled" (and enabled t) "keep" keep
+                                      "kind" (%keyword-name kind)))
+        "lispImage" (multiple-value-bind (image backend observe on-debugger)
+                        (lisp-image-settings settings)
+                      (%json-object "image" (%image-designator-name image)
+                                    "backend" backend
+                                    "observe" (and observe t)
+                                    "onDebugger" (%keyword-name on-debugger))))
+       "files" (map 'vector #'uiop:native-namestring (settings-files settings))))))
+
+(defun %client-settings-at (client cwd)
+  "CLIENT-SETTINGS of the directory CWD (relative to the client's)."
+  (%on-client-loop (client)
+    (%settings-object (%merged-settings client (%session-dir client cwd)))))
 
 (defun client-settings (session-or-client)
-  (declare (ignore session-or-client))
-  (%not-implemented 'client-settings))
+  (etypecase session-or-client
+    (code-session
+     (%on-client-loop ((code-session-client session-or-client))
+       (%settings-object (%s-settings (%live session-or-client)))))
+    (code-client (%client-settings-at session-or-client nil))))
 
 (defun client-tools (session)
-  (declare (ignore session))
-  (%not-implemented 'client-tools))
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (loop for source in (agent:ai-agent-tools (%s-agent st))
+            append (mapcar (lambda (tool)
+                             (let ((schema (llm:llm-tool-parameters tool)))
+                               (%json-object "name" (llm:llm-tool-name tool)
+                                             "description" (or (llm:llm-tool-description tool) "")
+                                             "input_schema"
+                                             (cond ((hash-table-p schema) schema)
+                                                   ((stringp schema)
+                                                    (let ((v (handler-case (json:decode schema)
+                                                               (error () nil))))
+                                                      (if (hash-table-p v) v (%json-object))))
+                                                   (t (%json-object))))))
+                           (agent:list-agent-tools source))))))

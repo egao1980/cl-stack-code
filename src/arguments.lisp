@@ -356,5 +356,19 @@ new sessions), --model, --max-turns, --permission-mode, --allowed-tools,
 --disallowed-tools, --append-system-prompt, --lisp-image, --lisp-observe
 (the flag layer of every session) and --plan-area (the area kind of plan
 sessions, whatever the mode)."
-  (declare (ignore invocation))
-  (%not-implemented 'check-rpc-flags))
+  (let ((i invocation))
+    (when (invocation-rpc-p i)
+      (when (invocation-print-p i)
+        (%usage-fail "--rpc and -p cannot be used together"))
+      (when (invocation-prompt i)
+        (%usage-fail "--rpc takes no prompt (send turn/start)"))
+      (when (invocation-output-format-given-p i)
+        (%usage-fail "--rpc writes JSON-RPC; --output-format is for -p"))
+      (when (or (invocation-continue-p i) (invocation-resume i) (invocation-session-id i)
+                (invocation-fork-session-p i) (invocation-list-sessions-p i))
+        (%usage-fail "--rpc opens sessions with session/new and session/resume, not --continue, --resume, --session-id, --fork-session or --list-sessions"))
+      (when (or (invocation-apply-p i) (invocation-reject-p i) (invocation-on-drift i)
+                (invocation-rewind i) (invocation-rewind-mode i)
+                (invocation-list-checkpoints-p i))
+        (%usage-fail "--rpc approves plans and rewinds with plan/approve, plan/reject and rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints")))
+    t))
