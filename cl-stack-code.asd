@@ -35,6 +35,7 @@
                (:version "rpc-protocol" "0.2.0")
                (:version "rpc-protocol-json" "0.1.1")
                (:version "rpc-backend-stdio" "0.2.0")
+               (:version "repl-protocol" "0.2.8")
                "process-backend-uiop")
   ;; H4b: --lisp-image spawn starts ros +Q run images that load swank / slynk
   ;; (install roots, as in lisp-mcp; never dependencies).
