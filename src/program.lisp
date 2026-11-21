@@ -406,14 +406,18 @@ configuration errors of -p signal here."
          (checkpointer (%make-run-checkpointer settings cwd data-dir getenv))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
+         (supervisor nil)
          (sources nil)
          (done nil))
     (unwind-protect
          (let ((program
                  (let ((event:*event-backend* event-backend)
                        (event:*event-loop* event-loop))
-                   (setf sources (make-code-tools cwd :settings settings
-                                                      :on-image-event (and link (%link-callback link))))
+                   ;; H8d: the session's supervisor, before the tools.
+                   (setf supervisor (make-code-supervisor cwd :data-dir data-dir :getenv getenv)
+                         sources (make-code-tools cwd :settings settings
+                                                      :on-image-event (and link (%link-callback link))
+                                                      :supervisor supervisor))
                    ;; H4b: the image starts before the terminal is touched; its
                    ;; events wait in the link until TUI-INIT.
                    (when link
@@ -425,7 +429,7 @@ configuration errors of -p signal here."
                           (instructions (assemble-system-prompt
                                          cwd :tools offered :backend backend
                                              :settings settings :user-config-dir config
-                                             :lisp-image (third sources)))
+                                             :lisp-image (%sources-lisp-tools sources)))
                           (store (make-settings-rule-store
                                   (third (settings-file-paths cwd :user-config-dir config))))
                           (agent (agent:make-ai-agent
@@ -463,6 +467,8 @@ configuration errors of -p signal here."
                              :user-config-dir config
                              :checkpointer checkpointer
                              :image-link link
+                             :supervisor supervisor
+                             :unit-tools (code-unit-tools sources)
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -481,8 +487,9 @@ configuration errors of -p signal here."
            program)
       (unless done
         (%link-close link)
-        (when (second sources)
-          (tools:close-shell-tools (second sources)))
+        ;; H8d: unit tools, shell tools, then the supervisor.
+        (%close-code-units supervisor :unit-tools (list (code-unit-tools sources))
+                                      :shell-tools (list (second sources)))
         (close-checkpointer checkpointer)
         (event:close-event-loop event-backend event-loop)))))
 
@@ -724,7 +731,7 @@ posted right after it; then the queued image events are posted."
 
 (defun %cp-lisp-tools (program)
   "H4b: PROGRAM's LISP-TOOLS, or NIL."
-  (third (%cp-sources program)))
+  (%sources-lisp-tools (%cp-sources program)))
 
 (defun %loop-start-image-turn (program)
   "H4b, loop thread: a turn whose message is the first queued image event's
@@ -931,6 +938,8 @@ from the tip's (H5b), else H3c's conversation rewind."
        (%on-loop program (lambda () (%post-if-going (%cp-lisp-tools program) (%cp-run program)))))
       (:image-turn (setf (%cp-interrupted program) nil)
        (%on-loop program (lambda () (%loop-start-image-turn program))))
+      ;; H8d
+      (:units-panel (%panel-open program))
       (:quit nil))))
 
 (defun %interrupt-wins (program event)
@@ -1017,6 +1026,8 @@ goes back to the input)."
         (run tui:*tui*))
     (when link
       (%link-attach link (lambda (event) (tui:tui-send (image-event-message event) run)))))
+  ;; H8d: the supervisor's events from now on.
+  (%start-units-ui program tui:*tui*)
   (let ((prompt (%cp-prompt program)))
     (when prompt
       (%apply-event program (list :submit prompt))))
@@ -1037,6 +1048,19 @@ goes back to the input)."
               (setf (w:text-input-value input) "")
               nil)
              (t (%apply-event program '(:quit)))))
+      ;; H8d: an approval (or plan / rewind) dialog keeps the keys; then the
+      ;; unit confirm dialog; Ctrl-P toggles the panel; an open panel has
+      ;; every other key.
+      ((and (null dialog) (%unit-dialog program))
+       (%unit-dialog-key program message))
+      ((and (null dialog) ctrl (eq key (first +unit-panel-key+))
+            (equal (tui:key-message-modifiers message) (second +unit-panel-key+)))
+       (if (unit-panel-open-p (code-program-panel program))
+           (%panel-close program)
+           (%panel-open program))
+       nil)
+      ((and (null dialog) (unit-panel-open-p (code-program-panel program)))
+       (%panel-key program message))
       ((and ctrl (eq key :d))
        (when (and (null dialog) (string= "" (w:text-input-value input)))
          (%apply-event program '(:quit))))
@@ -1078,19 +1102,26 @@ goes back to the input)."
 (defmethod tui:tui-update ((program code-program) model message)
   (let ((command
           (cond ((consp message)
-                 (if (eq :%cp-files (first message))
-                     (progn (when (second message)
-                              (setf (%cp-files program) (second message)))
-                            nil)
-                     (%apply-event program message)))
+                 (case (first message)
+                   (:%cp-files (when (second message)
+                                 (setf (%cp-files program) (second message)))
+                    nil)
+                   ;; H8d: supervisor events and the panel's threads.
+                   (:%units (%units-message program (rest message)))
+                   (t (%apply-event program message))))
                 ((tui:key-message-p message) (%key-event program message))
                 ((tui:mouse-message-p message)
-                 (w:widget-update (%cp-viewport program) message)
+                 (unless (unit-panel-open-p (code-program-panel program))
+                   (w:widget-update (%cp-viewport program) message))
                  nil)
                 ((tui:paste-message-p message)
-                 (nth-value 1 (w:widget-update (or (code-program-dialog program)
-                                                   (code-program-input program))
-                                               message)))
+                 (let ((target (or (code-program-dialog program)
+                                   ;; H8d: while the panel is open, its prompt.
+                                   (and (unit-panel-open-p (code-program-panel program))
+                                        (or (%unit-dialog program) (%panel-prompt program)))
+                                   (and (not (unit-panel-open-p (code-program-panel program)))
+                                        (code-program-input program)))))
+                   (and target (nth-value 1 (w:widget-update target message)))))
                 ((tui:tick-message-p message)
                  (nth-value 1 (w:widget-update (%cp-spinner program) message)))
                 (t nil))))
@@ -1184,6 +1215,10 @@ goes back to the input)."
       (setf (w:status-line-left status) left
             (w:status-line-right status) right))
     (w:widget-view status (tui:sub-canvas canvas 0 (1- height) width 1))
+    ;; H8d: the open panel replaces everything above the status line.
+    (when (unit-panel-open-p (code-program-panel program))
+      (%units-view program canvas width height)
+      (return-from tui:tui-view nil))
     (when (plusp bottom)
       (w:widget-view (or dialog input) (tui:sub-canvas canvas 0 bottom-y width bottom)))
     (when (>= rule-y 0)
@@ -1212,6 +1247,8 @@ goes back to the input)."
   "Close PROGRAM's shell tools, lisp tools and event loop. Idempotent. → NIL."
   (unless (%cp-closed program)
     (setf (%cp-stopping program) t)
+    ;; H8d: the subscription and the panel's threads end first.
+    (%stop-units-ui program)
     (let* ((thread (%cp-thread program))
            (eb (%cp-event-backend program))
            (el (%cp-event-loop program))
@@ -1226,13 +1263,13 @@ goes back to the input)."
       ;; H4b: no event is sent after this; a spawned image is killed, an
       ;; attached one keeps running.
       (%link-close (%cp-image-link program))
-      (let ((shell (second (%cp-sources program))))
-        (when shell
-          (tools:close-shell-tools shell)))
-      ;; H5a: the plan's area tools, when a plan is open.
-      (let ((shell (second (%cp-plan-sources program))))
-        (when shell
-          (tools:close-shell-tools shell)))
+      ;; H8d: the unit tools (the working directory's and, H5a, the open
+      ;; plan area's), the shell tools, then the supervisor.
+      (%close-code-units (code-program-supervisor program)
+                         :unit-tools (list (code-program-unit-tools program)
+                                           (code-unit-tools (%cp-plan-sources program)))
+                         :shell-tools (list (second (%cp-sources program))
+                                            (second (%cp-plan-sources program))))
       ;; H5b
       (when (%cp-checkpointer program)
         (close-checkpointer (%cp-checkpointer program)))
@@ -1292,11 +1329,16 @@ instructions to the area and drop the run; send (:plan-opened …)."
                                                    ;; H4b: the image stays with the
                                                    ;; working directory's sources.
                                                    :lisp-image '(:image (:off)))))
-           (sources (make-code-tools (plan-tool-root plan cwd) :settings settings)))
+           ;; H8d: the area's tools on the program's supervisor, under an
+           ;; :agent scope "plan-<id8>".
+           (sup (code-program-supervisor program))
+           (sources (make-code-tools (plan-tool-root plan cwd) :settings settings
+                                                               :supervisor sup
+                                                               :scope (%plan-unit-scope sup plan))))
       (handler-bind ((error (lambda (e)
                               (declare (ignore e))
-                              (when (second sources)
-                                (tools:close-shell-tools (second sources))))))
+                              (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                                                     :shell-tools (list (second sources))))))
         (let* ((offered (loop for source in sources
                               append (mapcar #'llm:llm-tool-name
                                              (agent:list-agent-tools source))))
@@ -1325,8 +1367,9 @@ instructions back, the run is dropped."
     (setf (%cp-plan program) nil
           (%cp-plan-sources program) nil
           (%cp-turn-plan program) nil)
-    (when (second sources)
-      (tools:close-shell-tools (second sources)))
+    ;; H8d: the area's unit tools, then its shell tools.
+    (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                           :shell-tools (list (second sources)))
     (%drop-run program)))
 
 (defun %plan-turn-end (program)
@@ -1476,3 +1519,654 @@ STATE-REWIND-PROMPT (made once per prompt), focus it. → NIL."
             (%cp-dialog-invocation program) key))
     (setf (w:widget-focused-p (code-program-input program)) nil)
     nil))
+
+;;; H8d: the unit panel (see the "H8d" part of the file header and
+;;; src/unit-panel.lisp). UI thread unless said otherwise: the supervisor's
+;;; dispatcher and the panel's threads only TUI-SEND (:%UNITS …) messages,
+;;; which TUI-UPDATE hands to %UNITS-MESSAGE.
+
+(defstruct (%units (:conc-name %us-))
+  "The program's unit state (%CP-UNITS-STATE)."
+  subscription                          ; SUP:SUBSCRIPTION from TUI-INIT
+  dialog pending                        ; the unit confirm dialog, (action id input)
+  (threads '())                         ; ((thread . stop-cell) …), joined at close
+  ticker sampler reader                 ; stop cells of the running ones
+  (gen 0)                               ; log reader generation
+  (search-gen 0))                       ; search generation
+
+(defstruct (%pv (:conc-name %pv-))
+  "The panel's view state (%UNIT-PANEL-STATE)."
+  (tick 0) lines-key lines              ; list view cache
+  last-lines last-lines-tick            ; UNIT-LAST-LINE per unit, per tick
+  stats cpu prev-sample prev-time       ; the last resource sample
+  ;; log view
+  (records '()) (gaps '()) memory
+  (following t) (top 0) (windowed nil) (rows 1)
+  prompt prompt-kind prompt-unit        ; the panel's W:TEXT-INPUT
+  help)                                 ; the last action's text until the next key
+
+(defparameter +unit-action-keys+
+  '(("s" . "stop") ("r" . "restart") ("i" . "input") ("e" . "close_input"))
+  "Panel keys → unit actions.")
+
+(defun %us (program)
+  (or (%cp-units-state program)
+      (setf (%cp-units-state program) (make-%units))))
+
+(defun %pv (program)
+  (let ((panel (code-program-panel program)))
+    (or (%unit-panel-state panel)
+        (setf (%unit-panel-state panel) (make-%pv)))))
+
+(defun %unit-dialog (program)
+  "The unit confirm dialog, or NIL."
+  (let ((us (%cp-units-state program)))
+    (and us (%us-dialog us))))
+
+(defun %panel-prompt (program)
+  "The panel's prompt (W:TEXT-INPUT), or NIL."
+  (let ((pv (%unit-panel-state (code-program-panel program))))
+    (and pv (%pv-prompt pv))))
+
+(defun %live-count (supervisor)
+  (if supervisor (count-if #'sup:unit-live-p (sup:supervisor-units supervisor)) 0))
+
+(defun %stop-cell (cell)
+  (when cell (setf (car cell) t)))
+
+(defun %sleep-unless (cell seconds)
+  "Sleep SECONDS in slices; → true when CELL says stop."
+  (let ((deadline (+ (get-internal-real-time) (* seconds internal-time-units-per-second))))
+    (loop until (or (car cell) (>= (get-internal-real-time) deadline))
+          do (sleep 0.05))
+    (car cell)))
+
+(defun %units-thread (program name function)
+  "Run FUNCTION (of its stop cell) on a new thread. → the stop cell. A
+condition FUNCTION does not handle ends the thread quietly (an unhandled one
+would enter the debugger of a non-interactive image)."
+  (let* ((us (%us program))
+         (cell (list nil))
+         (thread (bt:make-thread (lambda ()
+                                   (handler-case (funcall function cell)
+                                     (error () nil)))
+                                 :name name)))
+    (setf (%us-threads us)
+          (cons (cons thread cell)
+                (remove-if-not (lambda (entry) (bt:thread-alive-p (car entry))) (%us-threads us))))
+    cell))
+
+(defun %units-send (program &rest message)
+  (%send program (cons :%units message)))
+
+;;; Start and stop.
+
+(defun %start-units-ui (program run)
+  "TUI-INIT: the live count now, then the supervisor's events (from the
+current seq) to the UI."
+  (let ((sup (code-program-supervisor program))
+        (us (%us program)))
+    (when sup
+      (%apply-event program (list :units :running (%live-count sup)))
+      ;; The dispatcher thread only queues the event for the UI.
+      (setf (%us-subscription us)
+            (sup:subscribe sup (lambda (event) (tui:tui-send (list :%units :event event) run))
+                           :since (sup:supervisor-last-seq sup))))))
+
+(defun %stop-units-ui (program)
+  "CLOSE-CODE-PROGRAM (any thread): the subscription ends, every panel thread
+is told to stop and joined (bounded)."
+  (let ((us (%cp-units-state program)))
+    (when us
+      (let ((sub (shiftf (%us-subscription us) nil)))
+        (when sub (sup:unsubscribe sub)))
+      (setf (%us-dialog us) nil (%us-pending us) nil)
+      (let ((threads (shiftf (%us-threads us) '())))
+        (dolist (entry threads) (%stop-cell (cdr entry)))
+        (dolist (entry threads) (%join-thread (car entry) 2))))))
+
+;;; Opening and closing.
+
+(defun %panel-unit-ids (program)
+  (let ((sup (code-program-supervisor program)))
+    (and sup (loop for row in (unit-tree sup)
+                   when (getf row :unit) collect (sup:unit-id (getf row :unit))))))
+
+(defun %panel-fix-selection (program)
+  "The selection is a unit row: the first one when nothing (or an evicted
+unit) is selected."
+  (let ((panel (code-program-panel program))
+        (ids (%panel-unit-ids program)))
+    (unless (member (unit-panel-selected panel) ids :test #'equal)
+      (setf (unit-panel-selected panel) (first ids)))))
+
+(defun %panel-bump (program)
+  (incf (%pv-tick (%pv program))))
+
+(defun %panel-open (program)
+  (let ((panel (code-program-panel program))
+        (pv (%pv program))
+        (us (%us program))
+        (sup (code-program-supervisor program)))
+    (unless (unit-panel-open-p panel)
+      (setf (unit-panel-open-p panel) t
+            (unit-panel-mode panel) :list
+            (unit-panel-unit panel) nil
+            (unit-panel-query panel) nil
+            (unit-panel-hits panel) '()
+            (unit-panel-hit-index panel) nil
+            (%pv-help pv) nil
+            (%pv-prompt pv) nil)
+      (%panel-fix-selection program)
+      (%panel-bump program)
+      (when sup
+        (setf (%us-ticker us)
+              (%units-thread program "cl-stack-code unit ticker"
+                             (lambda (cell)
+                               (loop until (%sleep-unless cell +unit-tick-interval+)
+                                     do (%units-send program :tick))))
+              (%us-sampler us)
+              (%units-thread program "cl-stack-code unit sampler"
+                             (lambda (cell)
+                               (loop until (car cell)
+                                     do (let ((table (sample-unit-resources (sup:supervisor-units sup))))
+                                          (unless (car cell)
+                                            (%units-send program :sample table (get-internal-real-time))))
+                                        (%sleep-unless cell +unit-stats-interval+))))))))
+  nil)
+
+(defun %panel-stop-reader (program)
+  (let ((us (%us program)))
+    (%stop-cell (shiftf (%us-reader us) nil))
+    (incf (%us-gen us))))
+
+(defun %panel-close (program)
+  (let ((panel (code-program-panel program))
+        (pv (%pv program))
+        (us (%us program)))
+    (setf (unit-panel-open-p panel) nil
+          (unit-panel-mode panel) :list
+          (unit-panel-unit panel) nil
+          (unit-panel-query panel) nil
+          (unit-panel-hits panel) '()
+          (unit-panel-hit-index panel) nil
+          (%pv-prompt pv) nil
+          (%pv-help pv) nil
+          (%us-dialog us) nil
+          (%us-pending us) nil)
+    (%stop-cell (shiftf (%us-ticker us) nil))
+    (%stop-cell (shiftf (%us-sampler us) nil))
+    (%panel-stop-reader program))
+  nil)
+
+;;; The log view's data.
+
+(defun %panel-start-reader (program id &key start)
+  "Load unit ID's log (the last +UNIT-LOG-SCROLLBACK+ lines, or from START),
+then follow it, on a thread; a unit without a log file: its in-memory output."
+  (%panel-stop-reader program)
+  (let* ((us (%us program))
+         (gen (%us-gen us))
+         (sup (code-program-supervisor program)))
+    (setf (%us-reader us)
+          (%units-thread
+           program "cl-stack-code unit log"
+           (lambda (cell)
+             (let* ((u (sup:find-unit sup id))
+                    (log (and u (%unit-log-or-nil u))))
+               (cond ((null u) nil)
+                     (log
+                      (let ((from (or start (max 1 (- (sup:log-last-line log) +unit-log-scrollback+)))))
+                        (multiple-value-bind (records gaps next)
+                            (sup:log-read log :start from :limit +unit-log-scrollback+)
+                          (unless (car cell)
+                            (%units-send program :records gen :reset records gaps))
+                          (loop until (car cell)
+                                do (multiple-value-bind (more more-gaps after ended)
+                                       (sup:log-follow log :from next :wait 0.25)
+                                     (when (car cell) (return))
+                                     (when more
+                                       (%units-send program :records gen :append more more-gaps))
+                                     (setf next after)
+                                     ;; Ended: a restart may continue it; poll slowly.
+                                     (when (and ended (null more))
+                                       (%sleep-unless cell 0.25)))))))
+                     (t
+                      (let ((seen nil))
+                        (loop until (car cell)
+                              do (let ((text (sup:unit-output u)))
+                                   (unless (equal text seen)
+                                     (setf seen text)
+                                     (%units-send program :memory gen text)))
+                                 (%sleep-unless cell 0.25)))))))))))
+
+(defun %panel-take-records (program how records gaps)
+  (let ((pv (%pv program)))
+    (if (eq how :reset)
+        (setf (%pv-records pv) records
+              (%pv-gaps pv) gaps)
+        (let* ((last (let ((r (car (last (%pv-records pv))))) (if r (sup:log-record-line r) 0)))
+               (new (remove-if (lambda (r) (<= (sup:log-record-line r) last)) records))
+               (all (append (%pv-records pv) new))
+               (extra (- (length all) +unit-log-scrollback+)))
+          (when (plusp extra)
+            (setf all (nthcdr extra all)))
+          (setf (%pv-records pv) all
+                (%pv-gaps pv)
+                (let ((first (if all (sup:log-record-line (first all)) 0)))
+                  (remove-if (lambda (g) (< (sup:log-gap-last-line g) first))
+                             (remove-duplicates (append (%pv-gaps pv) gaps)
+                                                :key #'sup:log-gap-first-line :from-end t))))))))
+
+(defun %panel-item-count (pv)
+  (if (%pv-memory pv)
+      (length (%unit-memory-lines (%pv-memory pv) 1))
+      (+ (length (%pv-records pv)) (length (%pv-gaps pv)))))
+
+(defun %panel-top (pv n body)
+  "The first shown item of N with BODY rows."
+  (if (%pv-following pv)
+      (max 0 (- n body))
+      (max 0 (min (%pv-top pv) (- n body)))))
+
+(defun %panel-enter-log (program id)
+  (let ((panel (code-program-panel program))
+        (pv (%pv program)))
+    (setf (unit-panel-mode panel) :log
+          (unit-panel-unit panel) id
+          (unit-panel-query panel) nil
+          (unit-panel-hits panel) '()
+          (unit-panel-hit-index panel) nil
+          (%pv-records pv) '()
+          (%pv-gaps pv) '()
+          (%pv-memory pv) nil
+          (%pv-following pv) t
+          (%pv-top pv) 0
+          (%pv-windowed pv) nil)
+    (%panel-start-reader program id)))
+
+(defun %panel-leave-log (program)
+  (let ((panel (code-program-panel program)))
+    (%panel-stop-reader program)
+    (setf (unit-panel-mode panel) :list
+          (unit-panel-unit panel) nil
+          (unit-panel-query panel) nil
+          (unit-panel-hits panel) '()
+          (unit-panel-hit-index panel) nil)
+    (%panel-bump program)))
+
+(defun %panel-scroll (program delta &key to)
+  "Move the log view by DELTA rows (or TO the first one); following stops."
+  (let* ((pv (%pv program))
+         (n (%panel-item-count pv))
+         (body (%pv-rows pv))
+         (top (%panel-top pv n body)))
+    (setf (%pv-following pv) nil
+          (%pv-top pv) (max 0 (min (if to to (+ top delta)) (max 0 (- n body)))))))
+
+(defun %panel-follow (program)
+  "End: the tail, following again (a window around a hit is left)."
+  (let ((pv (%pv program))
+        (panel (code-program-panel program)))
+    (setf (%pv-following pv) t)
+    (when (%pv-windowed pv)
+      (setf (%pv-windowed pv) nil
+            (%pv-records pv) '()
+            (%pv-gaps pv) '())
+      (%panel-start-reader program (unit-panel-unit panel)))))
+
+(defun %panel-jump (program)
+  "Show the current hit: in the loaded lines, or reload the window around it."
+  (let* ((panel (code-program-panel program))
+         (pv (%pv program))
+         (index (unit-panel-hit-index panel))
+         (hit (and index (nth index (unit-panel-hits panel)))))
+    (when hit
+      (let* ((line (ss:hit-line hit))
+             (records (%pv-records pv))
+             (first (and records (sup:log-record-line (first records))))
+             (last (and records (sup:log-record-line (car (last records))))))
+        (if (and first (<= first line last))
+            (let ((position (or (position-if (lambda (item) (>= (%log-item-line item) line))
+                                             (%log-items records (%pv-gaps pv)))
+                                0)))
+              (setf (%pv-following pv) nil
+                    (%pv-top pv) (max 0 (- position 2))))
+            (progn
+              (setf (%pv-following pv) nil
+                    (%pv-top pv) 0
+                    (%pv-windowed pv) t
+                    (%pv-records pv) '()
+                    (%pv-gaps pv) '())
+              (%panel-start-reader program (unit-panel-unit panel) :start (max 1 (- line 10)))))))))
+
+(defun %panel-search (program query)
+  "SS:SEARCH-LOGS of QUERY in the shown unit's log, on a thread."
+  (let* ((us (%us program))
+         (gen (incf (%us-search-gen us)))
+         (tools (code-program-unit-tools program))
+         (id (unit-panel-unit (code-program-panel program))))
+    (when (and tools id)
+      (%units-thread program "cl-stack-code unit search"
+                     (lambda (cell)
+                       (declare (ignore cell))
+                       (handler-case
+                           (%units-send program :search gen query
+                                        (ss:search-logs (tools:unit-tools-index tools) query
+                                                        :units (list id) :k 50))
+                         (error (e)
+                           (%units-send program :search-error gen (%message-text e)))))))))
+
+;;; Actions.
+
+(defun %panel-run-action (program action id input)
+  "TOOLS:CALL-UNIT-TOOL \"unit_control\" on a worker thread; the text comes
+back as (:%units :action-done …)."
+  (let ((tools (code-program-unit-tools program)))
+    (%units-thread
+     program "cl-stack-code unit action"
+     (lambda (cell)
+       (declare (ignore cell))
+       (apply #'%units-send program :action-done
+              (handler-case
+                  (list :ok (tools:call-unit-tool tools "unit_control"
+                                                  (unit-control-arguments action id :input input)))
+                (agent:tool-failure (c) (list :error (%message-text c)))
+                ;; unit_control hidden by the settings (not an ERROR subtype).
+                (agent:agent-unknown-tool (c) (list :error (%message-text c)))
+                (error (c) (list :error (%message-text c)))))))))
+
+(defun %panel-act (program action id &key input)
+  "ACTION on unit ID: the input prompt first for input; then the agent's
+unit_control decision (deny: help row and a transcript error; ask: the
+confirm dialog; allow: run it)."
+  (let* ((sup (code-program-supervisor program))
+         (unit (and sup id (sup:find-unit sup id)))
+         (pv (%pv program))
+         (us (%us program)))
+    (cond
+      ((null unit) nil)
+      ((and (equal action "input") (null input))
+       (setf (%pv-prompt pv) (make-instance 'w:text-input :prompt "input> " :focused t
+                                         :placeholder "a line for its stdin (Enter sends, Esc cancels)")
+             (%pv-prompt-kind pv) :input
+             (%pv-prompt-unit pv) id))
+      (t
+       (multiple-value-bind (effect rule)
+           (unit-action-permission (%cp-agent program) (code-program-unit-tools program)
+                                   action id :input input
+                                   :mode (state-permission-mode (code-program-state program)))
+         (ecase effect
+           (:deny
+            (let ((text (%text "~a ~a denied~@[ by ~a~]" action id (%unit-rule-text rule))))
+              (setf (%pv-help pv) text)
+              (%apply-event program (list :error text))))
+           (:ask
+            (let ((dialog (make-instance 'w:confirm-dialog
+                                         :title "Unit control"
+                                         :message (unit-action-message action unit :input input)
+                                         :choices +unit-action-choices+
+                                         :feedback-choice nil)))
+              (setf (w:widget-focused-p dialog) t
+                    (%us-dialog us) dialog
+                    (%us-pending us) (list action id input))))
+           (:allow (%panel-run-action program action id input))))))))
+
+(defun %unit-dialog-key (program message)
+  "A key for the unit confirm dialog: Yes runs the action, No or Esc drops it."
+  (let ((us (%us program)))
+    (multiple-value-bind (widget command event) (w:widget-update (%us-dialog us) message)
+      (declare (ignore widget))
+      (cond ((w:confirm-event-p event)
+             (let ((pending (shiftf (%us-pending us) nil)))
+               (setf (%us-dialog us) nil)
+               (when (and pending (eq :yes (w:confirm-event-choice event)))
+                 (destructuring-bind (action id input) pending
+                   (%panel-run-action program action id input))))
+             command)
+            ((w:cancel-event-p event)
+             (setf (%us-dialog us) nil (%us-pending us) nil)
+             command)
+            (t command)))))
+
+;;; Keys.
+
+(defun %printable (message)
+  "The one character MESSAGE types (no Ctrl / Alt / Super), or NIL."
+  (let ((text (tui:key-message-text message)))
+    (and text (= 1 (length text))
+         (null (intersection (tui:key-message-modifiers message) '(:ctrl :alt :super)))
+         text)))
+
+(defun %panel-prompt-submit (program text)
+  (let* ((pv (%pv program))
+         (kind (%pv-prompt-kind pv))
+         (id (%pv-prompt-unit pv)))
+    (setf (%pv-prompt pv) nil)
+    (ecase kind
+      (:search (unless (%blank-text-p text)
+                 (%panel-search program text)))
+      (:input (%panel-act program "input" id :input (format nil "~a~%" text))))))
+
+(defun %panel-list-key (program key text)
+  (let* ((panel (code-program-panel program))
+         (ids (%panel-unit-ids program))
+         (selected (unit-panel-selected panel))
+         (index (position selected ids :test #'equal)))
+    (cond ((member key '(:arrow-up :arrow-down))
+           (when ids
+             (setf (unit-panel-selected panel)
+                   (nth (max 0 (min (1- (length ids))
+                                    (+ (or index 0) (if (eq key :arrow-up) -1 1))))
+                        ids))))
+          ((eq key :home) (setf (unit-panel-selected panel) (first ids)))
+          ((eq key :end) (setf (unit-panel-selected panel) (car (last ids))))
+          ((eq key :enter) (when index (%panel-enter-log program selected)))
+          ((or (eq key :escape) (equal text "q")) (%panel-close program))
+          ((assoc text +unit-action-keys+ :test #'equal)
+           (when index
+             (%panel-act program (cdr (assoc text +unit-action-keys+ :test #'equal)) selected))))
+    nil))
+
+(defun %panel-log-key (program key text)
+  (let* ((panel (code-program-panel program))
+         (pv (%pv program))
+         (hits (unit-panel-hits panel)))
+    (cond ((eq key :arrow-up) (%panel-scroll program -1))
+          ((eq key :arrow-down) (%panel-scroll program 1))
+          ((eq key :page-up) (%panel-scroll program (- (max 1 (%pv-rows pv)))))
+          ((eq key :page-down) (%panel-scroll program (max 1 (%pv-rows pv))))
+          ((eq key :home) (%panel-scroll program 0 :to 0))
+          ((eq key :end) (%panel-follow program))
+          ((eq key :escape)
+           (if (unit-panel-query panel)
+               (setf (unit-panel-query panel) nil
+                     (unit-panel-hits panel) '()
+                     (unit-panel-hit-index panel) nil)
+               (%panel-leave-log program)))
+          ((equal text "/")
+           (setf (%pv-prompt pv) (make-instance 'w:text-input :prompt "search> " :focused t
+                                         :placeholder "words or \"a phrase\" (Enter searches, Esc cancels)")
+                 (%pv-prompt-kind pv) :search
+                 (%pv-prompt-unit pv) (unit-panel-unit panel)))
+          ((member text '("n" "N") :test #'equal)
+           (when hits
+             (setf (unit-panel-hit-index panel)
+                   (mod (+ (or (unit-panel-hit-index panel) 0) (if (equal text "n") 1 -1))
+                        (length hits)))
+             (%panel-jump program)))
+          ((assoc text +unit-action-keys+ :test #'equal)
+           (%panel-act program (cdr (assoc text +unit-action-keys+ :test #'equal))
+                       (unit-panel-unit panel))))
+    nil))
+
+(defun %panel-key (program message)
+  "A key while the panel is open (no dialog shown). → a command or NIL."
+  (let* ((pv (%pv program))
+         (panel (code-program-panel program))
+         (key (tui:key-message-key message))
+         (text (%printable message))
+         (prompt (%pv-prompt pv)))
+    (setf (%pv-help pv) nil)
+    (cond (prompt
+           (multiple-value-bind (widget command event) (w:widget-update prompt message)
+             (declare (ignore widget))
+             (cond ((w:submit-event-p event)
+                    (%panel-prompt-submit program (w:submit-event-text event)))
+                   ((w:cancel-event-p event)
+                    (setf (%pv-prompt pv) nil)))
+             command))
+          ((eq :log (unit-panel-mode panel)) (%panel-log-key program key text))
+          (t (%panel-list-key program key text)))))
+
+;;; Messages from the dispatcher and the panel's threads.
+
+(defun %units-message (program message)
+  "(:event E) (:tick) (:sample TABLE TIME) (:records GEN HOW RECORDS GAPS)
+(:memory GEN TEXT) (:action-done :ok|:error TEXT) (:search GEN QUERY HITS)
+(:search-error GEN TEXT). → NIL."
+  (let ((pv (%pv program))
+        (us (%us program))
+        (panel (code-program-panel program)))
+    (destructuring-bind (kind &rest args) message
+      (ecase kind
+        (:event
+         (let ((notice (unit-failure-notice (first args))))
+           (%panel-bump program)
+           (%apply-event program (list :units :running (%live-count (code-program-supervisor program))))
+           (when notice
+             (%apply-event program (list :unit-failed :notice notice)))))
+        (:tick (%panel-bump program))
+        (:sample
+         (destructuring-bind (table time) args
+           (setf (%pv-cpu pv) (and (%pv-prev-sample pv)
+                                   (%cpu-table (%pv-prev-sample pv) table
+                                               (/ (- time (%pv-prev-time pv))
+                                                  internal-time-units-per-second)))
+                 (%pv-stats pv) table
+                 (%pv-prev-sample pv) table
+                 (%pv-prev-time pv) time)
+           (%panel-bump program)))
+        (:records
+         (destructuring-bind (gen how records gaps) args
+           (when (= gen (%us-gen us))
+             (%panel-take-records program how records gaps))))
+        (:memory
+         (destructuring-bind (gen text) args
+           (when (= gen (%us-gen us))
+             (setf (%pv-memory pv) text))))
+        (:action-done
+         (destructuring-bind (outcome text) args
+           (setf (%pv-help pv) (%one-line text))
+           (%panel-bump program)
+           (%apply-event program (if (eq outcome :ok)
+                                     (list :notice (%text "unit_control: ~a" text))
+                                     (list :error text)))))
+        (:search
+         (destructuring-bind (gen query hits) args
+           (when (and (= gen (%us-search-gen us)) (eq :log (unit-panel-mode panel)))
+             (setf (unit-panel-query panel) query
+                   (unit-panel-hits panel) hits
+                   (unit-panel-hit-index panel) (and hits 0))
+             (%panel-jump program))))
+        (:search-error
+         (destructuring-bind (gen text) args
+           (when (= gen (%us-search-gen us))
+             (setf (%pv-help pv) (%one-line text))))))))
+  nil)
+
+;;; The view.
+
+(defun %draw-lines (canvas lines)
+  (loop for line in lines
+        for y from 0 below (tui:canvas-rows canvas)
+        do (w:draw-runs canvas 0 y line)))
+
+(defun %units-list-view (program canvas width rows)
+  (let* ((panel (code-program-panel program))
+         (pv (%pv program))
+         (sup (code-program-supervisor program)))
+    (%panel-fix-selection program)
+    (let ((key (list (%pv-tick pv) width rows (unit-panel-selected panel))))
+      (unless (eql (%pv-last-lines-tick pv) (%pv-tick pv))
+        (setf (%pv-last-lines pv) (make-hash-table :test 'equal)
+              (%pv-last-lines-tick pv) (%pv-tick pv)))
+      (unless (equal key (%pv-lines-key pv))
+        (setf (%pv-lines pv) (let ((*%unit-last-lines* (%pv-last-lines pv)))
+                                (unit-panel-lines (and sup (unit-tree sup)) width rows
+                                               :selected (unit-panel-selected panel)
+                                               :stats (%pv-stats pv) :cpu (%pv-cpu pv)))
+              (%pv-lines-key pv) key)))
+    (%draw-lines (tui:sub-canvas canvas 0 0 width rows) (%pv-lines pv))))
+
+(defun %units-log-view (program canvas width rows)
+  (let* ((panel (code-program-panel program))
+         (pv (%pv program))
+         (sup (code-program-supervisor program))
+         (unit (and sup (unit-panel-unit panel) (sup:find-unit sup (unit-panel-unit panel)))))
+    (if (null unit)
+        ;; Evicted while shown: back to the list.
+        (progn (%panel-leave-log program)
+               (%units-list-view program canvas width rows))
+        (let* ((body (max 0 (1- rows)))
+               (hits (mapcar #'ss:hit-line (unit-panel-hits panel)))
+               (query (unit-panel-query panel))
+               (memory (%pv-memory pv))
+               (lines '()) (first nil) (last nil))
+          (setf (%pv-rows pv) (max 1 body))
+          (if memory
+              (let* ((all (%unit-memory-lines memory width :hits hits :query query))
+                     (n (length all))
+                     (top (%panel-top pv n body)))
+                (setf lines (subseq all top (min n (+ top body))))
+                (when lines
+                  (setf first (1+ top) last (+ top (length lines)))))
+              (let* ((items (%log-items (%pv-records pv) (%pv-gaps pv)))
+                     (n (length items))
+                     (top (%panel-top pv n body))
+                     (shown (subseq items top (min n (+ top body)))))
+                (setf lines (unit-log-lines (remove-if (lambda (i) (typep i 'sup:log-gap)) shown)
+                                            (remove-if-not (lambda (i) (typep i 'sup:log-gap)) shown)
+                                            width :hits hits :query query))
+                (when shown
+                  (setf first (%log-item-line (first shown))
+                        last (let ((item (car (last shown))))
+                               (if (typep item 'sup:log-gap)
+                                   (sup:log-gap-last-line item)
+                                   (sup:log-record-line item)))))))
+          (let ((title (concatenate 'string
+                                    (unit-log-title unit :following (%pv-following pv)
+                                                         :first-line first :last-line last
+                                                         :query query
+                                                         :hit-index (unit-panel-hit-index panel)
+                                                         :hit-count (length hits))
+                                    (if memory " · no log file" ""))))
+            (tui:draw-text canvas 0 0 (%cut-row title width)))
+          (%draw-lines (tui:sub-canvas canvas 0 1 width body) lines)))))
+
+(defun %units-view (program canvas width height)
+  "The open panel on CANVAS (W × H) above the status line (see
+src/unit-panel.lisp)."
+  (let* ((panel (code-program-panel program))
+         (pv (%pv program))
+         (dialog (or (code-program-dialog program) (%unit-dialog program)))
+         (prompt (%pv-prompt pv))
+         (bottom (if dialog (max 0 (min (- height 2) (%dialog-rows dialog width))) 1))
+         (bottom-y (- height 1 bottom))
+         (rule-y (1- bottom-y))
+         (rows (max 0 rule-y)))
+    (when (and (plusp bottom) (>= bottom-y 0))
+      (cond (dialog (w:widget-view dialog (tui:sub-canvas canvas 0 bottom-y width bottom)))
+            (prompt (w:widget-view prompt (tui:sub-canvas canvas 0 bottom-y width 1)))
+            (t (tui:draw-text canvas 0 bottom-y
+                              (%cut-row (or (%pv-help pv)
+                                            (if (eq :log (unit-panel-mode panel))
+                                                +unit-log-help+
+                                                +unit-list-help+))
+                                        width)))))
+    (when (>= rule-y 0)
+      (tui:draw-text canvas 0 rule-y (make-string width :initial-element #\─)))
+    (when (plusp rows)
+      (if (eq :log (unit-panel-mode panel))
+          (%units-log-view program canvas width rows)
+          (%units-list-view program canvas width rows)))))

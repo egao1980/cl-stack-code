@@ -880,6 +880,7 @@ result, then signals its failure."
          (plan (first plan-and-reopened))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
+         (supervisor nil)
          (sources nil))
     (unwind-protect
          (let ((event:*event-backend* event-backend)
@@ -892,9 +893,14 @@ result, then signals its failure."
                (agent:*off-loop-specials*
                  (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                         agent:*off-loop-specials*)))
-           (setf sources (make-code-tools (if plan (plan-tool-root plan cwd) cwd)
+           ;; H8d: the run's supervisor, before the tools.
+           (setf supervisor (make-code-supervisor cwd :data-dir data-dir
+                                                      :getenv (or getenv #'uiop:getenv))
+                 sources (make-code-tools (if plan (plan-tool-root plan cwd) cwd)
                                           :settings settings
-                                          :on-image-event (and link (%link-callback link))))
+                                          :on-image-event (and link (%link-callback link))
+                                          :supervisor supervisor
+                                          :scope (and plan (%plan-unit-scope supervisor plan))))
            ;; H4b: the image starts before the system event; its events are
            ;; written and posted on the loop thread.
            (when link
@@ -911,7 +917,7 @@ result, then signals its failure."
              (multiple-value-bind (instructions files)
                  (assemble-system-prompt cwd :tools offered :backend backend
                                              :settings settings :user-config-dir config
-                                             :plan plan :lisp-image (third sources))
+                                             :plan plan :lisp-image (%sources-lisp-tools sources))
                (let ((agent (agent:make-ai-agent
                              :name "cl-stack-code"
                              :backend backend
@@ -947,8 +953,9 @@ result, then signals its failure."
       ;; H4b: no event reaches the loop after this; -p never waits for
       ;; events after the run (the queue goes with the tools).
       (%link-close link)
-      (when (second sources)
-        (tools:close-shell-tools (second sources)))
+      ;; H8d: unit tools, shell tools, then the supervisor.
+      (%close-code-units supervisor :unit-tools (list (code-unit-tools sources))
+                                    :shell-tools (list (second sources)))
       (close-checkpointer checkpointer)
       (event:close-event-loop event-backend event-loop))))
 

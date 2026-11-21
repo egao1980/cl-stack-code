@@ -549,9 +549,3 @@
 
 (defparameter +version+ "0.8.0"
   "The product version, as in the .asd.")
-
-(defun %h8d-pending (what)
-  "H8d contract stub: WHAT is not implemented yet. The implementation removes
-this function and every call of it (src/units.lisp, src/unit-panel.lisp,
-src/interactive.lisp)."
-  (error "H8d: ~a is not implemented yet" what))

@@ -374,7 +374,13 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
   turn report pre start interrupted
   (pending '())                         ; (invocation . approval_request), oldest first
   ;; closing
-  closed close-pending)
+  closed close-pending
+  ;; H8d (set once by %OPEN-CODE-SESSION)
+  supervisor unit-tools
+  (unit-subs '())                       ; ("sub-N" SUP:SUBSCRIPTION), loop thread
+  (unit-sub-counter 0)                  ; loop thread
+  (units-lock (bt:make-lock "cl-stack-code session units"))
+  prev-sample prev-sample-time)         ; CLIENT-UNITS :RESOURCES, under UNITS-LOCK
 
 ;;; The loop thread and dispatch.
 
@@ -555,7 +561,7 @@ events when TURN is given)."
                             (%deliver session object on-event))
                           (lambda (object) (%deliver session object nil)))
                 :denial-reason #'%sdk-denial-reason
-                :image-tools (third (%s-sources (%session-state session)))))
+                :image-tools (%sources-lisp-tools (%s-sources (%session-state session)))))
 
 ;;; Sessions.
 
@@ -629,14 +635,19 @@ event delivered."
          (project-dir (or (find-project-root dir) dir))
          (store nil)
          (checkpointer nil)
+         (supervisor nil)
          (sources nil)
          (done nil))
     (unwind-protect
          (progn
            (setf store (funcall store-fn project-dir)
                  checkpointer (%make-run-checkpointer settings dir data-dir getenv)
+                 ;; H8d: the session's supervisor, before the tools.
+                 supervisor (make-code-supervisor dir :data-dir (%client-data-root client)
+                                                      :getenv getenv)
                  sources (make-code-tools dir :settings settings
-                                              :on-image-event (and link (%link-callback link))))
+                                              :on-image-event (and link (%link-callback link))
+                                              :supervisor supervisor))
            (when link
              (setf (%link-tools link) (third sources))
              (start-lisp-image (third sources) settings))
@@ -646,7 +657,7 @@ event delivered."
              (multiple-value-bind (instructions files)
                  (assemble-system-prompt dir :tools offered :backend backend
                                              :settings settings :user-config-dir config
-                                             :lisp-image (third sources))
+                                             :lisp-image (%sources-lisp-tools sources))
                (let* ((rules (make-settings-rule-store
                               (third (settings-file-paths dir :user-config-dir config))))
                       (agent (agent:make-ai-agent
@@ -673,7 +684,9 @@ event delivered."
                                    :project-dir project-dir
                                    :max-turns (or (settings-max-turns settings) +default-max-turns+)
                                    :agent agent :sources sources :link link
-                                   :checkpointer checkpointer))
+                                   :checkpointer checkpointer
+                                   :supervisor supervisor
+                                   :unit-tools (code-unit-tools sources)))
                  (push session (%client-sessions client))
                  (setf done t)
                  (when link
@@ -693,8 +706,9 @@ event delivered."
                  session))))
       (unless done
         (%link-close link)
-        (when (second sources)
-          (tools:close-shell-tools (second sources)))
+        ;; H8d: unit tools, shell tools, then the supervisor.
+        (%close-code-units supervisor :unit-tools (list (code-unit-tools sources))
+                                      :shell-tools (list (second sources)))
         (when checkpointer
           (close-checkpointer checkpointer))))))
 
@@ -763,11 +777,15 @@ event delivered."
                             :forked-from (session-id store))))))
 
 (defun %close-session-resources (st)
+  ;; H8d: the subscriptions end first (no event is delivered after this).
+  (dolist (entry (shiftf (%s-unit-subs st) '()))
+    (sup:unsubscribe (second entry)))
   (%link-close (%s-link st))
-  (let ((shell (second (%s-sources st))))
-    (when shell (tools:close-shell-tools shell)))
-  (let ((shell (second (%s-plan-sources st))))
-    (when shell (tools:close-shell-tools shell)))
+  ;; H8d: unit tools (the working directory's and the plan area's), shell
+  ;; tools, then the supervisor (every unit stopped, logs kept).
+  (%close-code-units (%s-supervisor st)
+                     :unit-tools (list (%s-unit-tools st) (code-unit-tools (%s-plan-sources st)))
+                     :shell-tools (list (second (%s-sources st)) (second (%s-plan-sources st))))
   (when (%s-checkpointer st)
     (close-checkpointer (%s-checkpointer st))))
 
@@ -901,11 +919,16 @@ tools and instructions (as %ENSURE-PLAN); the run is dropped. The plan
            (settings (merge-settings (%s-settings st)
                                      (make-settings :permission-mode :plan
                                                     :lisp-image '(:image (:off)))))
-           (sources (make-code-tools (plan-tool-root plan cwd) :settings settings)))
+           ;; H8d: the area's tools on the session's supervisor, under an
+           ;; :agent scope "plan-<id8>".
+           (sup (%s-supervisor st))
+           (sources (make-code-tools (plan-tool-root plan cwd) :settings settings
+                                                               :supervisor sup
+                                                               :scope (%plan-unit-scope sup plan))))
       (handler-bind ((error (lambda (e)
                               (declare (ignore e))
-                              (when (second sources)
-                                (tools:close-shell-tools (second sources))))))
+                              (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                                                     :shell-tools (list (second sources))))))
         (let* ((offered (loop for source in sources
                               append (mapcar #'llm:llm-tool-name
                                              (agent:list-agent-tools source))))
@@ -935,8 +958,10 @@ again, the run dropped."
           (%s-plan-turn-p st) nil
           (%s-run st) nil
           (%s-handle st) nil)
-    (when (second sources)
-      (tools:close-shell-tools (second sources)))))
+    ;; H8d: the area's unit tools, then its shell tools (the plan scope's
+    ;; units stop with the supervisor).
+    (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                           :shell-tools (list (second sources)))))
 
 (defun %start-turn (session prompt mentions on-event)
   (let ((st (%live session)))
@@ -985,7 +1010,7 @@ again, the run dropped."
                                                     :on-event (%sdk-agent-event session)
                                                     :callback ok :error-callback err))))
               ;; H4b: image events queued while idle follow the prompt.
-              (%post-if-going (third (%s-sources st)) (%s-run st))))
+              (%post-if-going (%sources-lisp-tools (%s-sources st)) (%s-run st))))
         (error (e) (%finish-turn session st (%s-run st) e)))
       turn)))
 
@@ -1432,7 +1457,7 @@ queued for the next turn."
                                                    (t (%json-object))))))
                            (agent:list-agent-tools source))))))
 
-;;; H8d: units (src/units.lisp). Stubs; the file header's "H8d" part has the
+;;; H8d: units (src/units.lisp). The file header's "H8d" part has the
 ;;; rules.
 ;;;
 ;;;   Sessions         %OPEN-CODE-SESSION makes the session's supervisor
@@ -1492,34 +1517,242 @@ queued for the next turn."
 
 (defun code-session-supervisor (session)
   "H8d: SESSION's supervisor."
-  (declare (ignore session))
-  (%h8d-pending "code-session-supervisor"))
+  (let ((st (%session-state session)))
+    (and st (%s-supervisor st))))
 
 (defun code-session-unit-tools (session)
   "H8d: SESSION's unit tools."
-  (declare (ignore session))
-  (%h8d-pending "code-session-unit-tools"))
+  (let ((st (%session-state session)))
+    (and st (%s-unit-tools st))))
+
+(defun %session-units (session)
+  "→ (values supervisor unit-tools state agent mode) of open SESSION, read on
+the loop thread (SESSION-NOT-OPEN once closed)."
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (values (%s-supervisor st) (%s-unit-tools st) st (%s-agent st) (%s-mode st)))))
 
 (defun client-units (session &key kind state owner resources)
-  (declare (ignore session kind state owner resources))
-  (%h8d-pending "client-units"))
+  (multiple-value-bind (sup ut st) (%session-units session)
+    (declare (ignore ut))
+    ;; The checks first (UNIT-OBJECTS signals them again, the same way).
+    (%state-filter state)
+    (if resources
+        ;; The OS call runs on the caller's thread, never the loop thread.
+        (let* ((sample (sample-unit-resources (sup:supervisor-units sup)))
+               (time (get-internal-real-time))
+               (cpu (bt:with-lock-held ((%s-units-lock st))
+                      (let ((previous (%s-prev-sample st))
+                            (then (%s-prev-sample-time st)))
+                        (setf (%s-prev-sample st) sample
+                              (%s-prev-sample-time st) time)
+                        (and previous
+                             (%cpu-table previous sample
+                                         (/ (- time then) internal-time-units-per-second)))))))
+          (unit-objects sup :kind kind :state state :owner owner :stats sample :cpu cpu))
+        (unit-objects sup :kind kind :state state :owner owner))))
 
 (defun client-subscribe-units (session &key since)
-  (declare (ignore session since))
-  (%h8d-pending "client-subscribe-units"))
+  (unless (or (null since) (typep since '(integer 0)))
+    (%usage-fail "since must be an integer >= 0: not ~s" since))
+  (let ((client (code-session-client session)))
+    (%on-client-loop (client)
+      (let* ((st (%live session))
+             (sup (%s-supervisor st))
+             (eb (%client-event-backend client))
+             (el (%client-event-loop client))
+             (id (format nil "sub-~d" (incf (%s-unit-sub-counter st))))
+             (entry (list id nil))
+             (seq (sup:supervisor-last-seq sup))
+             (complete (if since (nth-value 1 (sup:events-since sup since)) t)))
+        ;; The callback runs on the supervisor's dispatcher thread (in seq
+        ;; order, replay first): it only hands the event to the loop thread,
+        ;; whose wake queue is FIFO. Without SINCE the replay starts after
+        ;; SEQ, so nothing between reading SEQ and subscribing is lost.
+        (setf (second entry)
+              (sup:subscribe sup
+                             (lambda (event)
+                               (handler-case
+                                   (event:wake-call
+                                    eb el
+                                    (lambda ()
+                                      (when (member entry (%s-unit-subs st) :test #'eq)
+                                        (%deliver session
+                                                  (unit-event-object event
+                                                                     :subscription id
+                                                                     :session-id (code-session-id session))
+                                                  nil))))
+                                 ;; The loop is closing: nobody to deliver to.
+                                 (error () nil)))
+                             :since (or since seq)))
+        (setf (%s-unit-subs st) (append (%s-unit-subs st) (list entry)))
+        (values id seq complete)))))
 
 (defun client-unsubscribe-units (session id)
-  (declare (ignore session id))
-  (%h8d-pending "client-unsubscribe-units"))
+  (%on-client-loop ((code-session-client session))
+    (let* ((st (%live session))
+           (entry (find id (%s-unit-subs st) :key #'first :test #'equal)))
+      (unless entry
+        (error 'subscription-not-found :id id))
+      (setf (%s-unit-subs st) (remove entry (%s-unit-subs st) :test #'eq))
+      (sup:unsubscribe (second entry))
+      t)))
+
+(defun %stream-keywords (streams)
+  "STREAMS (NIL, or :stdout / :stderr / \"stdout\" / \"stderr\") → keywords;
+another → CODE-USAGE-ERROR."
+  (if (null streams)
+      '(:stdout :stderr)
+      (mapcar (lambda (s)
+                (cond ((member s '(:stdout :stderr)) s)
+                      ((equal s "stdout") :stdout)
+                      ((equal s "stderr") :stderr)
+                      (t (%usage-fail "streams must be stdout or stderr: not ~s" s))))
+              (coerce streams 'list))))
+
+(defun %check-range (name value low high)
+  (unless (or (null value) (and (integerp value) (<= low value high)))
+    (%usage-fail "~a must be an integer from ~d to ~d: not ~s" name low high value))
+  value)
 
 (defun client-read-unit (session &key unit ref start-line limit tail streams)
-  (declare (ignore session unit ref start-line limit tail streams))
-  (%h8d-pending "client-read-unit"))
+  (when (or (and unit ref) (and (null unit) (null ref)))
+    (%usage-fail "give exactly one of unit and ref"))
+  (when (and unit (not (stringp unit)))
+    (%usage-fail "unit must be a string: not ~s" unit))
+  (when (and ref (not (stringp ref)))
+    (%usage-fail "ref must be a string: not ~s" ref))
+  (%check-range "limit" limit 1 2000)
+  (%check-range "tail" tail 1 2000)
+  (unless (or (null start-line) (typep start-line '(integer 1)))
+    (%usage-fail "start_line must be a positive integer: not ~s" start-line))
+  (let ((streams (%stream-keywords streams))
+        (sup (%session-units session)))
+    (multiple-value-bind (id start count)
+        (if ref
+            (multiple-value-bind (key segment line) (ss:parse-log-ref ref)
+              (declare (ignore segment))
+              (unless key
+                (%usage-fail "ref must be <unit>:<segment>:<line>: not ~s" ref))
+              (values key (max 1 (- line 10)) 40))
+            (values unit 1 200))
+      (let ((u (sup:find-unit sup id)))
+        (unless u
+          (error 'unit-not-found :unit id))
+        (let ((log (%unit-log-or-nil u)))
+          (if (null log)
+              (%json-object "unit" id "status" (unit-status-word u)
+                            "records" #() "gaps" #()
+                            "next_line" :null "last_line" :null
+                            "ended" (and (sup:unit-finished-p u) t)
+                            "memory" (sup:unit-output u))
+              (multiple-value-bind (records gaps next)
+                  (if tail
+                      (multiple-value-bind (records gaps) (sup:log-tail log tail :streams streams)
+                        (values records gaps (1+ (sup:log-last-line log))))
+                      (sup:log-read log :start (or start-line start) :limit (or limit count)
+                                        :streams streams))
+                (let ((last (sup:log-last-line log)))
+                  (%json-object "unit" id "status" (unit-status-word u)
+                                "records" (map 'vector #'unit-record-object records)
+                                "gaps" (map 'vector #'unit-gap-object gaps)
+                                "next_line" next
+                                "last_line" last
+                                "ended" (and (sup:log-closed-p log) (> next last) t)
+                                "memory" :null)))))))))
+
+(defun %hit-object (index hit context)
+  (multiple-value-bind (records gaps) (ss:hit-excerpt index hit :context context)
+    (let ((time (ss:hit-time hit))
+          (extent (ss:hit-extent hit))
+          (score (ss:hit-score hit))
+          (stream (ss:hit-stream hit)))
+      (%json-object "ref" (ss:hit-ref hit)
+                    "unit" (ss:hit-key hit)
+                    "segment" (ss:hit-segment hit)
+                    "line" (ss:hit-line hit)
+                    "stream" (if stream (%lower stream) :null)
+                    "time" (if time (%rfc3339-ms time) :null)
+                    "kinds" (map 'vector #'%lower (ss:hit-kinds hit))
+                    "score" (if score (float score 1d0) :null)
+                    "text" (ss:hit-text hit)
+                    "extent" (if extent (vector (car extent) (cdr extent)) :null)
+                    "excerpt" (map 'vector #'unit-record-object records)
+                    "gaps" (map 'vector #'unit-gap-object gaps)))))
+
+(defun %time-argument (name value)
+  (cond ((null value) nil)
+        ((stringp value)
+         (handler-case (tools:parse-time-argument value)
+           (agent:tool-input-error (c)
+             (%usage-fail "~a: ~a" name (%message-text c)))))
+        (t (%usage-fail "~a must be a string (RFC 3339 or a duration ago): not ~s" name value))))
 
 (defun client-search-units (session query &key units kinds streams since until k context)
-  (declare (ignore session query units kinds streams since until k context))
-  (%h8d-pending "client-search-units"))
+  (unless (stringp query)
+    (%usage-fail "query must be a string: not ~s" query))
+  (%check-range "k" k 1 50)
+  (%check-range "context" context 0 10)
+  (let* ((k (or k 10))
+         (context (or context 2))
+         (streams (%stream-keywords streams))
+         (kinds (mapcar (lambda (name)
+                          (if (and (stringp name) (member name tools:+unit-search-kinds+ :test #'string=))
+                              (intern (string-upcase name) :keyword)
+                              (%usage-fail "kinds must be among ~{~a~^, ~}: not ~s"
+                                           tools:+unit-search-kinds+ name)))
+                        (coerce (or kinds '()) 'list)))
+         (units (mapcar (lambda (u)
+                          (if (and (stringp u) (plusp (length u)))
+                              u
+                              (%usage-fail "units must be unit ids or globs: not ~s" u)))
+                        (coerce (or units '()) 'list)))
+         (since (%time-argument "since" since))
+         (until (%time-argument "until" until)))
+    (multiple-value-bind (terms phrases) (ss:query-terms query)
+      (unless (or terms phrases kinds)
+        (%usage-fail "query has nothing to search for: give words or kinds")))
+    (multiple-value-bind (sup ut) (%session-units session)
+      (declare (ignore sup))
+      (let ((index (tools:unit-tools-index ut)))
+        (multiple-value-bind (hits total)
+            (handler-case (ss:search-logs index query :units units :kinds kinds :streams streams
+                                                      :since since :until until :k k)
+              (ss:search-error (c)
+                (%usage-fail "~a" (%message-text c))))
+          (%json-object "hits" (map 'vector (lambda (hit) (%hit-object index hit context)) hits)
+                        "total" total))))))
+
+(defun %call-unit-control (unit-tools unit action arguments)
+  "TOOLS:CALL-UNIT-TOOL \"unit_control\" → its text; the tool's conditions as
+the product's (UNIT-NOT-FOUND, UNIT-CONTROL-FAILED)."
+  (handler-case (tools:call-unit-tool unit-tools "unit_control" arguments)
+    ;; First: TOOLS:UNIT-NOT-FOUND is a TOOL-INPUT-ERROR, so a TOOL-FAILURE.
+    (tools:unit-not-found ()
+      (error 'unit-not-found :unit unit))
+    (agent:tool-failure (c)
+      (error 'unit-control-failed :unit unit :action action :message (%message-text c)))
+    ;; unit_control hidden by the settings: not an ERROR subtype.
+    (agent:agent-unknown-tool (c)
+      (error 'unit-control-failed :unit unit :action action :message (%message-text c)))))
 
 (defun client-control-unit (session unit action &key input confirmed)
-  (declare (ignore session unit action input confirmed))
-  (%h8d-pending "client-control-unit"))
+  (unless (stringp unit)
+    (%usage-fail "unit must be a string: not ~s" unit))
+  (let ((arguments (unit-control-arguments action unit :input input)))
+    (multiple-value-bind (sup ut st agent mode) (%session-units session)
+      (declare (ignore st))
+      (multiple-value-bind (effect rule resources)
+          (unit-action-permission agent ut action unit :input input :mode mode)
+        (ecase effect
+          (:deny (error 'unit-control-denied :unit unit :action action :rule (%unit-rule-text rule)))
+          (:ask (unless confirmed
+                  (error 'unit-control-needs-confirmation :unit unit :action action
+                                                          :resource (first resources))))
+          (:allow nil)))
+      ;; The action runs on the caller's thread (stop and restart block);
+      ;; called inside a loop-thread callback it runs there.
+      (let* ((text (%call-unit-control ut unit action arguments))
+             (u (sup:find-unit sup unit)))
+        (%json-object "result" text
+                      "unit" (if u (unit-object u :depth (%unit-depth u)) :null))))))

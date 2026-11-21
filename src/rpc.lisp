@@ -272,7 +272,9 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
         (:boolean "a boolean")
         (:object "an object")
         (:strings "an array of strings")
-        (:turn "an integer or a string"))))
+        (:turn "an integer or a string")
+        ;; H8d: units/subscribe since
+        (:count "an integer ≥ 0"))))
 
 (defun %bad-param (method key type)
   (error 'rpc-protocol:rpc-invalid-params
@@ -434,7 +436,72 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
          (lambda (client method params)
            (%json-object "tools"
                          (coerce (client-tools (%session-param client method params))
-                                 'vector)))))
+                                 'vector))))
+   ;; H8d
+   (cons "units/list"
+         (lambda (client method params)
+           (let* ((kind (%param method params "kind" :string))
+                  (state (%param method params "state" :string))
+                  (owner (%param method params "owner" :string))
+                  (resources (%param method params "resources" :boolean))
+                  (session (%session-param client method params))
+                  (sup (code-session-supervisor session))
+                  ;; The seq before the list: subscribing with since = seq
+                  ;; misses no change after it.
+                  (seq (sup:supervisor-last-seq sup))
+                  (units (client-units session :kind kind :state state :owner owner
+                                               :resources resources)))
+             (%json-object "units" (coerce units 'vector)
+                           "seq" seq
+                           "running" (count-if #'sup:unit-live-p (sup:supervisor-units sup))))))
+   (cons "units/subscribe"
+         (lambda (client method params)
+           (let ((since (%param method params "since" :integer)))
+             (when (and since (minusp since))
+               (%bad-param method "since" :count))
+             (multiple-value-bind (id seq complete)
+                 (client-subscribe-units (%session-param client method params) :since since)
+               (%json-object "subscription" id "seq" seq "complete" (and complete t))))))
+   (cons "units/unsubscribe"
+         (lambda (client method params)
+           (let ((id (%param method params "subscription" :string :required t)))
+             (client-unsubscribe-units (%session-param client method params) id)
+             (%json-object "unsubscribed" t))))
+   (cons "units/read"
+         (lambda (client method params)
+           (let ((unit (%param method params "unit" :string))
+                 (ref (%param method params "ref" :string))
+                 (start-line (%param method params "start_line" :integer))
+                 (limit (%param method params "limit" :integer))
+                 (tail (%param method params "tail" :integer))
+                 (streams (%param method params "streams" :strings)))
+             (client-read-unit (%session-param client method params)
+                               :unit unit :ref ref :start-line start-line :limit limit
+                               :tail tail :streams (and streams (coerce streams 'list))))))
+   (cons "units/search"
+         (lambda (client method params)
+           (let ((query (%param method params "query" :string :required t))
+                 (units (%param method params "units" :strings))
+                 (kinds (%param method params "kinds" :strings))
+                 (streams (%param method params "streams" :strings))
+                 (since (%param method params "since" :string))
+                 (until (%param method params "until" :string))
+                 (k (%param method params "k" :integer))
+                 (context (%param method params "context" :integer)))
+             (client-search-units (%session-param client method params) query
+                                  :units (and units (coerce units 'list))
+                                  :kinds (and kinds (coerce kinds 'list))
+                                  :streams (and streams (coerce streams 'list))
+                                  :since since :until until :k k :context context))))
+   (cons "units/control"
+         (lambda (client method params)
+           (let ((unit (%param method params "unit" :string :required t))
+                 (action (%param method params "action" (cons :member +unit-rpc-actions+)
+                                 :required t))
+                 (input (%param method params "input" :string))
+                 (confirmed (%param method params "confirmed" :boolean)))
+             (client-control-unit (%session-param client method params) unit action
+                                  :input input :confirmed confirmed)))))
   "Method name → (lambda (client method params)) → the result object.")
 
 (defun make-rpc-handler (client)

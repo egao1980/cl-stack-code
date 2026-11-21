@@ -124,46 +124,219 @@
 follow thread, samples, the prompt, the help text, the pending action."))
   (:documentation "H8d: the interactive mode's unit panel."))
 
-;;; Stubs: the views.
+;;; The views.
+
+(defparameter +unit-panel-empty-text+
+  "  no units yet: shell jobs, servers and subagents show up here"
+  "Row 1 of the list view without units.")
+
+(defun %fit (text n)
+  "TEXT, or its first N − 1 characters and \"…\" when longer than N."
+  (if (<= (length text) n)
+      text
+      (concatenate 'string (subseq text 0 (max 0 (1- n))) "…")))
+
+(defun %cut-row (text width)
+  "TEXT cut to WIDTH characters, trailing blanks trimmed."
+  (string-right-trim " " (if (> (length text) width) (subseq text 0 (max 0 width)) text)))
+
+(defun %indent (depth)
+  (make-string (* 2 depth) :initial-element #\Space))
+
+(defvar *%unit-last-lines* nil
+  "An EQUAL table unit id → UNIT-LAST-LINE the program binds while it draws the
+list view (one log read per unit per refresh), or NIL.")
+
+(defun %row-last-line (unit)
+  (let ((cache *%unit-last-lines*)
+        (id (sup:unit-id unit)))
+    (if cache
+        (multiple-value-bind (line found) (gethash id cache)
+          (if found line (setf (gethash id cache) (unit-last-line unit))))
+        (unit-last-line unit))))
+
+(defun %row-columns (mark name status kind pid up cpu rss last)
+  (string-right-trim
+   " " (%text "~a~20a ~9a ~9a ~6@a ~6@a ~5@a ~6@a  ~a"
+               mark (%fit name 20) (%fit status 9) (%fit kind 9) pid up cpu rss last)))
 
 (defun unit-row-text (row width &key header selected stats cpu (now (get-universal-time)))
   "→ the panel text of ROW (a UNIT-TREE row) cut to WIDTH, or of the column
 header with HEADER true (ROW ignored). SELECTED: its mark. STATS: its
 SAMPLE-UNIT-RESOURCES plist or NIL; CPU: its percent or NIL. See the file
 header."
-  (declare (ignore row width header selected stats cpu now))
-  (%h8d-pending "unit-row-text"))
+  (%cut-row
+   (cond (header (apply #'%row-columns "  " +unit-panel-columns+))
+         ((getf row :scope)
+          (%text "~a  ~a/" (%indent (getf row :depth)) (sup:scope-name (getf row :scope))))
+         (t (let* ((u (getf row :unit))
+                   (pid (sup:unit-pid u))
+                   (start (sup:unit-start-time u)))
+              (%row-columns (if selected "> " "  ")
+                            (concatenate 'string (%indent (getf row :depth)) (sup:unit-id u))
+                            (unit-status-word u)
+                            (%lower (sup:unit-kind u))
+                            (if pid (princ-to-string pid) "-")
+                            (if (and start (sup:unit-live-p u))
+                                (format-unit-uptime (max 0 (- now start)))
+                                "-")
+                            (format-unit-cpu cpu)
+                            (format-unit-rss (getf stats :rss))
+                            (or (%row-last-line u) "")))))
+   width))
+
+(defun %row-unit-id (row)
+  (let ((u (getf row :unit)))
+    (and u (sup:unit-id u))))
 
 (defun unit-panel-lines (rows width height &key selected stats cpu (now (get-universal-time)))
   "→ the list view: HEIGHT lines of runs (W:TEXT-RUNs) for the UNIT-TREE ROWS
 at WIDTH, the title row first. SELECTED: a unit id. STATS: a
 SAMPLE-UNIT-RESOURCES table; CPU: an EQUAL table id → percent. See the file
 header."
-  (declare (ignore rows width height selected stats cpu now))
-  (%h8d-pending "unit-panel-lines"))
+  (let* ((units (remove-if-not (lambda (row) (getf row :unit)) rows))
+         (running (count-if (lambda (row) (sup:unit-live-p (getf row :unit))) units))
+         (lines (list (list (w:text-run (%cut-row (format nil "Units · ~d running · ~d total"
+                                                          running (length units))
+                                                  width))))))
+    (if (null units)
+        (push (list (w:text-run (%cut-row +unit-panel-empty-text+ width))) lines)
+        (let* ((body (max 0 (- height 2)))
+               (index (and selected (position selected rows :key #'%row-unit-id :test #'equal)))
+               (offset (if (and index (plusp body))
+                           (max 0 (min (- index (1- body)) (- (length rows) body)))
+                           0)))
+          (push (list (w:text-run (unit-row-text nil width :header t) :dim t)) lines)
+          (loop for row in (nthcdr offset rows)
+                repeat body
+                do (let* ((id (%row-unit-id row))
+                          (mine (and id (equal id selected)))
+                          (text (unit-row-text row width
+                                               :selected mine
+                                               :stats (and id stats (gethash id stats))
+                                               :cpu (and id cpu (gethash id cpu))
+                                               :now now)))
+                     (push (list (if mine (w:text-run text :inverse t) (w:text-run text))) lines)))))
+    (setf lines (nreverse lines))
+    (if (< (length lines) height)
+        (append lines (make-list (- height (length lines)) :initial-element '()))
+        (subseq lines 0 (max 0 height)))))
+
+(defun %query-needles (query)
+  "The terms and phrases of QUERY (SS:QUERY-TERMS), longest first."
+  (when (and (stringp query) (plusp (length query)))
+    (multiple-value-bind (terms phrases) (ss:query-terms query)
+      (stable-sort (remove-duplicates (remove "" (append phrases terms) :test #'string=)
+                                      :test #'string= :from-end t)
+                   #'> :key #'length))))
+
+(defun %highlight-ranges (text needles)
+  "Non-overlapping (start . end) ranges of NEEDLES in TEXT (case-insensitive;
+at each position the first, i.e. longest, needle that matches)."
+  (let ((ranges '()) (i 0) (n (length text)))
+    (loop while (< i n)
+          do (let ((hit (find-if (lambda (needle)
+                                   (let ((e (+ i (length needle))))
+                                     (and (<= e n) (string-equal needle text :start2 i :end2 e))))
+                                 needles)))
+               (if hit
+                   (progn (push (cons i (+ i (length hit))) ranges)
+                          (incf i (length hit)))
+                   (incf i))))
+    (nreverse ranges)))
+
+(defun %text-runs (text ranges foreground)
+  "Runs of TEXT: RANGES inverse, the rest plain, all in FOREGROUND (or the
+default color)."
+  (let ((runs '()) (pos 0))
+    (flet ((emit (start end inverse)
+             (when (< start end)
+               (push (w:text-run (subseq text start end) :inverse inverse :foreground foreground)
+                     runs))))
+      (dolist (r ranges)
+        (emit pos (car r) nil)
+        (emit (car r) (cdr r) t)
+        (setf pos (cdr r)))
+      (emit pos (length text) nil))
+    (nreverse runs)))
+
+(defun %log-text-line (mark line text width &key needles foreground)
+  "One log view line: (format nil \"~a~5d  ~a\" MARK LINE TEXT) cut to WIDTH,
+NEEDLES highlighted in TEXT."
+  (let* ((prefix (format nil "~a~5d  " mark line))
+         (room (max 0 (- width (length prefix))))
+         (text (if (> (length text) room) (subseq text 0 room) text)))
+    (cons (w:text-run (if (> (length prefix) width) (subseq prefix 0 (max 0 width)) prefix))
+          (%text-runs text (%highlight-ranges text needles) foreground))))
+
+(defun %gap-line (gap width)
+  (list (w:text-run (%cut-row (%text "[gap: lines ~d-~d not in the log (~{~a~^, ~})]"
+                                      (sup:log-gap-first-line gap) (sup:log-gap-last-line gap)
+                                      (mapcar #'%lower (sup:log-gap-reasons gap)))
+                              width))))
+
+(defun %log-item-line (item)
+  (if (typep item 'sup:log-gap) (sup:log-gap-first-line item) (sup:log-record-line item)))
+
+(defun %log-items (records gaps)
+  "RECORDS and GAPS merged in line order."
+  (stable-sort (append (copy-list gaps) (copy-list records)) #'< :key #'%log-item-line))
 
 (defun unit-log-lines (records gaps width &key hits query)
   "→ lines of runs for SUP:LOG-RECORDs RECORDS and SUP:LOG-GAPs GAPS (in
 line order) at WIDTH. HITS: line numbers marked \">\"; QUERY: a search query
 whose terms are highlighted. See the file header."
-  (declare (ignore records gaps width hits query))
-  (%h8d-pending "unit-log-lines"))
+  (let ((needles (%query-needles query)))
+    (mapcar (lambda (item)
+              (if (typep item 'sup:log-gap)
+                  (%gap-line item width)
+                  (let ((line (sup:log-record-line item)))
+                    (%log-text-line (if (member line hits) ">" " ") line
+                                    (%clean-text (sup:log-record-text item) :tab :expand)
+                                    width
+                                    :needles needles
+                                    :foreground (and (eq :stderr (sup:log-record-stream item)) 1)))))
+            (%log-items records gaps))))
+
+(defun %unit-memory-lines (text width &key (start 1) hits query)
+  "The log view's lines of a unit without a log file: TEXT (SUP:UNIT-OUTPUT)
+one line per line, cleaned, numbered from 1; from line START."
+  (let* ((needles (%query-needles query))
+         (lines (uiop:split-string (string-right-trim '(#\Newline) text) :separator '(#\Newline))))
+    (when (equal lines '("")) (setf lines '()))
+    (loop for raw in (nthcdr (max 0 (1- start)) lines)
+          for n from start
+          collect (%log-text-line (if (member n hits) ">" " ") n
+                                  (%clean-text raw :tab :expand) width :needles needles))))
 
 (defun unit-log-title (unit &key following first-line last-line query hit-index hit-count)
   "→ the log view's title for UNIT (see the file header). HIT-INDEX is 0-based."
-  (declare (ignore unit following first-line last-line query hit-index hit-count))
-  (%h8d-pending "unit-log-title"))
+  (format nil "Log ~a (~a)~a~a"
+          (sup:unit-id unit) (unit-status-word unit)
+          (cond (following " · following")
+                ((and first-line last-line) (format nil " · lines ~d-~d" first-line last-line))
+                (t ""))
+          (cond ((null query) "")
+                ((and hit-count (plusp hit-count))
+                 (format nil " · search \"~a\": ~d of ~d" query (1+ (or hit-index 0)) hit-count))
+                (t (format nil " · search \"~a\": no results" query)))))
 
-;;; Stubs: the core (src/interactive.lisp routes here).
+;;; The core (src/interactive.lisp routes here).
 
 (defun %units-command (state argument)
   "/ps ARGUMENT (idle or busy): no argument → effect (:units-panel); else an
 :error \"usage: /ps\". → effects."
-  (declare (ignore state argument))
-  (%h8d-pending "/ps"))
+  (if (or (null argument) (%blank-text-p argument))
+      (list (list :units-panel))
+      (progn (%add-entry state :kind :error :text "usage: /ps")
+             '())))
 
 (defun %units-event (state event)
   "(:units :running N) → STATE-UNITS-RUNNING N, no effect. (:unit-failed
 :notice TEXT) → a :notice entry TEXT, no effect. → effects."
-  (declare (ignore state event))
-  (%h8d-pending "the unit events"))
+  (destructuring-bind (kind &key running notice &allow-other-keys) event
+    (ecase kind
+      (:units (setf (state-units-running state) (or running 0)))
+      (:unit-failed (when notice
+                      (%add-entry state :kind :notice :text notice))))
+    '()))
