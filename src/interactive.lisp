@@ -309,6 +309,28 @@
 ;;;   Status line: with STATE-IMAGE, the left side is " <model> · <mode> ·
 ;;;   <%IMAGE-MARKER> · <cwd>"; the marker says (debugger) while DS is not
 ;;;   empty. IMAGE-BANNER-TEXT is the banner row.
+;;;
+;;; H8d: units (src/units.lisp, src/unit-panel.lisp).
+;;;
+;;; Events
+;;;   (:units :running N)     the supervisor's live unit count changed
+;;;   (:unit-failed :notice TEXT)  a unit failed (UNIT-FAILURE-NOTICE)
+;;;
+;;; Effects
+;;;   (:units-panel)          the program opens the unit panel
+;;;
+;;; State
+;;;   STATE-UNITS-RUNNING     the live count, 0 at first (given)
+;;;
+;;; Rules
+;;;   :units        STATE-UNITS-RUNNING becomes N; no entry, no effect.
+;;;   :unit-failed  a :notice TEXT; no effect (idle or busy).
+;;;   Status line: the right side is "N running · <in> in · <out> out " while
+;;;   N > 0, else unchanged (%UNITS-MARKER, given).
+;;;
+;;; Commands
+;;;   /ps           no argument: (:units-panel); anything else: :error
+;;;                 "usage: /ps". Also while busy (like /tree).
 
 
 (defparameter +help-text+
@@ -329,6 +351,7 @@
             "  /plan                 show the open plan's projected change (plan mode)"
             "  /approve              apply the open plan to the project"
             "  /reject               discard the open plan"
+            "  /ps                   the session's units (shell jobs, servers, subagents): logs, search, stop (also Ctrl-P)"
             "  /exit                 quit (also Ctrl-D, or Ctrl-C on an empty input)"
             "Keys:"
             "  Enter send · Alt+Enter, Shift+Enter or Ctrl+J newline · Up/Down history"
@@ -406,7 +429,10 @@ asked about or run.")
 (the rewind's drift dialog, +DRIFT-CHOICES+).")
    ;; H4b
    (image :initarg :image :initform nil :accessor state-image
-          :documentation "NIL, or the image plist (see the \"H4b\" part of the file header)."))
+          :documentation "NIL, or the image plist (see the \"H4b\" part of the file header).")
+   ;; H8d
+   (units-running :initform 0 :accessor state-units-running
+                  :documentation "Live units of the session's supervisor (the status line)."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
@@ -563,6 +589,8 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
                            (plusp (length argument))
                            (not (eq :plan (parse-permission-mode argument)))))))
          (%plan-command state command argument))
+        ;; H8d
+        ((string= command "/ps") (%units-command state argument))
         ((string= command "/help")
          (%add-entry state :kind :notice :text +help-text+)
          '())
@@ -713,7 +741,9 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               ((:rewind-prompt :rewind-drift :rewound) (%rewind-event state event))
               ;; H4b
               ((:image-event :image-return :image-pending)
-               (if (state-image state) (%image-event state event) '()))))))
+               (if (state-image state) (%image-event state event) '()))
+              ;; H8d
+              ((:units :unit-failed) (%units-event state event))))))
     (values state effects)))
 
 (defun %home-relative (dir)
@@ -757,11 +787,17 @@ head goes too (\"…/app/\"), and the status line cuts what remains."
                           finally (return best))
                     (elided (- n 2) ""))))))))
 
+(defun %units-marker (state)
+  "H8d: \"N running\" while STATE-UNITS-RUNNING is positive, else NIL."
+  (let ((n (state-units-running state)))
+    (and (plusp n) (format nil "~d running" n))))
+
 (defun status-line-text (state &optional width)
   "→ (values left right) of the status line:
 left  \" <model> · <permission mode name> · <cwd>\", the cwd as a native
       directory namestring with the user's home directory prefix shown as \"~/\";
-right \"<input> in · <output> out \", the summed input and output tokens.
+right \"<input> in · <output> out \", the summed input and output tokens;
+      H8d: prefixed by \"N running · \" while N > 0 units are live.
 With WIDTH (the status line's columns) a cwd that does not fit loses its
 middle, not its end: the project directory name stays (#4)."
   (let* ((cwd (state-cwd state))
@@ -776,7 +812,7 @@ middle, not its end: the project directory name stays (#4)."
                   ""))
          (right (destructuring-bind (input output &rest more) (state-usage state)
                   (declare (ignore more))
-                  (format nil "~d in · ~d out " input output))))
+                  (format nil "~@[~a · ~]~d in · ~d out " (%units-marker state) input output))))
     ;; The widget gives the left side WIDTH - right - 1 columns (all of
     ;; WIDTH when the right side is dropped, at right + 2 > WIDTH).
     (when (and width (plusp (length dir)))

@@ -236,6 +236,40 @@
 ;;;   Close            CLOSE-CODE-PROGRAM also runs CLOSE-LISP-TOOLS (a
 ;;;                    spawned image is killed, an attached one keeps
 ;;;                    running).
+;;;
+;;; H8d: units (src/units.lisp, src/unit-panel.lisp; left to the
+;;; implementation).
+;;;   Start            MAKE-CODE-PROGRAM makes the supervisor
+;;;                    (MAKE-CODE-SUPERVISOR on the working directory and
+;;;                    the program's data directory) before the tools, passes
+;;;                    it to MAKE-CODE-TOOLS (and to the plan area's tools,
+;;;                    under an :agent scope "plan-<id8>"), and sets
+;;;                    CODE-PROGRAM-SUPERVISOR and CODE-PROGRAM-UNIT-TOOLS
+;;;                    (CODE-UNIT-TOOLS of the working directory's sources).
+;;;                    A configuration error after it was made shuts it down
+;;;                    (nothing stays open, as before).
+;;;   TUI-INIT         SUP:SUBSCRIBE from the current seq; each event goes to
+;;;                    the UI with TUI-SEND, where the core gets (:units
+;;;                    :running N) and, for UNIT-FAILURE-NOTICE, (:unit-failed
+;;;                    :notice TEXT); the panel redraws when open.
+;;;   Effects          (:units-panel) opens the panel (src/unit-panel.lisp).
+;;;   Keys             Ctrl-P (+UNIT-PANEL-KEY+) opens or closes the panel
+;;;                    when no dialog is shown; while it is open every key
+;;;                    goes to it (file header of src/unit-panel.lisp), except
+;;;                    that an approval dialog, when one appears, takes the
+;;;                    keys first (the agent is never left waiting behind the
+;;;                    panel).
+;;;   Layout           While open, the panel replaces the transcript, the
+;;;                    queued / steering / spinner / banner rows and the input
+;;;                    (src/unit-panel.lisp); the status line stays.
+;;;   Actions          UNIT-ACTION-PERMISSION with the agent, the unit tools
+;;;                    and the program's mode; the confirm dialog is a
+;;;                    W:CONFIRM-DIALOG titled "Unit control" (+UNIT-ACTION-
+;;;                    CHOICES+); TOOLS:CALL-UNIT-TOOL runs on a worker thread
+;;;                    and its text comes back with TUI-SEND.
+;;;   Close            CLOSE-CODE-PROGRAM ends the subscription and the panel's
+;;;                    threads, closes the unit tools and the shell tools, then
+;;;                    shuts the supervisor down (units stopped, logs kept).
 
 
 (defclass code-program ()
@@ -322,7 +356,16 @@
              :documentation "Loop thread: BEGIN-CHECKPOINT-TURN's state for the running turn.")
    ;; H4b
    (image-link :initarg :image-link :initform nil :reader %cp-image-link
-               :documentation "The image link (src/lisp-image.lisp) when the image is on, else NIL."))
+               :documentation "The image link (src/lisp-image.lisp) when the image is on, else NIL.")
+   ;; H8d (set by MAKE-CODE-PROGRAM; the readers are the API)
+   (supervisor :initarg :supervisor :initform nil :accessor code-program-supervisor
+               :documentation "The session's SUP:SUPERVISOR (MAKE-CODE-SUPERVISOR).")
+   (unit-tools :initarg :unit-tools :initform nil :accessor code-program-unit-tools
+               :documentation "The working directory's UNIT-TOOLS source (CODE-UNIT-TOOLS).")
+   (panel :initform (make-instance 'unit-panel) :reader code-program-panel
+          :documentation "The UNIT-PANEL (UI thread only).")
+   (units-state :initform nil :accessor %cp-units-state
+                :documentation "The implementation's: subscription, ticker, sampler, unit dialog."))
   (:documentation "The interactive mode as a tui-protocol program."))
 
 (defun %make-input (program-cell)

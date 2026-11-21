@@ -252,7 +252,9 @@
 (defparameter +event-types+
   '("system" "text_delta" "assistant" "tool_use" "tool_result"
     "approval_request" "approval_resolved" "steering" "image_event"
-    "plan" "rewind" "session" "result")
+    "plan" "rewind" "session" "result"
+    ;; H8d: units/subscribe notifications
+    "unit")
   "Every event \"type\" the SDK, -p's stream-json and --rpc can deliver.")
 
 (defparameter +approval-decision-names+
@@ -1429,3 +1431,95 @@ queued for the next turn."
                                                       (if (hash-table-p v) v (%json-object))))
                                                    (t (%json-object))))))
                            (agent:list-agent-tools source))))))
+
+;;; H8d: units (src/units.lisp). Stubs; the file header's "H8d" part has the
+;;; rules.
+;;;
+;;;   Sessions         %OPEN-CODE-SESSION makes the session's supervisor
+;;;                    (MAKE-CODE-SUPERVISOR on the session's working directory
+;;;                    and the client's data directory) before the tools and
+;;;                    passes it to MAKE-CODE-TOOLS (plan tools too, as the
+;;;                    program does); a configuration error shuts it down.
+;;;                    CLIENT-CLOSE-SESSION ends its subscriptions, closes the
+;;;                    unit tools and the shell tools and shuts it down.
+;;;   CODE-SESSION-SUPERVISOR session → its SUP:SUPERVISOR.
+;;;   CODE-SESSION-UNIT-TOOLS session → its UNIT-TOOLS (CODE-UNIT-TOOLS).
+;;;   CLIENT-UNITS session &key KIND STATE OWNER RESOURCES → UNIT-OBJECTS of
+;;;     the supervisor (KIND, STATE, OWNER as UNIT-OBJECTS takes them, strings
+;;;     from --rpc; a bad one → CODE-USAGE-ERROR). RESOURCES: take a
+;;;     SAMPLE-UNIT-RESOURCES now; cpu_percent from the session's previous
+;;;     sample (NIL the first time).
+;;;   CLIENT-SUBSCRIBE-UNITS session &key SINCE → (values ID SEQ COMPLETE):
+;;;     SUP:SUBSCRIBE (SINCE as given, else from SUP:SUPERVISOR-LAST-SEQ); ID
+;;;     "sub-<n>" (n per session, from 1); every event becomes a
+;;;     UNIT-EVENT-OBJECT with that subscription and the session id, delivered
+;;;     to the client's ON-EVENT on the loop thread in seq order, each once.
+;;;     COMPLETE: SUP:EVENTS-SINCE's complete-p for SINCE (T without SINCE).
+;;;   CLIENT-UNSUBSCRIBE-UNITS session id → T; an unknown or ended id →
+;;;     SUBSCRIPTION-NOT-FOUND.
+;;;   CLIENT-READ-UNIT session &key UNIT REF START-LINE LIMIT TAIL STREAMS →
+;;;     {"unit","status","records","gaps","next_line","last_line","ended",
+;;;     "memory"}: exactly one of UNIT / REF (else CODE-USAGE-ERROR). REF
+;;;     "<unit>:<segment>:<line>" → start = line − 10, limit 40; UNIT → start
+;;;     1, limit 200; START-LINE / LIMIT (1..2000) override; TAIL N → the last
+;;;     N output lines (SUP:LOG-TAIL; START-LINE ignored). Records are output
+;;;     records of STREAMS (default both; :stdout :stderr or "stdout"
+;;;     "stderr"). next_line = SUP:LOG-READ's next line, last_line =
+;;;     SUP:LOG-LAST-LINE, ended = SUP:LOG-CLOSED-P and nothing after,
+;;;     memory = null. Without a log file: records [], gaps [], next_line and
+;;;     last_line null, memory = SUP:UNIT-OUTPUT. Unknown unit →
+;;;     UNIT-NOT-FOUND.
+;;;   CLIENT-SEARCH-UNITS session query &key UNITS KINDS STREAMS SINCE UNTIL
+;;;     K CONTEXT → {"hits": [...], "total": N}: SS:SEARCH-LOGS on the unit
+;;;     tools' index (UNITS ids or globs; KINDS names of +UNIT-SEARCH-KINDS+;
+;;;     SINCE / UNTIL as TOOLS:PARSE-TIME-ARGUMENT reads them; K 1..50, default
+;;;     10; CONTEXT 0..10, default 2). Hit object: {"ref", "unit" (the hit
+;;;     key), "segment", "line", "stream", "time" (RFC 3339 ms), "kinds"
+;;;     [names], "score" (number or null), "text", "extent" [first, last] or
+;;;     null, "excerpt" [UNIT-RECORD-OBJECTs of SS:HIT-EXCERPT with CONTEXT],
+;;;     "gaps" [UNIT-GAP-OBJECTs]}. A bad argument (K or CONTEXT out of range, an
+;;;     unknown kind or stream, a bad time, a blank QUERY without KINDS) →
+;;;     CODE-USAGE-ERROR.
+;;;   CLIENT-CONTROL-UNIT session unit action &key INPUT CONFIRMED →
+;;;     {"result": text, "unit": UNIT-OBJECT}: UNIT-ACTION-PERMISSION with the
+;;;     session's agent, unit tools and mode; :deny → UNIT-CONTROL-DENIED
+;;;     (rule as FORMAT-PERMISSION-RULE); :ask and not CONFIRMED →
+;;;     UNIT-CONTROL-NEEDS-CONFIRMATION (resource), nothing done; otherwise
+;;;     TOOLS:CALL-UNIT-TOOL "unit_control" (UNIT-CONTROL-ARGUMENTS) off the
+;;;     loop thread; a TOOLS:UNIT-NOT-FOUND → UNIT-NOT-FOUND; another
+;;;     TOOL-FAILURE → UNIT-CONTROL-FAILED with its message. An action not in
+;;;     +UNIT-RPC-ACTIONS+ → CODE-USAGE-ERROR.
+
+(defun code-session-supervisor (session)
+  "H8d: SESSION's supervisor."
+  (declare (ignore session))
+  (%h8d-pending "code-session-supervisor"))
+
+(defun code-session-unit-tools (session)
+  "H8d: SESSION's unit tools."
+  (declare (ignore session))
+  (%h8d-pending "code-session-unit-tools"))
+
+(defun client-units (session &key kind state owner resources)
+  (declare (ignore session kind state owner resources))
+  (%h8d-pending "client-units"))
+
+(defun client-subscribe-units (session &key since)
+  (declare (ignore session since))
+  (%h8d-pending "client-subscribe-units"))
+
+(defun client-unsubscribe-units (session id)
+  (declare (ignore session id))
+  (%h8d-pending "client-unsubscribe-units"))
+
+(defun client-read-unit (session &key unit ref start-line limit tail streams)
+  (declare (ignore session unit ref start-line limit tail streams))
+  (%h8d-pending "client-read-unit"))
+
+(defun client-search-units (session query &key units kinds streams since until k context)
+  (declare (ignore session query units kinds streams since until k context))
+  (%h8d-pending "client-search-units"))
+
+(defun client-control-unit (session unit action &key input confirmed)
+  (declare (ignore session unit action input confirmed))
+  (%h8d-pending "client-control-unit"))

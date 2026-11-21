@@ -2,6 +2,13 @@
 
 ;;; Headless runs: -p with text, json or stream-json output.
 ;;;
+;;; H8d (left to the implementation): every run makes its supervisor
+;;; (MAKE-CODE-SUPERVISOR on the working directory and the data directory)
+;;; before the tools and passes it to MAKE-CODE-TOOLS, so the init event's
+;;; "tools" end with the unit tools and bash commands are units; after the run
+;;; (and when the setup fails) the unit tools, the shell tools and the
+;;; supervisor are closed, in that order. The output is otherwise unchanged.
+;;;
 ;;; H3c: every run is a turn of a session (src/sessions.lisp).
 ;;;   Before the run   CHECK-SESSION-FLAGS; then the session: --continue →
 ;;;                    LAST-SESSION of SESSIONS-DIRECTORY (none →

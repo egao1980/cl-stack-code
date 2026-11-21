@@ -25,6 +25,9 @@
                     (#:repl #:repl-protocol)
                     ;; H3d
                     (#:rpc #:rpc-protocol)
-                    (#:stdio #:rpc-backend-stdio)))
+                    (#:stdio #:rpc-backend-stdio)
+                    ;; H8d
+                    (#:sup #:supervisor-protocol)
+                    (#:ss #:supervisor-protocol/search)))
 
 (in-package #:cl-stack-code/tests)

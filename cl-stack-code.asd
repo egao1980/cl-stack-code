@@ -1,10 +1,10 @@
 (defsystem "cl-stack-code"
-  :version "0.7.0"
-  :description "Coding agent CLI on cl-stack: an SDK and a JSON-RPC 2.0 server over stdio (--rpc) on one core: sessions, turns with streamed events, approvals answered by the caller, steering, interrupts, plans, checkpoints and rewinds, the same event shapes as stream-JSON; a live Lisp image for the agent (lisp-mcp/agent tools, debugger entries in other threads delivered to the agent's inbox, restarts gated by permission rules), checkpoints (every turn that changes files records a composite revision of the conversation and the files: a pathlib snapshot, a git commit on a private ref, or a jj working-copy commit) and per-part rewinds (conversation, files or both, drift-checked), plan mode (edits and shell commands in a copy of the project, a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
+  :version "0.8.0"
+  :description "Coding agent CLI on cl-stack: a supervisor per session (shell jobs, servers and subagents as units with capped rotated logs; a TUI process panel (/ps, Ctrl-P) to follow, search, stop, restart and feed them, the same model over --rpc units/* methods, both behind the agent's unit_control permission rules), an SDK and a JSON-RPC 2.0 server over stdio (--rpc) on one core: sessions, turns with streamed events, approvals answered by the caller, steering, interrupts, plans, checkpoints and rewinds, the same event shapes as stream-JSON; a live Lisp image for the agent (lisp-mcp/agent tools, debugger entries in other threads delivered to the agent's inbox, restarts gated by permission rules), checkpoints (every turn that changes files records a composite revision of the conversation and the files: a pathlib snapshot, a git commit on a private ref, or a jj working-copy commit) and per-part rewinds (conversation, files or both, drift-checked), plan mode (edits and shell commands in a copy of the project, a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
   :depends-on ((:version "ai-agent-protocol" "0.14.0")
-               (:version "agent-tools" "0.2.0")
+               (:version "agent-tools" "0.3.0")
                (:version "llm-protocol" "0.5.0")
                (:version "llm-protocol-anthropic" "0.3.0")
                (:version "llm-protocol-openai" "0.4.0")
@@ -36,7 +36,11 @@
                (:version "rpc-protocol-json" "0.1.1")
                (:version "rpc-backend-stdio" "0.2.0")
                (:version "repl-protocol" "0.2.8")
-               "process-backend-uiop")
+               "process-backend-uiop"
+               ;; H8d
+               (:version "supervisor-protocol" "0.3.0")
+               (:version "supervisor-protocol/search" "0.3.0")
+               (:version "process-protocol" "0.4.1"))
   ;; H4b: --lisp-image spawn starts ros +Q run images that load swank / slynk
   ;; (install roots, as in lisp-mcp; never dependencies).
   :properties (:cl-repo (:ci (:with ("swank" "slynk"))))
@@ -58,6 +62,9 @@
                (:file "plans")
                (:file "checkpoints")
                (:file "lisp-image")
+               ;; H8d
+               (:file "units")
+               (:file "unit-panel")
                (:file "interactive")
                (:file "headless")
                (:file "program")
@@ -99,6 +106,9 @@
                ;; H3d
                "rpc-protocol"
                "rpc-backend-stdio"
+               ;; H8d
+               "supervisor-protocol"
+               "supervisor-protocol/search"
                "rove")
   :pathname "tests"
   :serial t
@@ -151,7 +161,14 @@
                (:file "client-approval-test")
                (:file "client-plan-test")
                (:file "rpc-test")
-               (:file "rpc-process-test"))
+               (:file "rpc-process-test")
+               ;; H8d
+               (:file "units-support")
+               (:file "units-test")
+               (:file "units-core-test")
+               (:file "units-program-test")
+               (:file "units-client-test")
+               (:file "units-rpc-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
