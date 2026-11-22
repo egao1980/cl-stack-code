@@ -51,7 +51,10 @@ NIL to read the prompt from input (no free argument, or \"-\").")
                        :documentation "--list-checkpoints: print the resumed session's checkpoints.")
    ;; H3d
    (rpc-p :initarg :rpc-p :reader invocation-rpc-p :initform nil
-          :documentation "--rpc: serve JSON-RPC 2.0 on standard input and output."))
+          :documentation "--rpc: serve JSON-RPC 2.0 on standard input and output.")
+   ;; ACP-2
+   (acp-p :initarg :acp-p :reader invocation-acp-p :initform nil
+          :documentation "--acp: serve the Agent Client Protocol on standard input and output."))
   (:documentation "One parsed command line."))
 
 (defparameter +output-format-names+ '("text" "json" "stream-json")
@@ -113,6 +116,9 @@ ours to rebind, so it goes in as :BACKEND)."
                 :kind :flag)
            ;; H3d
            (opt "rpc" "Serve JSON-RPC 2.0 on stdin/stdout (sessions, turns, approvals; see the docs)"
+                :kind :flag)
+           ;; ACP-2
+           (opt "acp" "Serve the Agent Client Protocol on stdin/stdout (for editors: Zed, JetBrains, Emacs)"
                 :kind :flag)))))
 
 (defun %lisp-image-flag (value observe)
@@ -230,6 +236,7 @@ are present is checked by RUN-CLI, not here."
          :rewind-mode (%choice-flag "--rewind-mode" (get-opt :rewind-mode) +rewind-mode-names+)
          :list-checkpoints-p (and (get-opt :list-checkpoints) t)
          :rpc-p (and (get-opt :rpc) t)
+         :acp-p (and (get-opt :acp) t)
          :settings (make-settings
                     :model (get-opt :model)
                     :max-turns (%max-turns (get-opt :max-turns))
@@ -407,4 +414,41 @@ sessions, whatever the mode)."
                 (invocation-rewind i) (invocation-rewind-mode i)
                 (invocation-list-checkpoints-p i))
         (%usage-fail "--rpc approves plans and rewinds with plan/approve, plan/reject and rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints")))
+    t))
+
+;;; ACP-2: --acp.
+
+(defun check-acp-flags (invocation)
+  "→ T when INVOCATION's flags go with --acp (or --acp is not given);
+otherwise CODE-USAGE-ERROR, checked in this order:
+  --acp with --rpc             → \"--acp and --rpc cannot be used together\"
+  --acp with -p                → \"--acp and -p cannot be used together\"
+  --acp with a prompt          → \"--acp takes no prompt (send session/prompt)\"
+  --acp with --output-format   → \"--acp writes ACP JSON-RPC; --output-format is for -p\"
+  --acp with any of --continue, --resume, --session-id, --fork-session,
+  --list-sessions              → \"--acp opens sessions with session/new and session/load, not --continue, --resume, --session-id, --fork-session or --list-sessions\"
+  --acp with any of --apply, --reject, --on-drift, --rewind, --rewind-mode,
+  --list-checkpoints           → \"--acp takes none of --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints: they are for -p\"
+Every other flag goes with --acp, as with --rpc: --cwd (the default
+working directory of sessions whose session/new gives none), --model,
+--max-turns, --permission-mode (the mode new sessions start in),
+--allowed-tools, --disallowed-tools, --append-system-prompt, --model-param,
+--lisp-image, --lisp-observe and --plan-area."
+  (let ((i invocation))
+    (when (invocation-acp-p i)
+      (when (invocation-rpc-p i)
+        (%usage-fail "--acp and --rpc cannot be used together"))
+      (when (invocation-print-p i)
+        (%usage-fail "--acp and -p cannot be used together"))
+      (when (invocation-prompt i)
+        (%usage-fail "--acp takes no prompt (send session/prompt)"))
+      (when (invocation-output-format-given-p i)
+        (%usage-fail "--acp writes ACP JSON-RPC; --output-format is for -p"))
+      (when (or (invocation-continue-p i) (invocation-resume i) (invocation-session-id i)
+                (invocation-fork-session-p i) (invocation-list-sessions-p i))
+        (%usage-fail "--acp opens sessions with session/new and session/load, not --continue, --resume, --session-id, --fork-session or --list-sessions"))
+      (when (or (invocation-apply-p i) (invocation-reject-p i) (invocation-on-drift i)
+                (invocation-rewind i) (invocation-rewind-mode i)
+                (invocation-list-checkpoints-p i))
+        (%usage-fail "--acp takes none of --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints: they are for -p")))
     t))

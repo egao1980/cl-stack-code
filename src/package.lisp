@@ -131,6 +131,8 @@
    #:tool-call-summary
    #:tool-result-diff
    #:tool-call-preview
+   ;; ACP-2
+   #:tool-call-texts
    #:approval-message
    #:transcript-lines
    #:status-line-text
@@ -444,6 +446,9 @@
    #:client-rewind
    #:client-settings
    #:client-tools
+   ;; ACP-2
+   #:client-set-permission-mode
+   #:client-export-session
 
    ;; H3d: conditions
    #:client-closed
@@ -473,6 +478,12 @@
    #:rpc-client-wait-event
    #:rpc-client-process
    #:close-rpc-client
+
+   ;; ACP-2: --acp (src/rpc.lisp); the server is cl-stack-code/acp
+   #:invocation-acp-p
+   #:check-acp-flags
+   #:*acp-server*
+   #:*acp-system*
 
    ;; H8d: units (src/units.lisp, src/unit-panel.lisp)
    #:+unit-panel-key+
@@ -580,5 +591,5 @@
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.10.1"
+(defparameter +version+ "0.11.0"
   "The product version, as in the .asd.")

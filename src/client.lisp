@@ -63,6 +63,7 @@
 ;;;   (an "always" answer is saved there, as in the TUI). One client may hold
 ;;;   many sessions; each runs at most one turn at a time.
 ;;;   CLIENT-NEW-SESSION client &key CWD MODEL PERMISSION-MODE SESSION-ID
+;;;                      TOOL-SOURCES
 ;;;     CWD is relative to the client's CWD. MODEL (a designator) and
 ;;;     PERMISSION-MODE (a keyword, as SETTINGS-PERMISSION-MODE) override the
 ;;;     merged settings for this session. SESSION-ID as --session-id: a bad one
@@ -77,8 +78,19 @@
 ;;;     permission_mode, tools, instructions, and lisp_image with the image
 ;;;     on) with the session's id. → the CODE-SESSION; CODE-SESSION-INIT is
 ;;;     that same object.
+;;;     TOOL-SOURCES (ACP-2, tool backends): NIL, or (lambda (sources) →
+;;;     sources), called once on the loop thread right after MAKE-CODE-TOOLS
+;;;     with the working directory's sources (file-tools shell-tools [lisp]
+;;;     [units]). What it returns is the session's working-directory source
+;;;     list (offered, run, and given back after a plan closes): the same
+;;;     shape, a FILE-TOOLS first (it may be a new one, e.g. over another
+;;;     CL-STACK-PATHLIB filesystem), and the given shell, lisp and unit
+;;;     objects in place (the session closes them; a hook may CHANGE-CLASS
+;;;     the shell tools to a subclass of AGENT-TOOLS:SHELL-TOOLS). Another
+;;;     value → CODE-USAGE-ERROR; its errors fail the open as a configuration
+;;;     error does. Plan-area sources never pass through it.
 ;;;   CLIENT-RESUME-SESSION client designator &key CWD MODEL PERMISSION-MODE
-;;;                         FORK SESSION-ID
+;;;                         FORK SESSION-ID TOOL-SOURCES
 ;;;     DESIGNATOR: an id, a unique prefix of at least 4 hex characters or a
 ;;;     UUID (OPEN-SESSION), or :LAST, the project's last session
 ;;;     (--continue). None → SESSION-NOT-FOUND. A session open in this client
@@ -87,7 +99,8 @@
 ;;;     a new session (--fork-session). The model: MODEL, else the head
 ;;;     record's, else the settings, else +DEFAULT-MODEL+ (H3c). The init
 ;;;     event gains "turns" (the length of the head's line); with FORK also
-;;;     "forked_from" (the source id).
+;;;     "forked_from" (the source id). TOOL-SOURCES as for CLIENT-NEW-SESSION
+;;;     (ignored for a session already open).
 ;;;   CLIENT-FORK-SESSION session &key AT SESSION-ID → a new CODE-SESSION:
 ;;;     CLONE-SESSION of SESSION's store :AT (a turn number or id prefix, as
 ;;;     RESOLVE-TURN; default the head; SESSION-TURN-NOT-FOUND), with
@@ -131,8 +144,9 @@
 ;;;     BEGIN-CHECKPOINT-TURN (H5b). The turn record's prompt is PROMPT as
 ;;;     given.
 ;;;     Events, in this order: plan "opened" / "reopened" (a plan turn that
-;;;     opened its plan); then, as they happen, text_delta, assistant,
-;;;     tool_use, approval_request, approval_resolved, tool_result, steering
+;;;     opened its plan); then, as they happen, text_delta, thinking_delta
+;;;     (ACP-2: {"type","session_id","step","text"}, one per non-empty
+;;;     streamed thinking part), assistant, tool_use, approval_request, approval_resolved, tool_result, steering
 ;;;     "taken" and image_event; at the turn's end steering "dropped" (when
 ;;;     posts were not taken), plan "projected" (a plan turn that stopped or
 ;;;     hit max turns), and last "result". The run's events have stream-json's
@@ -171,7 +185,21 @@
 ;;;   CLIENT-INTERRUPT session → T when a turn was running or waiting, NIL when
 ;;;     idle. CANCEL-AGENT-RUN; approvals still waiting are denied first (one
 ;;;     approval_resolved "interrupt" each) and the run does not resume. The
-;;;     turn's result follows as usual.
+;;;     turn's result follows as usual. ACP-2: the session's running
+;;;     foreground bash commands (H8d :shell-job units of its shell tools that
+;;;     are not background jobs) are stopped too, so the turn ends now, not
+;;;     when the command would; background jobs keep running.
+;;;   CLIENT-SET-PERMISSION-MODE session mode → MODE (ACP-2). The session's
+;;;     permission mode (a keyword, as SETTINGS-PERMISSION-MODE; NIL is
+;;;     :DEFAULT) from its next turn on: its settings gain the mode, its rules
+;;;     and agent settings are rebuilt and the kept run is dropped (the next
+;;;     turn starts a new run on SESSION-TURNS: history kept, as after a
+;;;     rewind); CODE-SESSION-PERMISSION-MODE is MODE. :PLAN: the next turn
+;;;     opens or reopens the plan, as in a plan-mode session; leaving :PLAN
+;;;     gives the working directory's tools back and leaves the open plan on
+;;;     disk. Another keyword → CODE-USAGE-ERROR (PERMISSION-MODE-NAME); a
+;;;     lispImage that does not go with MODE → CHECK-LISP-IMAGE-SETTINGS's
+;;;     error; a turn running or waiting → TURN-BUSY.
 ;;;
 ;;; Approvals
 ;;;   No handler answers AGENT-APPROVAL-REQUIRED (bypassPermissions approves
@@ -238,6 +266,9 @@
 ;;;     a client: those of its CWD.
 ;;;   CLIENT-TOOLS session → a list of {"name","description","input_schema"}
 ;;;     in offered order.
+;;;   CLIENT-EXPORT-SESSION session &key (FORMAT :JSON) → EXPORT-SESSION's
+;;;     text of the session's head line (ACP-2: session/load replays it), read
+;;;     on the loop thread.
 ;;;
 ;;; The image (H4b)
 ;;;   With lispImage on, every session has its own image, started by
@@ -250,7 +281,10 @@
 ;;; Given: events.
 
 (defparameter +event-types+
-  '("system" "text_delta" "assistant" "tool_use" "tool_result"
+  '("system" "text_delta"
+    ;; ACP-2: streamed thinking, right after text_delta
+    "thinking_delta"
+    "assistant" "tool_use" "tool_result"
     "approval_request" "approval_resolved" "steering" "image_event"
     "plan" "rewind" "session" "result"
     ;; H8d: units/subscribe notifications
@@ -632,7 +666,8 @@ overrides."
       (when (%session-exists-p sessions-dir normal)
         (%usage-fail "session ~a already exists: use --resume ~a" normal normal)))))
 
-(defun %open-code-session (client dir settings designator store-fn &key turns forked-from)
+(defun %open-code-session (client dir settings designator store-fn
+                           &key turns forked-from tool-sources)
   "Set SESSION up as MAKE-CODE-PROGRAM sets up the interactive mode; STORE-FN
 makes its store once the configuration passed. → the CODE-SESSION, its init
 event delivered."
@@ -663,6 +698,9 @@ event delivered."
                  sources (make-code-tools dir :settings settings
                                               :on-image-event (and link (%link-callback link))
                                               :supervisor supervisor))
+           ;; ACP-2: the caller's tool backends (TOOL-SOURCES, header).
+           (when tool-sources
+             (setf sources (%hooked-sources tool-sources sources)))
            (when link
              (setf (%link-tools link) (third sources))
              (start-lisp-image (third sources) settings))
@@ -727,11 +765,23 @@ event delivered."
         (when checkpointer
           (close-checkpointer checkpointer))))))
 
+(defun %hooked-sources (hook sources)
+  "ACP-2: SOURCES through the TOOL-SOURCES hook. The hook must give back a
+list of the same shape whose shell, lisp and unit tools are the given objects
+(the session closes those); anything else → CODE-USAGE-ERROR."
+  (let ((new (funcall hook (copy-list sources))))
+    (unless (and (listp new)
+                 (= (length new) (length sources))
+                 (tools:file-tools-p (first new))
+                 (every #'eq (rest new) (rest sources)))
+      (%usage-fail "a tool-sources hook must return (file-tools shell-tools …) with the session's own shell, lisp and unit tools"))
+    new))
+
 (defun %head-model (store)
   (let ((head (and store (session-head store))))
     (and head (record-model (revision-record head)))))
 
-(defun client-new-session (client &key cwd model permission-mode session-id)
+(defun client-new-session (client &key cwd model permission-mode session-id tool-sources)
   (%on-client-loop (client)
     (let* ((dir (%session-dir client cwd))
            (settings (%merged-settings client dir :model model :permission-mode permission-mode))
@@ -742,9 +792,11 @@ event delivered."
       (%open-code-session client dir settings
                           (or model (settings-model settings) +default-model+)
                           (lambda (project-dir)
-                            (%session-for-run inv nil sessions-dir project-dir))))))
+                            (%session-for-run inv nil sessions-dir project-dir))
+                          :tool-sources tool-sources))))
 
-(defun client-resume-session (client designator &key cwd model permission-mode fork session-id)
+(defun client-resume-session (client designator &key cwd model permission-mode fork session-id
+                                                      tool-sources)
   (%on-client-loop (client)
     (let* ((dir (%session-dir client cwd))
            (sessions-dir (%sessions-dir-of-client client dir))
@@ -769,7 +821,8 @@ event delivered."
                                 (lambda (project-dir)
                                   (%session-for-run inv source sessions-dir project-dir))
                                 :turns (length (session-line source))
-                                :forked-from (and fork (session-id source))))))))
+                                :forked-from (and fork (session-id source))
+                                :tool-sources tool-sources))))))
 
 (defun client-fork-session (session &key at session-id)
   (let ((client (code-session-client session)))
@@ -1120,6 +1173,46 @@ again, the run dropped."
         (agent:agent-run-post (%s-run st) turn)
         t))))
 
+(defun %foreground-shell-units (st)
+  "ACP-2: the live units of SESSION's running foreground bash commands: the
+:shell-job units of its shell tools' scopes (working directory and plan area)
+that are not registered background jobs."
+  (loop for shell in (list (second (%s-sources st)) (second (%s-plan-sources st)))
+        for scope = (and (tools:shell-tools-p shell) (tools:shell-tools-scope shell))
+        when scope
+          append (let ((jobs (remove nil (mapcar #'tools:shell-job-unit
+                                                 (tools:shell-tools-jobs shell)))))
+                   (remove-if (lambda (u)
+                                (or (sup:unit-finished-p u)
+                                    (not (eq :shell-job (sup:unit-kind u)))
+                                    (member u jobs :test #'eq)))
+                              (sup:scope-units scope)))))
+
+(defparameter +interrupt-shell-watch-seconds+ 60
+  "How long an interrupt keeps stopping the turn's foreground bash commands.")
+
+(defun %stop-foreground-shell (st)
+  "ACP-2: an interrupt stops the running foreground bash commands, so the
+cancelled run gets its tool result now instead of when the command ends. A
+call the run had already launched may start its command just after the
+interrupt, so a watcher thread stops each foreground command it sees until the
+interrupted turn has ended (bounded). SUP:STOP-UNIT waits, so this never runs
+on the loop thread. The watcher only reads the session's state."
+  (let ((turn (%s-turn st)))
+    (when turn
+      (bt:make-thread
+       (lambda ()
+         (loop with deadline = (+ (get-internal-real-time)
+                                  (* +interrupt-shell-watch-seconds+ internal-time-units-per-second))
+               while (and (eq turn (%s-turn st)) (not (code-turn-done-p turn))
+                          (< (get-internal-real-time) deadline))
+               do (dolist (u (handler-case (%foreground-shell-units st)
+                               (error () nil)))
+                    (handler-case (sup:stop-unit u :grace 1)
+                      (error () nil)))
+                  (sleep 0.1)))
+       :name "cl-stack-code interrupt"))))
+
 (defun %interrupt (st session)
   "Loop thread. → T when a turn was running or waiting."
   (case (%s-state st)
@@ -1127,6 +1220,7 @@ again, the run dropped."
      (setf (%s-interrupted st) t)
      (let ((target (or (%s-run st) (%s-handle st))))
        (when target (agent:cancel-agent-run target)))
+     (%stop-foreground-shell st)
      t)
     (:waiting
      (setf (%s-interrupted st) t)
@@ -1137,6 +1231,39 @@ again, the run dropped."
 (defun client-interrupt (session)
   (%on-client-loop ((code-session-client session))
     (%interrupt (%live session) session)))
+
+;;; ACP-2: the permission mode of an open session, and its record.
+
+(defun client-set-permission-mode (session mode)
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (permission-mode-name mode)        ; another keyword → CODE-USAGE-ERROR
+      (%check-idle session st)
+      (let* ((mode (or mode :default))
+             (settings (merge-settings (%s-settings st) (make-settings :permission-mode mode)))
+             (agent (%s-agent st)))
+        (when (settings-lisp-image settings)
+          (check-lisp-image-settings settings mode))
+        ;; Leaving plan mode: the working directory's tools again; the plan
+        ;; stays open on disk (the next plan-mode turn reopens it).
+        (when (and (%s-plan st) (not (eq mode :plan)))
+          (%restore-cwd-tools st))
+        (setf (%s-settings st) settings
+              (%s-mode st) mode
+              (code-session-permission-mode session) mode
+              (agent:ai-agent-settings agent) (%agent-settings (%s-cwd st) settings)
+              ;; The next turn starts a new run on SESSION-TURNS.
+              (%s-run st) nil
+              (%s-handle st) nil)
+        (unless (%s-plan st)
+          (setf (agent:ai-agent-permissions agent) (%agent-permissions settings)))
+        mode))))
+
+(defun client-export-session (session &key (format :json))
+  (%on-client-loop ((code-session-client session))
+    (%live session)
+    (with-output-to-string (s)
+      (export-session (code-session-store session) s :format format))))
 
 ;;; Approvals.
 

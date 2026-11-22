@@ -10,6 +10,10 @@
 ;;;   (:error "message")                  GENERATE signals an ERROR
 ;;;   (:gate GATE STEP)                   wait until GATE is open (OPEN-GATE),
 ;;;                                       then answer with STEP (H3b)
+;;;   (:think "thought" STEP)             ACP-2: a thinking part, then STEP: the
+;;;                                       thought is streamed first, as word-sized
+;;;                                       LLM-THINKING-PART deltas, and is the
+;;;                                       response's first part
 ;;;
 ;;; Tool call ids are "call-<step>-<i>". Every response reports usage
 ;;; input 10, output 5, cache read 2, cache write 1. STREAM-GENERATE sends
@@ -116,6 +120,13 @@
              (%ungated (third step)))
       step))
 
+(defun %thought (step)
+  "→ (values thought step): a (:think \"thought\" STEP) step's thought and
+its STEP (ungated), else \"\" and STEP."
+  (if (and (consp step) (eq (first step) :think))
+      (values (second step) (%ungated (third step)))
+      (values "" step)))
+
 (defun %respond (backend turns tools on-part &optional model settings)
   (let ((n (bt:with-lock-held ((%lock backend))
              (push (make-instance 'scripted-request
@@ -128,19 +139,24 @@
     (when (> n (length (scripted-steps backend)))
       (error "scripted backend: no step ~d (the script has ~d)"
              n (length (scripted-steps backend))))
-    (multiple-value-bind (text calls) (%step-parts (%ungated (nth (1- n) (scripted-steps backend))) n)
-      (when on-part
-        (dolist (w (%words text))
-          (funcall on-part (llm:make-llm-text-part :text w)))
-        (dolist (c calls)
-          (funcall on-part c)))
-      (llm:make-llm-response
-       :parts (append (and (plusp (length text))
-                           (list (llm:make-llm-text-part :text text)))
-                      calls)
-       :model "scripted"
-       :finish-reason (if calls :tool-use :stop)
-       :usage (%usage)))))
+    (multiple-value-bind (thought step) (%thought (%ungated (nth (1- n) (scripted-steps backend))))
+      (multiple-value-bind (text calls) (%step-parts step n)
+        (when on-part
+          (dolist (w (%words thought))
+            (funcall on-part (llm:make-llm-thinking-part :text w)))
+          (dolist (w (%words text))
+            (funcall on-part (llm:make-llm-text-part :text w)))
+          (dolist (c calls)
+            (funcall on-part c)))
+        (llm:make-llm-response
+         :parts (append (and (plusp (length thought))
+                             (list (llm:make-llm-thinking-part :text thought)))
+                        (and (plusp (length text))
+                             (list (llm:make-llm-text-part :text text)))
+                        calls)
+         :model "scripted"
+         :finish-reason (if calls :tool-use :stop)
+         :usage (%usage))))))
 
 (defmethod llm:generate ((backend scripted-backend) turns &key model settings tools
                          tool-choice output)
