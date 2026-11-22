@@ -582,8 +582,3 @@
 
 (defparameter +version+ "0.10.0"
   "The product version, as in the .asd.")
-
-(defun %r4d4b-pending (what)
-  "R4d-4b contract stub: WHAT is not implemented yet. The implementation removes
-this function and every call of it (src/sandbox.lisp)."
-  (error "R4d-4b: ~a is not implemented yet" what))

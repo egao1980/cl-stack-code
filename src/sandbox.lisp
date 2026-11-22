@@ -116,9 +116,9 @@
 ;;; mode (H4b's check): confining the area's image is H5d.
 ;;;
 ;;; Given code: the variable, the constants, the PLAN-SANDBOX class and
-;;; readers, PLAN-SANDBOX-CONFINED-P, PLAN-SANDBOX-TOOL-KEYS. Every other
-;;; function here is a %R4D4B-PENDING stub; the wiring in the hosts is the
-;;; implementation's.
+;;; readers, PLAN-SANDBOX-CONFINED-P, PLAN-SANDBOX-TOOL-KEYS. The functions
+;;; below implement the rest; each host wires them (src/headless.lisp,
+;;; src/program.lisp, src/client.lisp).
 
 (defvar *plan-compute-backend* :default
   "R4d-4b: the confining backend plan mode uses: :DEFAULT (the per-OS backend,
@@ -173,51 +173,143 @@ result of OPEN-PLAN-SANDBOX, changed by PLAN-SANDBOX-REFUSED."))
        (list :confinement (plan-sandbox-confinement sandbox)
              :compute-backend (plan-sandbox-backend sandbox))))
 
-;;; Stubs.
+
+;;; The backend.
 
 (defun default-plan-compute-backend ()
   "→ a fresh confining backend for this OS (seatbelt on macOS, landlock on
 Linux), or NIL (Windows until R4e-1, other platforms)."
-  (%r4d4b-pending "default-plan-compute-backend"))
+  #+darwin (stack-compute-seatbelt:make-seatbelt-backend)
+  #+linux (stack-compute-landlock:make-landlock-backend)
+  #-(or darwin linux) nil)
 
 (defun plan-compute-backend ()
   "→ *PLAN-COMPUTE-BACKEND* resolved: :DEFAULT → (DEFAULT-PLAN-COMPUTE-BACKEND),
 NIL → NIL, a backend → itself; anything else → TYPE-ERROR."
-  (%r4d4b-pending "plan-compute-backend"))
+  (let ((value *plan-compute-backend*))
+    (etypecase value
+      ((eql :default) (default-plan-compute-backend))
+      (null nil)
+      (sc:confining-backend value))))
+
+;;; The confinement.
 
 (defun plan-scratch-directory (plan)
   "→ <PLAN-DIRECTORY PLAN>/scratch/ (a directory pathname), created with its
 cache/ subdirectory on the first call. Outside the area."
-  (declare (ignore plan))
-  (%r4d4b-pending "plan-scratch-directory"))
+  (let ((scratch (merge-pathnames "scratch/"
+                                  (uiop:ensure-directory-pathname (plan-directory plan)))))
+    (ensure-directories-exist (merge-pathnames "cache/" scratch))
+    scratch))
 
 (defun plan-confinement (plan settings)
   "→ the STACK-COMPUTE:CONFINEMENT of PLAN's shell under SETTINGS (see the file
 header, THE CONFINEMENT)."
-  (declare (ignore plan settings))
-  (%r4d4b-pending "plan-confinement"))
+  (multiple-value-bind (network extra) (sandbox-settings settings)
+    (dolist (dir extra)
+      (unless (uiop:directory-exists-p dir)
+        (error 'settings-error :key "sandbox.extraWritable" :file nil
+                               :message (format nil "~a is not a directory"
+                                                (uiop:native-namestring dir)))))
+    (let ((scratch (plan-scratch-directory plan)))
+      (sc:make-confinement
+       :writable (mapcar #'sc:physical-path (list* (plan-root plan) scratch extra))
+       :read :all
+       :deny-read :default
+       :network network
+       :env-mode :scrub
+       :env (list (cons "XDG_CACHE_HOME"
+                        (uiop:native-namestring (merge-pathnames "cache/" scratch))))
+       :tmp :private))))
+
+;;; The probe.
+
+(defun %first-nonblank-line (text)
+  "The first line of TEXT that is not blank, trimmed, or NIL."
+  (and (stringp text)
+       (loop with start = 0
+             for end = (position-if (lambda (ch) (member ch '(#\Newline #\Return))) text
+                                    :start start)
+             for line = (string-trim '(#\Space #\Tab) (subseq text start end))
+             when (plusp (length line)) return line
+             while end
+             do (setf start (1+ end)))))
+
+(defun %plan-sandbox-canary (backend confinement plan)
+  "Step 5 of the probe: → NIL when `exit 0` ran confined in PLAN's area and
+exited 0, else the reason (a string)."
+  (handler-case
+      (let ((result (sc:run-confined backend confinement
+                                     (append (tools:default-shell) (list "exit 0"))
+                                     :directory (plan-root plan)
+                                     :wall-clock +plan-sandbox-canary-timeout+)))
+        (cond ((null result) "the sandbox canary failed: exit NIL")
+              ((eql 0 (sc:sandbox-result-exit-code result)) nil)
+              (t (format nil "the sandbox canary failed: exit ~a~@[: ~a~]"
+                         (sc:sandbox-result-exit-code result)
+                         (%first-nonblank-line (sc:sandbox-result-stderr result))))))
+    ;; SANDBOX-TIMEOUT is a COMPUTE-ERROR: unwinding past it is fine (RUN-CONFINED
+    ;; killed the tree and releases the launch). A launch that cannot even be
+    ;; spawned (a PROCESS-ERROR) fails closed the same way.
+    ((or sc:compute-error pp:process-error) (e)
+      (format nil "the sandbox canary failed: ~a" e))))
+
+(defun %plan-sandbox-probe (plan settings backend)
+  "Steps 1-5 of the probe. → (values reason confinement); REASON NIL = confined."
+  (let ((confinement nil))
+    (flet ((fail (reason) (return-from %plan-sandbox-probe (values reason confinement))))
+      (unless backend (fail +no-sandbox-backend-reason+))
+      (setf confinement (plan-confinement plan settings))
+      (multiple-value-bind (ok why) (sc:confinement-available-p backend)
+        (unless ok (fail (if (and (stringp why) (plusp (length why))) why "unavailable"))))
+      ;; Never CHECK-CONFINEMENT's USE-VALUE: no weaker policy is acceptable.
+      (handler-case (sc:check-confinement backend confinement)
+        (sc:compute-error (e) (fail (princ-to-string e))))
+      (values (%plan-sandbox-canary backend confinement plan) confinement))))
 
 (defun open-plan-sandbox (plan settings &key (backend (plan-compute-backend)))
   "→ a PLAN-SANDBOX for PLAN under SETTINGS, probed through BACKEND (see the
 file header, THE PROBE); PLAN-SANDBOX-UNAVAILABLE with sandbox.failIfUnavailable."
-  (declare (ignore plan settings backend))
-  (%r4d4b-pending "open-plan-sandbox"))
+  (multiple-value-bind (reason confinement) (%plan-sandbox-probe plan settings backend)
+    (cond ((null reason)
+           (make-instance 'plan-sandbox :plan plan :status :confined
+                                        :backend backend :confinement confinement))
+          ((nth-value 2 (sandbox-settings settings))
+           (error 'plan-sandbox-unavailable :plan plan :reason reason :backend backend))
+          (t
+           (make-instance 'plan-sandbox :plan plan :status :unavailable
+                                        :backend backend :confinement confinement
+                                        :reason reason)))))
 
 (defun plan-sandbox-refused (sandbox cause)
   "A confined command was refused mid-session: SANDBOX becomes :REFUSED with
 reason (PRINC-TO-STRING CAUSE) (CAUSE: the STACK-COMPUTE:COMPUTE-ERROR, or a
 string). → T the first time, NIL when SANDBOX was already :REFUSED (reason
 kept). An :UNAVAILABLE sandbox is left as it is (→ NIL)."
-  (declare (ignore sandbox cause))
-  (%r4d4b-pending "plan-sandbox-refused"))
+  (when (eq :confined (plan-sandbox-status sandbox))
+    (setf (%plan-sandbox-status sandbox) :refused
+          (%plan-sandbox-reason sandbox) (princ-to-string cause))
+    t))
+
+;;; Texts.
+
+(defun %plan-sandbox-id8 (sandbox)
+  (let ((id (plan-id (plan-sandbox-plan sandbox))))
+    (subseq id 0 (min 8 (length id)))))
 
 (defun plan-sandbox-notice (sandbox)
   "→ the notice for SANDBOX, or NIL while :CONFINED:
   :UNAVAILABLE \"plan <id8>: no sandbox (<reason>); bash and job_input ask before each command\"
   :REFUSED     \"plan <id8>: the sandbox refused a command (<reason>); bash and job_input ask before each command from the next turn\"
 <id8> = the first 8 characters of the plan id."
-  (declare (ignore sandbox))
-  (%r4d4b-pending "plan-sandbox-notice"))
+  (ecase (plan-sandbox-status sandbox)
+    (:confined nil)
+    (:unavailable
+     (format nil "plan ~a: no sandbox (~a); bash and job_input ask before each command"
+             (%plan-sandbox-id8 sandbox) (plan-sandbox-reason sandbox)))
+    (:refused
+     (format nil "plan ~a: the sandbox refused a command (~a); bash and job_input ask before each command from the next turn"
+             (%plan-sandbox-id8 sandbox) (plan-sandbox-reason sandbox)))))
 
 (defun plan-sandbox-section (sandbox)
   "→ the system prompt section for SANDBOX:
@@ -226,8 +318,11 @@ kept). An :UNAVAILABLE sandbox is left as it is (→ NIL)."
              job_input call asks the user first, and a headless run (-p)
              refuses it. Prefer the file tools; they stay inside the plan area.\"
 (one line after the heading)."
-  (declare (ignore sandbox))
-  (%r4d4b-pending "plan-sandbox-section"))
+  (if (plan-sandbox-confined-p sandbox)
+      (format nil "# Sandbox~%~a"
+              (tools:confinement-description (plan-sandbox-confinement sandbox)))
+      (format nil "# Sandbox~%There is no sandbox: ~a. Each bash and job_input call asks the user first, and a headless run (-p) refuses it. Prefer the file tools; they stay inside the plan area."
+              (plan-sandbox-reason sandbox))))
 
 (defun plan-sandbox-object (sandbox)
   "→ the JSON object (an EQUAL hash table) of SANDBOX for the plan events:
@@ -237,13 +332,62 @@ kept). An :UNAVAILABLE sandbox is left as it is (→ NIL)."
   \"writable\" the confinement's writable directories (a vector of native
              namestrings, the area first), or :NULL without one
   \"reason\"   the reason, or :NULL while :CONFINED"
-  (declare (ignore sandbox))
-  (%r4d4b-pending "plan-sandbox-object"))
+  (let ((object (make-hash-table :test #'equal))
+        (backend (plan-sandbox-backend sandbox))
+        (confinement (plan-sandbox-confinement sandbox)))
+    (flet ((network-name (network)
+             (if (symbolp network)
+                 (string-downcase (symbol-name network))
+                 "policy")))
+      (setf (gethash "status" object) (string-downcase (symbol-name (plan-sandbox-status sandbox)))
+            (gethash "backend" object) (if backend
+                                           (string-downcase
+                                            (symbol-name (class-name (class-of backend))))
+                                           :null)
+            (gethash "network" object) (if confinement
+                                           (network-name (sc:confinement-network confinement))
+                                           :null)
+            (gethash "writable" object) (if confinement
+                                            (map 'vector #'uiop:native-namestring
+                                                 (sc:confinement-writable confinement))
+                                            :null)
+            (gethash "reason" object) (or (plan-sandbox-reason sandbox) :null)))
+    object))
 
 (defun plan-sandbox-refusal-result (sandbox name)
   "→ the tool result text for tool NAME after a refusal of SANDBOX:
 \"Tool <name> was not run: the sandbox refused it (<reason>). Nothing ran. From
 the next turn, bash and job_input ask the user before each command; until
 then, continue with the file tools.\""
-  (declare (ignore sandbox name))
-  (%r4d4b-pending "plan-sandbox-refusal-result"))
+  (format nil "Tool ~a was not run: the sandbox refused it (~a). Nothing ran. From the next turn, bash and job_input ask the user before each command; until then, continue with the file tools."
+          name (plan-sandbox-reason sandbox)))
+
+;;; Host helpers (not exported): the refusal handler and the shell's state.
+
+(defun %plan-sandbox-refusal-handler (sandbox-fn notify)
+  "→ a HANDLER-BIND function for AI-AGENT-PROTOCOL:AGENT-TOOL-ERROR (see the
+file header, A REFUSAL MID-SESSION). SANDBOX-FN, of the condition, gives the
+host's current PLAN-SANDBOX or NIL; NOTIFY (or NIL) gets the notice text the
+first time. Declines every other tool error and every refusal outside a
+plan sandbox that was confined (the default tool result stays)."
+  (lambda (condition)
+    (let ((cause (agent:agent-tool-error-cause condition)))
+      (when (typep cause 'tools:shell-confinement-refused)
+        (let ((sandbox (funcall sandbox-fn condition)))
+          (when (and sandbox (member (plan-sandbox-status sandbox) '(:confined :refused)))
+            (when (and (plan-sandbox-refused sandbox
+                                             (or (tools:shell-confinement-refused-cause cause)
+                                                 cause))
+                       notify)
+              (funcall notify (plan-sandbox-notice sandbox)))
+            ;; The innermost USE-VALUE: the agent loop's tool restart.
+            (use-value (plan-sandbox-refusal-result
+                        sandbox (or (agent:agent-tool-error-name condition) "bash")))))))))
+
+(defun %plan-shell-stale-p (sandbox sources)
+  "True when SOURCES' shell tools are still confined but SANDBOX no longer is
+(:REFUSED): the host rebuilds them at the next turn's start."
+  (and sandbox
+       (eq :refused (plan-sandbox-status sandbox))
+       (tools:shell-tools-confinement (second sources))
+       t))

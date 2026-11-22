@@ -347,6 +347,11 @@
                      :documentation "The agent's working-directory instructions while a plan is open.")
    (user-config-dir :initarg :user-config-dir :initform nil :reader %cp-user-config-dir
                     :documentation "The user config directory (for ASSEMBLE-SYSTEM-PROMPT).")
+   ;; R4d-4b
+   (plan-backend :initarg :plan-backend :initform nil :reader %cp-plan-backend
+                 :documentation "PLAN-COMPUTE-BACKEND, resolved by MAKE-CODE-PROGRAM (its thread).")
+   (plan-sandbox :initform nil :accessor %cp-plan-sandbox
+                 :documentation "Loop thread: the open plan's PLAN-SANDBOX, or NIL.")
    (drift-paths :initform '() :accessor %cp-drift-paths
                 :documentation "The paths of the last (:plan-drift …) sent, for the drift dialog.")
    ;; H5b
@@ -466,6 +471,8 @@ configuration errors of -p signal here."
                              :data-dir data-dir
                              :user-config-dir config
                              :checkpointer checkpointer
+                             ;; R4d-4b: here, not on the agent thread.
+                             :plan-backend (plan-compute-backend)
                              :image-link link
                              :supervisor supervisor
                              :unit-tools (code-unit-tools sources)
@@ -528,7 +535,12 @@ in it becomes an :error message."
          (agent:*off-loop-specials*
            (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                   agent:*off-loop-specials*)))
-    (handler-bind ((agent:agent-approval-required
+    (handler-bind ((agent:agent-tool-error
+                     ;; R4d-4b: a confined bash the backend refused.
+                     (%plan-sandbox-refusal-handler
+                      (lambda (c) (declare (ignore c)) (%cp-plan-sandbox program))
+                      (lambda (notice) (%send program (list :notice notice)))))
+                   (agent:agent-approval-required
                      (lambda (c)
                        ;; Only bypassPermissions answers; otherwise the run pauses.
                        (when (eq (%cp-mode program) :bypass-permissions)
@@ -800,7 +812,12 @@ notices (lisp-mcp/agent has no way to queue them again)."
          (agent (%cp-agent program))
          (agent-settings (agent:ai-agent-settings agent)))
     (setf (%cp-mode program) mode
-          (agent:ai-agent-permissions agent) (%agent-permissions settings)
+          ;; R4d-4b: while a plan's sandbox is open its rules hold (the shell
+          ;; allows only while confined).
+          (agent:ai-agent-permissions agent) (let ((sandbox (%cp-plan-sandbox program)))
+                                               (if (and sandbox (eq mode :plan))
+                                                   (%plan-permissions settings sandbox)
+                                                   (%agent-permissions settings)))
           (getf (agent:agent-settings-extra agent-settings) :permission-policy)
           ;; The run's settings are this object (RUN-AI-AGENT-ASYNC without
           ;; :settings uses the agent's), read on every permission check.
@@ -1309,52 +1326,101 @@ goes back to the input)."
    (uiop:pathname-parent-directory-pathname
     (uiop:ensure-directory-pathname (%cp-sessions-dir program)))))
 
+(defun %program-plan-settings (program)
+  "The settings the plan's tools and rules use: mode :PLAN, the image off."
+  (merge-settings (%cp-settings program)
+                  (make-settings :permission-mode :plan
+                                 ;; H4b: the image stays with the working
+                                 ;; directory's sources.
+                                 :lisp-image '(:image (:off)))))
+
+(defun %program-plan-agent (program plan settings sandbox)
+  "Make the area's tool sources for PLAN (confined while SANDBOX is), and
+→ (values sources instructions). H8d: on the program's supervisor, under an
+:agent scope \"plan-<id8>\"."
+  (let* ((agent (%cp-agent program))
+         (sup (code-program-supervisor program))
+         (sources (apply #'make-code-tools (plan-tool-root plan (%cp-cwd program))
+                         :settings settings
+                         :supervisor sup
+                         :scope (%plan-unit-scope sup plan)
+                         (plan-sandbox-tool-keys sandbox))))
+    (handler-bind ((error (lambda (e)
+                            (declare (ignore e))
+                            (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                                                   :shell-tools (list (second sources))))))
+      (let ((offered (loop for source in sources
+                           append (mapcar #'llm:llm-tool-name
+                                          (agent:list-agent-tools source)))))
+        (values sources
+                (assemble-system-prompt
+                 (%cp-cwd program) :tools offered :backend (agent:ai-agent-backend agent)
+                                   :settings settings
+                                   :user-config-dir (%cp-user-config-dir program)
+                                   :plan plan :sandbox sandbox))))))
+
 (defun %ensure-plan (program)
   "Open or reopen the plan when none is open; swap the agent's tools and
-instructions to the area and drop the run; send (:plan-opened …)."
-  (unless (%cp-plan program)
-    (let* ((cwd (%cp-cwd program))
-           (data-dir (%program-data-dir program))
-           (session (%cp-session program))
-           (entry (%head-plan-entry session))
-           (plan (or (and entry (eq :open (getf entry :status))
-                          (handler-case (reopen-plan (plans-directory cwd :data-dir data-dir)
-                                                     (getf entry :id))
-                            (plan-not-found () nil)))
-                     (open-plan (%cp-project-dir program) :kind :auto :data-dir data-dir
-                                                          :session-id (session-id session))))
-           (agent (%cp-agent program))
-           (settings (merge-settings (%cp-settings program)
-                                     (make-settings :permission-mode :plan
-                                                   ;; H4b: the image stays with the
-                                                   ;; working directory's sources.
-                                                   :lisp-image '(:image (:off)))))
-           ;; H8d: the area's tools on the program's supervisor, under an
-           ;; :agent scope "plan-<id8>".
-           (sup (code-program-supervisor program))
-           (sources (make-code-tools (plan-tool-root plan cwd) :settings settings
-                                                               :supervisor sup
-                                                               :scope (%plan-unit-scope sup plan))))
-      (handler-bind ((error (lambda (e)
-                              (declare (ignore e))
-                              (%close-code-units nil :unit-tools (list (code-unit-tools sources))
-                                                     :shell-tools (list (second sources))))))
-        (let* ((offered (loop for source in sources
-                              append (mapcar #'llm:llm-tool-name
-                                             (agent:list-agent-tools source))))
-               (instructions (assemble-system-prompt
-                              cwd :tools offered :backend (agent:ai-agent-backend agent)
-                                  :settings settings
-                                  :user-config-dir (%cp-user-config-dir program)
-                                  :plan plan)))
+instructions to the area and drop the run; send (:plan-opened …). R4d-4b: the
+plan's sandbox is probed when it opens (failIfUnavailable: the plan does not
+open); while a plan is open, a sandbox that refused a command gets unconfined
+shell tools that ask (%REFRESH-PLAN-SHELL)."
+  (if (%cp-plan program)
+      (%refresh-plan-shell program)
+      (let* ((cwd (%cp-cwd program))
+             (data-dir (%program-data-dir program))
+             (session (%cp-session program))
+             (entry (%head-plan-entry session))
+             (reopened (and entry (eq :open (getf entry :status))
+                            (handler-case (reopen-plan (plans-directory cwd :data-dir data-dir)
+                                                       (getf entry :id))
+                              (plan-not-found () nil))))
+             (plan (or reopened
+                       (open-plan (%cp-project-dir program) :kind :auto :data-dir data-dir
+                                                            :session-id (session-id session))))
+             (agent (%cp-agent program))
+             (settings (%program-plan-settings program))
+             (sandbox (handler-bind ((plan-sandbox-unavailable
+                                       (lambda (e)
+                                         (declare (ignore e))
+                                         ;; A fresh plan does not stay open behind it.
+                                         (unless reopened (reject-plan plan)))))
+                        (open-plan-sandbox plan settings :backend (%cp-plan-backend program)))))
+        (multiple-value-bind (sources instructions)
+            (%program-plan-agent program plan settings sandbox)
           (setf (%cp-cwd-instructions program) (agent:ai-agent-instructions agent)
                 (agent:ai-agent-tools agent) sources
                 (agent:ai-agent-instructions agent) instructions
+                (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
                 (%cp-plan program) plan
-                (%cp-plan-sources program) sources)))
-      (%drop-run program)
-      (%send program (list :plan-opened :id (plan-id plan) :kind (plan-kind plan)
-                                        :root (uiop:native-namestring (plan-root plan)))))))
+                (%cp-plan-sources program) sources
+                (%cp-plan-sandbox program) sandbox))
+        (%drop-run program)
+        (%send program (list :plan-opened :id (plan-id plan) :kind (plan-kind plan)
+                                          :root (uiop:native-namestring (plan-root plan))))
+        (let ((notice (plan-sandbox-notice sandbox)))
+          (when notice
+            (%send program (list :notice notice)))))))
+
+(defun %refresh-plan-shell (program)
+  "R4d-4b, at a turn's start: after a refusal the plan's shell tools are made
+again without the confinement, the rules lose the shell allows (bash and
+job_input ask; denied with failIfUnavailable), the old sources are closed and
+the run is dropped (the agent sees the new tools)."
+  (let ((sandbox (%cp-plan-sandbox program))
+        (old (%cp-plan-sources program)))
+    (when (%plan-shell-stale-p sandbox old)
+      (let ((settings (%program-plan-settings program))
+            (agent (%cp-agent program)))
+        (multiple-value-bind (sources instructions)
+            (%program-plan-agent program (%cp-plan program) settings sandbox)
+          (setf (agent:ai-agent-tools agent) sources
+                (agent:ai-agent-instructions agent) instructions
+                (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
+                (%cp-plan-sources program) sources))
+        (%close-code-units nil :unit-tools (list (code-unit-tools old))
+                               :shell-tools (list (second old)))
+        (%drop-run program)))))
 
 (defun %restore-cwd-agent (program)
   "The plan closed: the agent gets the working directory's tools and
@@ -1366,7 +1432,12 @@ instructions back, the run is dropped."
       (setf (agent:ai-agent-instructions agent) (%cp-cwd-instructions program)))
     (setf (%cp-plan program) nil
           (%cp-plan-sources program) nil
+          (%cp-plan-sandbox program) nil
           (%cp-turn-plan program) nil)
+    ;; R4d-4b: the rules of the mode, without the plan's sandbox.
+    (setf (agent:ai-agent-permissions agent)
+          (%agent-permissions (merge-settings (%cp-settings program)
+                                              (make-settings :permission-mode (%cp-mode program)))))
     ;; H8d: the area's unit tools, then its shell tools.
     (%close-code-units nil :unit-tools (list (code-unit-tools sources))
                            :shell-tools (list (second sources)))

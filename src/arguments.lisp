@@ -299,6 +299,7 @@ permission mode (flags over settings); otherwise CODE-USAGE-ERROR:
   --on-drift without --apply or --rewind  → \"--on-drift needs --apply or --rewind\"
   --apply with a prompt and MODE not :PLAN, or --plan-area with MODE not :PLAN
                                           → \"--apply and --plan-area need --permission-mode plan\"
+  --allow-network with MODE not :PLAN     → \"--allow-network needs --permission-mode plan\"
 An action-only invocation (--apply or --reject, --resume or --continue, no
 prompt) does not need plan mode; it acts on the session's open plan."
   (let* ((apply-p (invocation-apply-p invocation))
@@ -316,7 +317,15 @@ prompt) does not need plan mode; it acts on the session's open plan."
                (or (and apply-p (or prompt (not resumed)))
                    (invocation-plan-area invocation)))
       (%usage-fail "--apply and --plan-area need --permission-mode plan"))
+    ;; R4d-4b
+    (when (and (not plan-mode-p) (invocation-allow-network-p invocation))
+      (%usage-fail "--allow-network needs --permission-mode plan"))
     t))
+
+(defun invocation-allow-network-p (invocation)
+  "R4d-4b: true when INVOCATION has --allow-network (the flag layer's
+sandbox.network \"allow\")."
+  (eq :allow (getf (settings-sandbox (invocation-settings invocation)) :network)))
 
 ;;; H5b: rewind flags.
 

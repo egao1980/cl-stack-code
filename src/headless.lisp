@@ -462,19 +462,40 @@ SOURCE, or a new session (--session-id or a random id)."
                 (steer:make-instruction-discovery cwd :names +instruction-file-names+
                                                       :include-root nil))))
 
-(defun %agent-permissions (settings)
+(defun %agent-permissions (settings &key (plan-shell-allowed t))
   "The agent's rule list. The lowest rule makes a shell command's program:
 resources neutral for allows, so bash(SPEC) decides a simple command whose
 words match it (as in Claude Code); with no bash rule the call still asks,
-and every settings or flag rule comes later and wins."
+and every settings or flag rule comes later and wins. R4d-4b:
+PLAN-SHELL-ALLOWED goes to SETTINGS-PERMISSION-RULES."
   (cons (agent:make-permission-rule "bash" "program:*" :allow)
-        (settings-permission-rules settings)))
+        (settings-permission-rules settings :plan-shell-allowed plan-shell-allowed)))
 
-(defun %drive (agent prompt report mode)
+(defun %plan-permissions (settings sandbox)
+  "R4d-4b: plan mode's rule list for SANDBOX (a PLAN-SANDBOX). The plan base
+rules keep bash and job_input allowed only while SANDBOX is :CONFINED; else
+they ask. After a refusal with sandbox.failIfUnavailable, bash and job_input
+are denied (the last rules, so they win) with the refusal text as feedback."
+  (append (%agent-permissions settings :plan-shell-allowed (plan-sandbox-confined-p sandbox))
+          (and (eq :refused (plan-sandbox-status sandbox))
+               (nth-value 2 (sandbox-settings settings))
+               (mapcar (lambda (name)
+                         (agent:make-permission-rule
+                          name "*" :deny
+                          :feedback (plan-sandbox-refusal-result sandbox name)))
+                       +shell-tool-names+))))
+
+(defun %drive (agent prompt report mode &key sandbox error-output)
   "Run AGENT on PROMPT on the bound loop. Approvals are answered headless.
+R4d-4b: with a plan SANDBOX, a confined bash the backend refuses becomes
+PLAN-SANDBOX-REFUSAL-RESULT, the notice going once to ERROR-OUTPUT.
 → (values run failure interrupted-p)."
   (let ((interrupted nil))
-    (handler-bind ((agent:agent-approval-required
+    (handler-bind ((agent:agent-tool-error
+                     (%plan-sandbox-refusal-handler
+                      (lambda (c) (declare (ignore c)) sandbox)
+                      (lambda (notice) (%plan-stderr-line error-output "~a" notice))))
+                   (agent:agent-approval-required
                      (lambda (c)
                        (if (eq mode :bypass-permissions)
                            (agent:invoke-approve c)
@@ -595,7 +616,9 @@ act on the session's open plan, no run, INPUT not read."
 (CHECK-PLAN-FLAGS then refuses the combination)."
   (and (or (eq mode :plan)
            (invocation-apply-p inv) (invocation-reject-p inv)
-           (invocation-on-drift inv) (invocation-plan-area inv))
+           (invocation-on-drift inv) (invocation-plan-area inv)
+           ;; R4d-4b: CHECK-PLAN-FLAGS refuses it outside plan mode.
+           (invocation-allow-network-p inv))
        t))
 
 (defun %plans-dir (cwd data-dir getenv)
@@ -879,6 +902,18 @@ result, then signals its failure."
                 (%headless-plan inv mode cwd store source sessions-dir data-dir getenv
                                 error-output)))))
          (plan (first plan-and-reopened))
+         ;; R4d-4b: the plan's sandbox, probed through the backend resolved
+         ;; here (this thread). failIfUnavailable (exit 1) and a bad
+         ;; extraWritable (exit 2) signal before the model is called.
+         (sandbox
+           (when plan
+             (handler-bind ((error (lambda (e)
+                                     (close-checkpointer checkpointer)
+                                     ;; A fresh plan does not stay open behind it.
+                                     (when (and (typep e 'plan-sandbox-unavailable)
+                                                (not (second plan-and-reopened)))
+                                       (reject-plan plan)))))
+               (open-plan-sandbox plan settings :backend (plan-compute-backend)))))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (supervisor nil)
@@ -897,11 +932,12 @@ result, then signals its failure."
            ;; H8d: the run's supervisor, before the tools.
            (setf supervisor (make-code-supervisor cwd :data-dir data-dir
                                                       :getenv (or getenv #'uiop:getenv))
-                 sources (make-code-tools (if plan (plan-tool-root plan cwd) cwd)
-                                          :settings settings
-                                          :on-image-event (and link (%link-callback link))
-                                          :supervisor supervisor
-                                          :scope (and plan (%plan-unit-scope supervisor plan))))
+                 sources (apply #'make-code-tools (if plan (plan-tool-root plan cwd) cwd)
+                                :settings settings
+                                :on-image-event (and link (%link-callback link))
+                                :supervisor supervisor
+                                :scope (and plan (%plan-unit-scope supervisor plan))
+                                (plan-sandbox-tool-keys sandbox)))
            ;; H4b: the image starts before the system event; its events are
            ;; written and posted on the loop thread.
            (when link
@@ -918,14 +954,17 @@ result, then signals its failure."
              (multiple-value-bind (instructions files)
                  (assemble-system-prompt cwd :tools offered :backend backend
                                              :settings settings :user-config-dir config
-                                             :plan plan :lisp-image (%sources-lisp-tools sources))
+                                             :plan plan :sandbox sandbox
+                                             :lisp-image (%sources-lisp-tools sources))
                (let ((agent (agent:make-ai-agent
                              :name "cl-stack-code"
                              :backend backend
                              :model model
                              :instructions instructions
                              :tools sources
-                             :permissions (%agent-permissions settings)
+                             :permissions (if sandbox
+                                              (%plan-permissions settings sandbox)
+                                              (%agent-permissions settings))
                              :settings (%agent-settings cwd settings)))
                      (root (find-project-root cwd)))
                  (apply #'%emit-event report "system"
@@ -933,10 +972,14 @@ result, then signals its failure."
                                            (and link settings)))
                  (when plan
                    (apply #'%emit-event report "plan"
-                          (%plan-open-keys plan (second plan-and-reopened))))
+                          (%plan-open-keys plan (second plan-and-reopened) sandbox)))
+                 ;; R4d-4b: once, after the plan opened, before the model.
+                 (let ((notice (and sandbox (plan-sandbox-notice sandbox))))
+                   (when notice (%plan-stderr-line error-output "~a" notice)))
                  (let ((pre (begin-checkpoint-turn checkpointer store)))
                    (multiple-value-bind (run failure interrupted)
-                       (%drive agent (append history (list (llm:user-turn prompt))) report mode)
+                       (%drive agent (append history (list (llm:user-turn prompt))) report mode
+                               :sandbox sandbox :error-output error-output)
                      (when plan
                        (%headless-plan-finish report plan inv run
                                               (or (%report-failure report) failure)
@@ -975,13 +1018,15 @@ result, then signals its failure."
          ;; H4b: only with the image on.
          (and image-settings (list "lisp_image" (%lisp-image-object image-settings)))))
 
-(defun %plan-open-keys (plan reopened-p)
-  "The plan \"opened\" / \"reopened\" event's keys and values."
-  (list "subtype" (if reopened-p "reopened" "opened")
-        "plan_id" (plan-id plan)
-        "kind" (string-downcase (string (plan-kind plan)))
-        "area" (uiop:native-namestring (plan-root plan))
-        "base" (plan-base plan)))
+(defun %plan-open-keys (plan reopened-p &optional sandbox)
+  "The plan \"opened\" / \"reopened\" event's keys and values. R4d-4b: with
+a SANDBOX, \"sandbox\" is its PLAN-SANDBOX-OBJECT."
+  (list* "subtype" (if reopened-p "reopened" "opened")
+         "plan_id" (plan-id plan)
+         "kind" (string-downcase (string (plan-kind plan)))
+         "area" (uiop:native-namestring (plan-root plan))
+         "base" (plan-base plan)
+         (and sandbox (list "sandbox" (plan-sandbox-object sandbox)))))
 
 (defun %headless-image-event (report event)
   "H4b, loop thread: EVENT's image_event line (none for :debugger-return),
