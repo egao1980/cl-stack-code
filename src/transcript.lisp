@@ -204,13 +204,21 @@ NIL when the edit tool would refuse it."
         (when (or (= n 1) (and all (plusp n)))
           (%replace-occurrences old new text all))))))
 
-(defun %preview-texts (root name args)
-  "→ (values rel old new new-file-p) for the call, or NIL."
+(defun %preview-disk-text (root rel)
+  "→ (values text exists-p) of REL under ROOT on the disk; TEXT NIL when it is
+not UTF-8 text, a directory, or leaves ROOT."
+  (multiple-value-bind (file exists) (%preview-file root rel)
+    (values (and file exists (%file-text file)) exists)))
+
+(defun %preview-texts (root name args &key read-file)
+  "→ (values rel old new new-file-p) for the call, or NIL. READ-FILE (rel) →
+(values text exists-p) reads the file (default: the disk under ROOT)."
   (let* ((path (gethash "file_path" args))
          (rel (and (stringp path) (%preview-rel path))))
     (when rel
-      (multiple-value-bind (file exists) (%preview-file root rel)
-        (let ((old (and file exists (%file-text file))))
+      (multiple-value-bind (old exists)
+          (if read-file (funcall read-file rel) (%preview-disk-text root rel))
+        (progn
           (cond ((string= name "write")
                  (let ((content (gethash "content" args)))
                    (cond ((not (stringp content)) nil)
@@ -228,6 +236,21 @@ NIL when the edit tool would refuse it."
                                               (%apply-preview-edit text edit)))
                            unless text do (return-from %preview-texts nil))
                      (values rel old text nil))))))))))
+
+(defun tool-call-texts (root name input &key read-file)
+  "ACP-2: → (values rel old new new-file-p) of a write / edit / multi_edit call
+NAME with INPUT under ROOT: REL the root-relative path, OLD the file's whole
+text before the call (\"\" for a new file, NEW-FILE-P true), NEW the whole
+text the call would leave, with the edit tool's matching rules (TOOL-CALL-
+PREVIEW's); NIL for another tool, bad arguments, a path outside ROOT, a file
+that is not text, or an edit that would not apply. READ-FILE (lambda (rel)) →
+(values text exists-p) reads the file instead of the disk (e.g. an editor's
+buffer). Never signals."
+  (handler-case
+      (let ((args (%decode-object input)))
+        (when (and args (member name '("edit" "multi_edit" "write") :test #'string=))
+          (%preview-texts root name args :read-file read-file)))
+    (error () nil)))
 
 (defun tool-call-preview (root name input)
   "→ the unified diff the call would make under ROOT, or NIL."

@@ -332,11 +332,18 @@ the run is canceled and the error fails the run afterwards."
          ;; H4b: events queued before the run reach its first step.
          (%post-if-going (%report-image-tools report) payload))
         (:step (setf (%report-step report) payload))
-        (:part (when (and (llm:llm-text-part-p payload)
-                          (plusp (length (llm:llm-text-part-text payload))))
-                 (%emit-event report "text_delta"
-                              "step" (%report-step report)
-                              "text" (llm:llm-text-part-text payload))))
+        (:part (cond ((and (llm:llm-text-part-p payload)
+                           (plusp (length (llm:llm-text-part-text payload))))
+                      (%emit-event report "text_delta"
+                                   "step" (%report-step report)
+                                   "text" (llm:llm-text-part-text payload)))
+                     ;; ACP-2: streamed thinking, the same shape.
+                     ((and (llm:llm-thinking-part-p payload)
+                           (stringp (llm:llm-thinking-part-text payload))
+                           (plusp (length (llm:llm-thinking-part-text payload))))
+                      (%emit-event report "thinking_delta"
+                                   "step" (%report-step report)
+                                   "text" (llm:llm-thinking-part-text payload)))))
         (:response (%on-response report payload))
         (:permission (%on-permission report payload))
         (:invocation (%on-invocation report payload)))

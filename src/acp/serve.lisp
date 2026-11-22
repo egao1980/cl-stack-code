@@ -14,7 +14,13 @@
 ;;;   CL-STACK-CODE:*ACP-SERVER*, set below when this system loads.
 
 (defun serve-acp (&rest client-args &key input output &allow-other-keys)
-  (declare (ignore client-args input output))
-  (%acp2-pending 'serve-acp))
+  (let ((agent (apply #'make-code-acp-agent
+                      (loop for (key value) on client-args by #'cddr
+                            unless (member key '(:input :output))
+                              append (list key value)))))
+    (unwind-protect
+         (stdio:serve-acp-agent agent :input input :output output)
+      (close-code-acp-agent agent))
+    0))
 
 (setf code:*acp-server* 'serve-acp)

@@ -4,7 +4,13 @@
                     (#:acp #:acp-protocol)
                     (#:stdio #:acp-backend-stdio)
                     (#:json #:json-protocol)
-                    (#:bt #:bordeaux-threads))
+                    (#:bt #:bordeaux-threads)
+                    (#:bt2 #:bordeaux-threads-2)
+                    ;; the client-backed tool backends (bridge.lisp)
+                    (#:agent #:ai-agent-protocol)
+                    (#:tools #:agent-tools)
+                    (#:fs #:cl-stack-pathlib)
+                    (#:dt #:datetime-protocol))
   (:documentation "ACP-2: cl-stack-code as an Agent Client Protocol agent. A
 CODE-ACP-AGENT implements acp-protocol's agent-side generic functions over the
 cl-stack-code SDK (src/client.lisp); SERVE-ACP serves one on stdio

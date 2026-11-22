@@ -30,7 +30,8 @@
 ;;;   thread through RPC-NOTIFY (rpc-backend-stdio writes each line whole).
 ;;;   They can arrive before the response of the request that caused them
 ;;;   (session/new's init, a turn's first events): order by the stream of
-;;;   events, not by responses.
+;;;   events, not by responses. ACP-2: the stream carries thinking_delta
+;;;   events too (one emitter, +EVENT-TYPES+).
 ;;;
 ;;; Methods (+RPC-METHODS+). params is an object (absent = {}); unknown keys
 ;;; are ignored; a missing or mistyped key → -32602 (RPC-INVALID-PARAMS) with
