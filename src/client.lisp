@@ -287,6 +287,8 @@
     "assistant" "tool_use" "tool_result"
     "approval_request" "approval_resolved" "steering" "image_event"
     "plan" "rewind" "session" "result"
+    ;; H3e-1: lazily loaded instruction files and rules
+    "instructions"
     ;; H8d: units/subscribe notifications
     "unit")
   "Every event \"type\" the SDK, -p's stream-json and --rpc can deliver.")

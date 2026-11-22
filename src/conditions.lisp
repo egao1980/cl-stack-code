@@ -384,3 +384,36 @@ not an open subscription of the session.")
              (format s "~a" (or (code-error-message c)
                                 (format nil "no units subscription ~s in this session"
                                         (subscription-not-found-id c)))))))
+
+;;; H3e-1: skills and path-scoped rules. Discovery never lets these escape:
+;;; DISCOVER-SKILLS / DISCOVER-RULES turn each into a note and skip the file.
+
+(define-condition skill-format-error (code-error)
+  ((path :initarg :path :reader skill-format-error-path :initform nil
+         :documentation "The SKILL.md pathname.")
+   (reason :initarg :reason :reader skill-format-error-reason :initform nil
+           :documentation "Why it is skipped: \"no frontmatter\", \"bad frontmatter (…)\",
+\"name is missing\", \"name \\\"X\\\" is not lowercase letters, digits and hyphens
+(at most 64)\", \"name \\\"X\\\" does not match its directory \\\"Y\\\"\" or
+\"description is missing\"."))
+  (:documentation "H3e-1: a SKILL.md that is not an Agent Skill (agentskills.io).")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "skill at ~a: ~a"
+                                        (and (skill-format-error-path c)
+                                             (uiop:native-namestring (skill-format-error-path c)))
+                                        (skill-format-error-reason c)))))))
+
+(define-condition rule-format-error (code-error)
+  ((path :initarg :path :reader rule-format-error-path :initform nil
+         :documentation "The rule file's pathname.")
+   (reason :initarg :reason :reader rule-format-error-reason :initform nil
+           :documentation "Why it is skipped: \"bad frontmatter (…)\" or \"paths must
+be a list of strings or a comma-separated string\"."))
+  (:documentation "H3e-1: a rules/*.md file whose frontmatter cannot be used.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "rule at ~a: ~a"
+                                        (and (rule-format-error-path c)
+                                             (uiop:native-namestring (rule-format-error-path c)))
+                                        (rule-format-error-reason c)))))))

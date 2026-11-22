@@ -14,6 +14,8 @@
                     (#:tui #:tui-protocol)
                     (#:w #:tui-protocol/widgets)
                     (#:md #:tui-markdown)
+                    ;; H3e-1: import tokens come from the parsed markdown
+                    (#:mdp #:markdown-protocol)
                     (#:tty #:tui-backend-tty)
                     (#:rev #:revision-protocol)
                     (#:git #:revision-backend-git)
@@ -558,6 +560,59 @@
    #:unit-control-failed-action
    #:subscription-not-found
    #:subscription-not-found-id
+   ;; H3e-1: @imports, skills, path-scoped rules (src/imports.lisp,
+   ;; src/skills.lisp, src/rules.lisp)
+   #:import-tokens
+   #:resolve-import
+   #:instruction-block
+   #:+max-import-hops+
+   #:load-instruction-context
+   #:instruction-context
+   #:instruction-context-p
+   #:context-files
+   #:context-imports
+   #:context-skills
+   #:context-rules
+   #:context-notes
+   #:context-project-dir
+   #:context-loaded-rules
+   #:skill-roots
+   #:parse-skill-file
+   #:discover-skills
+   #:skill-directory
+   #:skill-source
+   #:skill-listing-section
+   #:make-skill-tools
+   #:skill-tools
+   #:skill-tools-p
+   #:skill-tools-skills
+   #:code-skill-tools
+   #:skill-tool-result
+   #:+skill-tool-name+
+   #:+skill-source-names+
+   #:+skill-listing-budget+
+   #:+max-skill-description-chars+
+   #:+skill-listing-preamble+
+   #:rule-roots
+   #:parse-rule-file
+   #:discover-rules
+   #:rule-patterns
+   #:rule-always-p
+   #:rule-matches-p
+   #:rule-block
+   #:make-code-instruction-discovery
+   #:code-instruction-discovery
+   #:discovery-loaded-rules
+   #:settings-skill-dirs
+   #:settings-context-files
+   #:record-rules
+   #:session-loaded-rules
+   #:skill-format-error
+   #:skill-format-error-path
+   #:skill-format-error-reason
+   #:rule-format-error
+   #:rule-format-error-path
+   #:rule-format-error-reason
    ;; R4d-4b: plan mode's sandbox
    #:*plan-compute-backend*
    #:+no-sandbox-backend-reason+
@@ -591,5 +646,11 @@
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.11.0"
+(defparameter +version+ "0.12.0"
   "The product version, as in the .asd.")
+
+(defun %h3e1-pending (what)
+  "H3e-1 contract stub: WHAT is not implemented yet. The implementation removes
+this function and every call of it (src/imports.lisp, src/skills.lisp,
+src/rules.lisp)."
+  (error "H3e-1: ~a is not implemented yet" what))
