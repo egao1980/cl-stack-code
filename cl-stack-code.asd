@@ -34,13 +34,13 @@
                (:version "http-encoding-zstd" "0.1.1") (:version "http-encoding-brotli" "0.1.1")
                (:version "http-encoding-snappy" "0.1.1")
                ;; H4b
-               (:version "lisp-mcp" "0.7.0")
-               (:version "lisp-mcp/agent" "0.7.0")
+               (:version "lisp-mcp" "0.7.1")
+               (:version "lisp-mcp/agent" "0.7.1")
                ;; H3d
                (:version "rpc-protocol" "0.2.0")
                (:version "rpc-protocol-json" "0.1.1")
                (:version "rpc-backend-stdio" "0.2.0")
-               (:version "repl-protocol" "0.2.8")
+               (:version "repl-protocol" "0.2.9")
                ;; 0.3.3: shell jobs do not inherit an --rpc child's stdio pipes on Windows
                ;; (egao1980/supervisor-protocol#9); 0.3.4: cmd.exe command lines verbatim
                (:version "process-backend-uiop" "0.3.4")
