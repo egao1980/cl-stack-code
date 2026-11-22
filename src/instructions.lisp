@@ -145,12 +145,17 @@ SKILL-LISTING-SECTION of CONTEXT-SKILLS (when there are skills), then
 SETTINGS-APPEND-SYSTEM-PROMPT. → (values prompt files context): FILES is
 CONTEXT-FILES. With INSTRUCTION-SET (an INSTRUCTION-SET with a current
 revision), those blocks are INSTRUCTION-SET-BLOCKS of its current revision
-instead (a rewound or resumed session renders the set it continues). Until
-then CONTEXT is returned as given and unused, and INSTRUCTION-SET is ignored."
-  (declare (ignore instruction-set))
+instead (a rewound or resumed session renders the set it continues). "
   (let* ((settings (or settings (make-settings)))
          (cwd (%truename-directory cwd))
-         (files (instruction-files cwd :user-config-dir user-config-dir))
+         (context (or context
+                      (load-instruction-context cwd :settings settings
+                                                    :user-config-dir user-config-dir)))
+         (files (context-files context))
+         (blocks (if (and instruction-set (instruction-set-current instruction-set))
+                     (instruction-set-blocks (instruction-set-store instruction-set)
+                                             (instruction-set-current instruction-set))
+                     (%context-blocks context)))
          (append-prompt (settings-append-system-prompt settings))
          (sections (append
                     (list (steer:build-system-prompt :tools tools :model backend))
@@ -160,7 +165,15 @@ then CONTEXT is returned as given and unused, and INSTRUCTION-SET is ignored."
                         (list (%environment-section cwd (find-project-root cwd)
                                                     (settings-permission-mode settings))))
                     (and lisp-image (%lisp-image-sections lisp-image settings))
-                    (mapcar #'%instruction-block files)
+                    blocks
                     (and append-prompt (plusp (length append-prompt))
                          (list append-prompt)))))
     (values (format nil "~{~a~^~%~%~}" sections) files context)))
+
+(defun %context-blocks (context)
+  "H3e-1: the instruction blocks of CONTEXT: each file's block (imports
+expanded), each always-on rule's block, then the # Skills section."
+  (append (mapcar (lambda (entry) (getf entry :block)) (%context-file-entries context))
+          (mapcar #'rule-block (remove-if-not #'rule-always-p (context-rules context)))
+          (let ((section (skill-listing-section (context-skills context))))
+            (and section (list section)))))

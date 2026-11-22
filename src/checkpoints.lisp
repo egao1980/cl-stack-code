@@ -433,10 +433,14 @@ on its first write)."
      (loop for part in (getf content :parts)
            for role = (and (%plist-p part) (getf part :role))
            for id = (and (%plist-p part) (getf part :revision))
-           do (unless (and (member role '(:files :conversation)) (stringp id))
+           do (unless (and (member role '(:files :conversation :instructions)) (stringp id))
                 (%checkpoint-fail cs "malformed checkpoint part: ~s" part))
-           collect (if (eq role :files)
-                       (rev:make-manifest-part :files nil id)
+           collect (case role
+                     (:files (rev:make-manifest-part :files nil id))
+                     ;; H3e-1
+                     (:instructions (%instructions-part-from-disk cs session id
+                                                                  (getf part :depends-on)))
+                     (t
                        (handler-case (%conversation-part session id)
                          (rev:revision-error ()
                            ;; Written by another process after this session's last sync.
@@ -444,7 +448,23 @@ on its first write)."
                            (handler-case (%conversation-part session id)
                              (rev:revision-error ()
                                (%checkpoint-fail cs "checkpoint names turn ~a, which is not in session ~a"
-                                                 id (session-id session)))))))))))
+                                                 id (session-id session))))))))))))
+
+(defun %instructions-part (session id depends-on)
+  (rev:make-manifest-part :instructions (session-instruction-store session) id
+                          :depends-on depends-on))
+
+(defun %instructions-part-from-disk (cs session id depends-on)
+  "H3e-1: the :instructions part of a checkpoint read from disk; its store is
+the session's instruction store."
+  (handler-case (%instructions-part session id depends-on)
+    (rev:revision-error ()
+      ;; Written by another process after this session's last sync.
+      (sync-session session)
+      (handler-case (%instructions-part session id depends-on)
+        (rev:revision-error ()
+          (%checkpoint-fail cs "checkpoint names instruction set ~a, which is not in session ~a"
+                            id (session-id session)))))))
 
 (defun %manifest->content (revision)
   "The on-disk content plist of the checkpoint REVISION."
@@ -456,7 +476,13 @@ on its first write)."
                                                :revision (rev:part-revision-id part)))
                                  (:conversation (list :role :conversation :kind :session
                                                       :revision (rev:part-revision-id part)
-                                                      :depends-on (list :files))))))))
+                                                      :depends-on (list :files)))
+                                 ;; H3e-1
+                                 (:instructions
+                                  (append (list :role :instructions :kind :instruction-set
+                                                :revision (rev:part-revision-id part))
+                                          (and (rev:part-depends-on part)
+                                               (list :depends-on (copy-list (rev:part-depends-on part)))))))))))
 
 (defun %persist-checkpoints (cs)
   "Write what CS's memory has and its directory lacks: new revision files
@@ -577,7 +603,9 @@ object, synced from disk)."
                       :message (or (rev:revision-message revision) "")
                       :recorded-at (rev:revision-recorded-at revision)
                       :expired-p (<= ordinal expired-ordinal)
-                      :revision revision)))
+                      :revision revision
+                      :instructions-id (let ((part (%part revision :instructions)))
+                                         (and part (rev:part-revision-id part))))))
 
 (defun session-checkpoints (store &key all)
   "→ the CHECKPOINTs of the SESSION-STORE STORE, oldest first: the retained
@@ -799,8 +827,12 @@ Then GC-CHECKPOINTS. Works whether or not CHECKPOINTER is enabled."
                         (make-instance 'rev:manifest-part :role :files :store part-store
                                                           :revision-id files-id)
                         (rev:make-manifest-part :files part-store files-id)))
-                  (parts (cons files-part
-                               (and turn (list (%conversation-part store (rev:revision-id turn))))))
+                  ;; H3e-1: the instruction set that goes with the conversation part.
+                  (iid (%checkpoint-instructions-id store turn))
+                  (parts (append (list files-part)
+                                 (and turn (list (%conversation-part store (rev:revision-id turn))))
+                                 (and iid (list (%instructions-part
+                                                 store iid (and turn (list :conversation)))))))
                   (revision
                     (rev:commit-composite
                      cs parts
@@ -816,6 +848,16 @@ Then GC-CHECKPOINTS. Works whether or not CHECKPOINTER is enabled."
              (setf (%checkpoint-store-base cs) (rev:revision-id revision))
              (gc-checkpoints checkpointer store)
              (%revision-checkpoint revision (%expired-ordinal cs)))))))))
+
+(defun %checkpoint-instructions-id (store turn)
+  "H3e-1: the instruction-set id of the SESSION-STORE STORE at TURN (a
+revision, or NIL: \"0\"), or NIL when there is none or it is not in the
+instruction store. Its revision is written before the checkpoint names it."
+  (let* ((istore (session-instruction-store store))
+         (id (session-instruction-set store (if turn (rev:revision-id turn) "0"))))
+    (when (and id (%find-set-revision istore id))
+      (%flush-instruction-store istore)
+      id)))
 
 (defun begin-checkpoint-turn (checkpointer store)
   "Before a turn: → the FILES-STATE now, or NIL when CHECKPOINTER is disabled."

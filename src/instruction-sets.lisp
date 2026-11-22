@@ -267,69 +267,461 @@ INSTRUCTION-STORE (see the file header). Make it with MAKE-INSTRUCTION-SET."))
 (defmethod instruction-set-components ((set instruction-set))
   (copy-list (%instruction-set-components set)))
 
-;;; Stubs.
+;;; Errors.
+
+(defun %iset-fail (control &rest args)
+  (error 'instruction-set-error :message (apply #'format nil control args)))
+
+;;; Texts.
+
+(defun %instruction-texts-directory (session)
+  (merge-pathnames "texts/" (instructions-directory session)))
+
+(defun %instruction-revisions-directory (session)
+  (merge-pathnames "revisions/" (instructions-directory session)))
+
+(defun %instruction-start-file (session)
+  (merge-pathnames "refs/start" (instructions-directory session)))
+
+(defun %text-hash-p (x)
+  (and (stringp x) (= 71 (length x)) (uiop:string-prefix-p "sha256:" x)
+       (%hex-string-p (subseq x 7))))
+
+(defun %text-file (session hash)
+  (make-pathname :name (subseq hash 7) :type nil :version nil
+                 :defaults (%instruction-texts-directory session)))
+
+(defun intern-instruction-text (store string)
+  "→ \"sha256:<hex>\" of STRING, kept in STORE."
+  (check-type string string)
+  (let ((hash (p:octets-hash (p:utf8-encode string))))
+    (setf (gethash hash (%instruction-store-texts store)) string)
+    hash))
+
+(defun instruction-text (store hash)
+  "→ the text whose INTERN-INSTRUCTION-TEXT hash is HASH, or INSTRUCTION-SET-ERROR."
+  (or (gethash hash (%instruction-store-texts store))
+      (let* ((session (instruction-store-session store))
+             (file (and session (%text-hash-p hash) (%text-file session hash))))
+        (unless (and file (probe-file file))
+          (%iset-fail "instruction text ~a is missing" hash))
+        (let* ((octets (handler-case (p:read-bytes (uiop:native-namestring file))
+                         (error (e) (%iset-fail "instruction text ~a cannot be read: ~a"
+                                                (uiop:native-namestring file) e))))
+               (text (handler-case (p:utf8-decode octets)
+                       (error () nil))))
+          (unless (and text (equal hash (p:octets-hash octets)))
+            (%iset-fail "instruction text ~a does not match its hash" (uiop:native-namestring file)))
+          (setf (gethash hash (%instruction-store-texts store)) text)))))
+
+(defun %content-text-hashes (form)
+  "The \"sha256:…\" strings in FORM (a revision content), in order, no duplicates."
+  (let ((out '()))
+    (labels ((walk (x)
+               (cond ((%text-hash-p x) (pushnew x out :test #'string=))
+                     ((consp x) (walk (car x)) (walk (cdr x))))))
+      (walk form))
+    (nreverse out)))
+
+;;; Ids and data.
+
+(defun %data-p (x)
+  "Strings, integers, keywords, T, NIL and proper lists of those."
+  (typecase x
+    (null t)
+    (string t)
+    (integer t)
+    (keyword t)
+    ((eql t) t)
+    (cons (let ((n (handler-case (list-length x) (error () nil))))
+            (and n (every #'%data-p x))))
+    (t nil)))
+
+(defun instruction-set-id (content)
+  "→ the 64-hex id of the revision CONTENT. See the header."
+  (subseq (p:octets-hash (p:utf8-encode (%print-data content))) (length "sha256:")))
+
+;;; The store and the sidecar.
+
+(defun %find-set-revision (store id)
+  (handler-case (rev:resolve-revision store id)
+    (rev:revision-not-found () nil)))
+
+(defun %write-instruction-file (file text)
+  "Write TEXT to FILE atomically unless FILE is there already (immutable,
+content-addressed)."
+  (unless (probe-file file)
+    (ensure-directories-exist file)
+    (%write-file-atomically file text)))
+
+(defun %flush-instruction-store (store)
+  "Write every revision, text and the start ref of the INSTRUCTION-STORE STORE
+that is not on disk yet (persist on reference; see the header)."
+  (let ((session (instruction-store-session store))
+        (written (%instruction-store-written store)))
+    (when session
+      (dolist (r (rev:heads store))
+        (let ((id (rev:revision-id r)))
+          (unless (gethash id written)
+            (dolist (hash (%content-text-hashes (rev:revision-content r)))
+              (unless (gethash hash written)
+                (let ((text (gethash hash (%instruction-store-texts store))))
+                  (when text
+                    (let ((file (%text-file session hash)))
+                      (unless (probe-file file)
+                        (ensure-directories-exist file)
+                        (p:write-text file text :atomic t)))
+                    (setf (gethash hash written) t)))))
+            (%write-instruction-file
+             (make-pathname :name id :type "sexp" :defaults (%instruction-revisions-directory session))
+             (%print-data (%revision-plist r)))
+            (setf (gethash id written) t))))
+      (let ((ref (rev:find-ref store +instruction-start-ref+)))
+        (when (and ref (not (gethash :start-ref written)))
+          (%write-instruction-file (%instruction-start-file session) (%ref-text ref))
+          (setf (gethash :start-ref written) t))))
+    store))
+
+(defun %hydrate-instruction-store (store)
+  "Read the revision files (and refs/start) of STORE's session that STORE does
+not hold yet. A bad file → SESSION-ERROR naming it."
+  (let* ((session (instruction-store-session store))
+         (written (%instruction-store-written store))
+         (dir (and session (%instruction-revisions-directory session))))
+    (when (and dir (uiop:directory-exists-p dir))
+      (dolist (file (uiop:directory-files dir "*.sexp"))
+        (let ((name (pathname-name file)))
+          (unless (or (%hidden-name-p name) (%find-set-revision store name))
+            (let ((plist (%read-revision-file session file)))
+              (destructuring-bind (&key id parents recorded-at message provenance content
+                                   &allow-other-keys)
+                  plist
+                (unless (and (null parents) (equal id (instruction-set-id content)))
+                  (%session-file-error session file "does not hash to its name"))
+                (dt:with-fixed-clock ((dt:make-instant (first recorded-at) (second recorded-at)))
+                  (rev:commit-revision store content :id id :parents '()
+                                                     :message message :provenance provenance))
+                (setf (gethash id written) t)))))))
+    (let ((file (and session (%instruction-start-file session))))
+      (when (and file (not (rev:find-ref store +instruction-start-ref+)) (probe-file file))
+        (let ((text (handler-case (uiop:read-file-string file :external-format :utf-8)
+                      (error (e) (%session-file-error session file "cannot be read: ~a" e)))))
+          (multiple-value-bind (kind target) (%parse-ref-text session file text)
+            (unless (and (eq kind :movable) (%find-set-revision store target))
+              (%session-file-error session file "names revision ~a, which is not in the session" target))
+            (rev:move-ref store +instruction-start-ref+ target)
+            (setf (gethash :start-ref written) t)))))
+    store))
+
+(defun %session-write-instructions (session)
+  "%PERSIST's first step: the session's instruction sidecar."
+  (when (typep session 'session-store)
+    (let ((store (%session-instructions session)))
+      (when store (%flush-instruction-store store)))))
+
+(defun %session-read-instructions (session)
+  "%SYNC's last step: revision files other processes wrote."
+  (when (typep session 'session-store)
+    (let ((store (%session-instructions session)))
+      (when store (%hydrate-instruction-store store)))))
 
 (defun session-instruction-store (session)
   "→ the INSTRUCTION-STORE of the SESSION-STORE SESSION, re-hydrated from its
 directory on first use. See the header."
-  (declare (ignore session))
-  (%h3e1-pending "session-instruction-store"))
+  (check-type session session-store)
+  (or (%session-instructions session)
+      (let ((store (make-instance 'instruction-store
+                                  :engine (make-instance 'diff:sexp-diff-engine)
+                                  :session session))
+            (done nil))
+        (setf (%session-instructions session) store)
+        (unwind-protect
+             (progn (%hydrate-instruction-store store)
+                    (setf done t)
+                    store)
+          (unless done
+            (setf (%session-instructions session) nil))))))
 
-(defun intern-instruction-text (store string)
-  "→ \"sha256:<hex>\" of STRING, kept in STORE."
-  (declare (ignore store string))
-  (%h3e1-pending "intern-instruction-text"))
+(defun %copy-instruction-revisions (from to ids)
+  "Copy the revisions IDS (those FROM's instruction store has), their texts
+and FROM's start ref (with its revision) into TO's instruction store, not
+written yet: TO's next write writes them. FROM and TO are session stores."
+  (let* ((src (session-instruction-store from))
+         (dst (session-instruction-store to))
+         (start (rev:find-ref src +instruction-start-ref+))
+         (ids (remove-duplicates (append (remove nil ids) (and start (list (rev:ref-target start))))
+                                 :test #'equal :from-end t)))
+    (dolist (id ids)
+      (let ((r (%find-set-revision src id)))
+        (when (and r (not (%find-set-revision dst (rev:revision-id r))))
+          (let ((at (rev:revision-recorded-at r)))
+            (dt:with-fixed-clock (at)
+              (rev:commit-revision dst (rev:revision-content r)
+                                   :id (rev:revision-id r) :parents '()
+                                   :message (rev:revision-message r)
+                                   :provenance (rev:revision-provenance r))))
+          (dolist (hash (%content-text-hashes (rev:revision-content r)))
+            (let ((text (handler-case (instruction-text src hash)
+                          (instruction-set-error () nil))))
+              (when text
+                (setf (gethash hash (%instruction-store-texts dst)) text)))))))
+    (when (and start (not (rev:find-ref dst +instruction-start-ref+))
+               (%find-set-revision dst (rev:ref-target start)))
+      (rev:move-ref dst +instruction-start-ref+ (rev:ref-target start)))
+    dst))
 
-(defun instruction-text (store hash)
-  "→ the text whose INTERN-INSTRUCTION-TEXT hash is HASH, or INSTRUCTION-SET-ERROR."
-  (declare (ignore store hash))
-  (%h3e1-pending "instruction-text"))
+;;; Built-in components.
 
-(defun instruction-set-id (content)
-  "→ the 64-hex id of the revision CONTENT. See the header."
-  (declare (ignore content))
-  (%h3e1-pending "instruction-set-id"))
+(defclass %builtin-component ()
+  ((role :initarg :role :reader component-role)
+   (data :initarg :data :accessor %component-data
+         :documentation "The snapshot (data), as made from the context or restored."))
+  (:documentation "H3e-1: a built-in component whose live state is its data."))
+
+(defclass %instruction-files-component (%builtin-component) ())
+(defclass %context-files-component (%builtin-component) ())
+
+(defclass %skills-component (%builtin-component)
+  ((tools :initform '() :accessor %component-tools
+          :documentation "SKILL-TOOLS sources that serve this component's skills."))
+  (:documentation ":skills: the index; a restore gives the linked skill tools its skills."))
+
+(defclass %rules-component (%builtin-component)
+  ((cell :initarg :cell :reader %component-cell
+         :documentation "The loaded set's cons (the discovery's, or its own)."))
+  (:documentation ":rules: DATA is the :found list; the loaded set lives in CELL."))
+
+(defmethod component-snapshot ((c %builtin-component) store)
+  (declare (ignore store))
+  (copy-tree (%component-data c)))
+
+(defmethod component-restore ((c %builtin-component) snapshot store)
+  (declare (ignore store))
+  (setf (%component-data c) (copy-tree snapshot)))
+
+(defmethod component-snapshot ((c %rules-component) store)
+  (declare (ignore store))
+  (list :found (copy-tree (%component-data c))
+        :loaded (copy-list (car (%component-cell c)))))
+
+(defmethod component-restore ((c %rules-component) snapshot store)
+  (declare (ignore store))
+  (setf (%component-data c) (copy-tree (getf snapshot :found))
+        (car (%component-cell c)) (copy-list (getf snapshot :loaded))))
+
+(defun %snapshot-skill (entry)
+  "A STEER-DIRECTIVE (kind :SKILL, no body: the tool reads it) from a :skills entry."
+  (steer:make-steer-directive :kind :skill
+                              :name (getf entry :name)
+                              :description (getf entry :description)
+                              :body nil
+                              :path (uiop:parse-native-namestring (getf entry :path))
+                              :extra (list :source (getf entry :source))))
+
+(defmethod component-restore :after ((c %skills-component) snapshot store)
+  (declare (ignore store))
+  (let ((skills (mapcar #'%snapshot-skill snapshot)))
+    (dolist (tools (%component-tools c))
+      (setf (slot-value tools 'skills) skills))))
+
+(defun %native (path) (uiop:native-namestring path))
+
+(defun %safe-file-sha256 (path)
+  (handler-case (%file-sha256 path)
+    (error () nil)))
+
+(defun %instruction-files-data (context store)
+  (loop for entry in (%context-file-entries context)
+        collect (list :path (%native (getf entry :path))
+                      :source (getf entry :source)
+                      :sha256 (getf entry :sha256)
+                      :block (intern-instruction-text store (getf entry :block))
+                      :imports (loop for (path . from) in (getf entry :imports)
+                                     collect (list :path (%native path)
+                                                   :from (%native from)
+                                                   :sha256 (%safe-file-sha256 path))))))
+
+(defun %skills-data (context)
+  (loop for skill in (context-skills context)
+        for path = (steer:steer-directive-path skill)
+        collect (list :name (steer:steer-directive-name skill)
+                      :description (steer:steer-directive-description skill)
+                      :path (%native path)
+                      :source (skill-source skill)
+                      :sha256 (%safe-file-sha256 path))))
+
+(defun %rules-data (context store)
+  (loop for rule in (context-rules context)
+        collect (list :path (%rule-native rule)
+                      :paths (rule-patterns rule)
+                      :text (intern-instruction-text store (steer:steer-directive-body rule)))))
 
 (defun make-instruction-set (store &key context discovery)
   "→ an INSTRUCTION-SET on STORE: the built-in components for CONTEXT (an
 INSTRUCTION-CONTEXT; none when NIL), linked to DISCOVERY (a
 CODE-INSTRUCTION-DISCOVERY) when given. Commits nothing."
-  (declare (ignore store context discovery))
-  (%h3e1-pending "make-instruction-set"))
+  (check-type store instruction-store)
+  (let ((set (make-instance 'instruction-set :store store)))
+    (when context
+      (add-instruction-component
+       set (make-instance '%instruction-files-component
+                          :role :instruction-files :data (%instruction-files-data context store)))
+      (add-instruction-component
+       set (make-instance '%context-files-component
+                          :role :context-files
+                          :data (loop for (native . found) in (%context-configured context)
+                                      collect (list :path native :found found))))
+      (add-instruction-component
+       set (make-instance '%skills-component :role :skills :data (%skills-data context)))
+      (add-instruction-component
+       set (make-instance '%rules-component
+                          :role :rules
+                          :data (%rules-data context store)
+                          :cell (if discovery
+                                    (%discovery-loaded discovery)
+                                    (list (copy-list (context-loaded-rules context)))))))
+    (when discovery
+      (setf (car (%discovery-link discovery)) set))
+    set))
+
+(defun %link-skill-tools (set tools)
+  "Let SET's :skills component restore the SKILL-TOOLS source TOOLS (NIL: nothing)."
+  (let ((c (and set tools (find :skills (%instruction-set-components set) :key #'component-role))))
+    (when (typep c '%skills-component)
+      (pushnew tools (%component-tools c)))
+    tools))
 
 (defun add-instruction-component (set component)
   "Register COMPONENT last in SET → COMPONENT. A role already in SET →
 INSTRUCTION-SET-ERROR. Commits nothing."
-  (declare (ignore set component))
-  (%h3e1-pending "add-instruction-component"))
+  (let ((role (component-role component)))
+    (when (find role (%instruction-set-components set) :key #'component-role)
+      (%iset-fail "the instruction set already has a ~(~s~) component" role))
+    (setf (%instruction-set-components set)
+          (append (%instruction-set-components set) (list component)))
+    component))
 
 (defun commit-instruction-set (set reason)
   "→ (values id new-p): the revision of SET's components now. See the header."
-  (declare (ignore set reason))
-  (%h3e1-pending "commit-instruction-set"))
-
-(defun restore-instruction-set (set id)
-  "Restore SET's components to revision ID → ID. See the header."
-  (declare (ignore set id))
-  (%h3e1-pending "restore-instruction-set"))
+  (check-type reason keyword)
+  (let* ((store (instruction-set-store set))
+         (content (list :instruction-set +instruction-set-format+
+                        :components
+                        (loop for c in (%instruction-set-components set)
+                              for snapshot = (component-snapshot c store)
+                              unless (%data-p snapshot)
+                                do (%iset-fail "the ~(~s~) component's snapshot is not data"
+                                               (component-role c))
+                              collect (list :role (component-role c) :snapshot snapshot))))
+         (id (instruction-set-id content))
+         (new-p (null (%find-set-revision store id))))
+    (when new-p
+      (rev:commit-revision store content
+                           :id id :parents '()
+                           :message (format nil "instructions: ~(~a~)" reason)
+                           :provenance (list :kind :instructions :reason reason :version +version+)))
+    (when (and (eq reason :start) (null (rev:find-ref store +instruction-start-ref+)))
+      (rev:move-ref store +instruction-start-ref+ id))
+    (setf (%instruction-set-current set) id)
+    (values id new-p)))
 
 (defun read-instruction-set (store id)
   "→ ((role . snapshot) …) of revision ID in STORE, content order."
-  (declare (ignore store id))
-  (%h3e1-pending "read-instruction-set"))
+  (let ((content (rev:revision-content (rev:resolve-revision store id))))
+    (loop for entry in (getf (cddr content) :components)
+          collect (cons (getf entry :role) (getf entry :snapshot)))))
+
+(defun restore-instruction-set (set id)
+  "Restore SET's components to revision ID → ID. See the header."
+  (let* ((store (instruction-set-store set))
+         (full (rev:revision-id (rev:resolve-revision store id)))
+         (alist (read-instruction-set store full)))
+    (dolist (c (%instruction-set-components set))
+      (let ((hit (assoc (component-role c) alist)))
+        (when hit
+          (component-restore c (cdr hit) store))))
+    (setf (%instruction-set-current set) full)
+    full))
+
+(defun %rule-text-block (native text)
+  (format nil "<rule path=\"~a\">~%~a~%</rule>" native text))
 
 (defun instruction-set-blocks (store id)
   "→ the system prompt blocks of revision ID. See the header."
-  (declare (ignore store id))
-  (%h3e1-pending "instruction-set-blocks"))
+  (let ((alist (read-instruction-set store id)))
+    (append (loop for entry in (cdr (assoc :instruction-files alist))
+                  collect (instruction-text store (getf entry :block)))
+            (loop for entry in (getf (cdr (assoc :rules alist)) :found)
+                  unless (getf entry :paths)
+                    collect (%rule-text-block (getf entry :path)
+                                              (instruction-text store (getf entry :text))))
+            (let ((section (skill-listing-section
+                            (mapcar #'%snapshot-skill (cdr (assoc :skills alist))))))
+              (and section (list section))))))
 
 (defun instruction-set-loaded-rules (store id)
   "→ native paths of the rules in context in revision ID, load order."
-  (declare (ignore store id))
-  (%h3e1-pending "instruction-set-loaded-rules"))
+  (copy-list (getf (cdr (assoc :rules (read-instruction-set store id))) :loaded)))
+
+(defun %start-id (store)
+  (let ((ref (rev:find-ref store +instruction-start-ref+)))
+    (and ref (rev:ref-target ref))))
 
 (defun session-instruction-set (session &optional (designator +head-ref+))
   "→ the instruction-set revision id for DESIGNATOR on SESSION, or NIL. See the
 header."
-  (declare (ignore session designator))
-  (%h3e1-pending "session-instruction-set"))
+  (let ((store (session-instruction-store session)))
+    (or (and (not (equal designator "0"))
+             (loop for r in (reverse (session-line session designator))
+                   for id = (record-instructions (revision-record r))
+                   when id return id))
+        (%start-id store))))
+
+;;; The process (src/headless.lisp, src/client.lisp, src/program.lisp).
+
+(defun %open-session-instructions (cwd settings session &key user-config-dir)
+  "One context, discovery and set per session per process: :RESUME when
+SESSION has a head or a start revision, else :START. → (values context
+discovery set)."
+  (let* ((store (session-instruction-store session))
+         (head (session-instruction-set session))
+         (context (load-instruction-context
+                   cwd :settings settings :user-config-dir user-config-dir
+                       :session-rules (and head (%find-set-revision store head)
+                                           (instruction-set-loaded-rules store head))))
+         (discovery (make-code-instruction-discovery
+                     cwd :rules (context-rules context)
+                         :project-dir (context-project-dir context)
+                         :loaded (context-loaded-rules context)))
+         (set (make-instruction-set store :context context :discovery discovery)))
+    (commit-instruction-set set (if (or (session-head session) head) :resume :start))
+    (values context discovery set)))
+
+(defun %follow-head (set session)
+  "After an in-process head move: restore SET to SESSION-INSTRUCTION-SET of the
+new head (the start revision for no head). → the id, or NIL (nothing known)."
+  (when set
+    (let ((id (session-instruction-set session)))
+      (when (and id (%find-set-revision (instruction-set-store set) id))
+        (restore-instruction-set set id)))))
+
+(defun %rehome-instruction-set (set session)
+  "SESSION (a fork or a clone of SET's session) is where SET's revisions go
+from now on: its instruction store gets SET's current revision (its next
+write writes it), and SET moves to it. → SET."
+  (when (and set (not (eq (instruction-store-session (instruction-set-store set)) session)))
+    (let ((old (instruction-store-session (instruction-set-store set))))
+      (%copy-instruction-revisions old session (list (instruction-set-current set)))
+      (setf (slot-value set 'store) (session-instruction-store session))))
+  set)
+
+(defun %restart-instruction-set (set discovery session)
+  "A new conversation in this process (SESSION, a new session): SET moves to
+it with only the always-on rules loaded, committed :START. → the id or NIL."
+  (when set
+    (setf (slot-value set 'store) (session-instruction-store session))
+    (when discovery
+      (setf (car (%discovery-loaded discovery))
+            (loop for rule in (discovery-rules discovery)
+                  when (rule-always-p rule) collect (%rule-native rule))))
+    (commit-instruction-set set :start)))

@@ -8,7 +8,7 @@
     (remove-if (lambda (name) (member name hidden :test #'string=)) names)))
 
 (defun make-code-tools (cwd &key settings on-image-event supervisor scope
-                              confinement compute-backend)
+                              confinement compute-backend skills)
   "→ (file-tools shell-tools), both rooted at CWD. The shell tools need
 approval and get SETTINGS-ENV of SETTINGS as their :env. H4b: with
 LISP-IMAGE-ENABLED-P, (file-tools shell-tools lisp-tools), the lisp tools
@@ -27,7 +27,10 @@ R4d-4b: CONFINEMENT and COMPUTE-BACKEND (both or neither) go to
 MAKE-SHELL-TOOLS unchanged, so every bash command line (and its job) runs
 confined, under SUPERVISOR as a confined unit; the bash description then ends
 with the policy (AGENT-TOOLS:CONFINEMENT-DESCRIPTION). Plan mode passes its
-PLAN-SANDBOX's confinement and backend while the sandbox is :CONFINED."
+PLAN-SANDBOX's confinement and backend while the sandbox is :CONFINED.
+
+H3e-1: with SKILLS (STEER-DIRECTIVEs) and \"skill\" not hidden, a SKILL-TOOLS
+source over them comes last: (file shell [lisp] [units] skill)."
   (let* ((settings (or settings (make-settings)))
          (root (uiop:ensure-directory-pathname cwd))
          (files (tools:make-file-tools
@@ -60,7 +63,10 @@ PLAN-SANDBOX's confinement and backend while the sandbox is :CONFINED."
                      :tools (%offered-names settings tools:+unit-tool-names+)))))
     (append (list files shell)
             (and lisp (list lisp))
-            (and units (list units)))))
+            (and units (list units))
+            (and skills
+                 (%offered-names settings (list +skill-tool-name+))
+                 (list (make-skill-tools skills))))))
 
 (defun code-unit-tools (sources)
   "H8d: the UNIT-TOOLS in SOURCES (MAKE-CODE-TOOLS' list), or NIL."

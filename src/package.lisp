@@ -678,9 +678,3 @@
 
 (defparameter +version+ "0.12.0"
   "The product version, as in the .asd.")
-
-(defun %h3e1-pending (what)
-  "H3e-1 contract stub: WHAT is not implemented yet. The implementation removes
-this function and every call of it (src/imports.lisp, src/skills.lisp,
-src/rules.lisp, src/instruction-sets.lisp)."
-  (error "H3e-1: ~a is not implemented yet" what))

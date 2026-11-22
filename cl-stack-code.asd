@@ -8,7 +8,7 @@
                (:version "llm-protocol" "0.5.0")
                (:version "llm-protocol-anthropic" "0.3.0")
                (:version "llm-protocol-openai" "0.4.0")
-               (:version "steer-protocol" "0.3.0")
+               (:version "steer-protocol" "0.4.0")
                (:version "cli-protocol" "0.2.1")
                (:version "cli-backend-clingon" "0.2.0")
                "json-protocol"

@@ -608,12 +608,17 @@ before refs."
     (dolist (ref (rev:list-refs store :kind :movable))
       (unless (assoc (rev:ref-name ref) disk-refs :test #'equal)
         (rev:delete-ref store (rev:ref-name ref))))
+    ;; H3e-1: instruction-set revisions other processes wrote.
+    (%session-read-instructions store)
     store))
 
 (defun %persist (store &key force-meta)
   "Write what STORE's memory has and its directory lacks: new revision files
 (parents first), changed and deleted refs, then session.sexp on the first
 write, and \"last\" when revisions were added (or FORCE-META)."
+  ;; H3e-1: the instruction sidecar first, so a record is never on disk
+  ;; without the instruction-set revision it names.
+  (%session-write-instructions store)
   (let* ((on-disk (make-hash-table :test 'equal))
          (changed nil)
          (added nil))
@@ -898,7 +903,11 @@ revision new-store). SESSION-LOCKED and file errors propagate."
                                      :actual (rev:ref-conflict-actual conflict))
           (fork-session (&optional new-id)
             :report "Save this turn as a new session cloned at the expected head."
-            (commit-turn (clone-session store :id new-id :at expected) record :id id))))))
+            (let ((clone (clone-session store :id new-id :at expected)))
+              ;; H3e-1: the revision RECORD names goes with it.
+              (when (record-instructions record)
+                (%copy-instruction-revisions store clone (list (record-instructions record))))
+              (commit-turn clone record :id id)))))))
 
 (defun %line-number-p (string)
   (and (stringp string) (plusp (length string)) (every #'digit-char-p string)))
@@ -987,6 +996,14 @@ directory is STORE's. Written at once, and \"last\" names the clone."
          (clone (%make-session-store dir (%new-session-id dir id)
                                      :project-dir (session-project-dir store)
                                      :cloned-from (list (session-id store) tip))))
+    ;; H3e-1: the instruction revisions the copied records name, the start
+    ;; ref and their texts; the clone's write below writes them.
+    (let ((ids (loop for r in line
+                     for id = (record-instructions (revision-record r))
+                     when id collect id)))
+      (when (or ids (%session-instructions store)
+                (uiop:directory-exists-p (instructions-directory store)))
+        (%copy-instruction-revisions store clone ids)))
     (%call-writing clone
                    (lambda ()
                      (loop for previous = nil then r

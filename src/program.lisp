@@ -370,7 +370,16 @@
    (panel :initform (make-instance 'unit-panel) :reader code-program-panel
           :documentation "The UNIT-PANEL (UI thread only).")
    (units-state :initform nil :accessor %cp-units-state
-                :documentation "The implementation's: subscription, ticker, sampler, unit dialog."))
+                :documentation "The implementation's: subscription, ticker, sampler, unit dialog.")
+   ;; H3e-1 (set by MAKE-CODE-PROGRAM)
+   (instruction-context :initarg :instruction-context :initform nil :reader %cp-instruction-context
+                        :documentation "The INSTRUCTION-CONTEXT the session started from.")
+   (discovery :initarg :discovery :initform nil :reader %cp-discovery
+              :documentation "The session's CODE-INSTRUCTION-DISCOVERY.")
+   (instruction-set :initarg :instruction-set :initform nil :reader %cp-instruction-set
+                    :documentation "The session's INSTRUCTION-SET (loop thread).")
+   (render :initarg :render :initform nil :reader %cp-render
+           :documentation "→ the working directory's system prompt, from the set's current revision."))
   (:documentation "The interactive mode as a tui-protocol program."))
 
 (defun %make-input (program-cell)
@@ -413,16 +422,24 @@ configuration errors of -p signal here."
          (event-loop (event:make-event-loop event-backend))
          (supervisor nil)
          (sources nil)
+         (context nil)
+         (discovery nil)
+         (instruction-set nil)
          (done nil))
     (unwind-protect
          (let ((program
                  (let ((event:*event-backend* event-backend)
                        (event:*event-loop* event-loop))
+                   ;; H3e-1: the session's instruction set (:start or :resume).
+                   (multiple-value-setq (context discovery instruction-set)
+                     (%open-session-instructions cwd settings session :user-config-dir config))
                    ;; H8d: the session's supervisor, before the tools.
                    (setf supervisor (make-code-supervisor cwd :data-dir data-dir :getenv getenv)
                          sources (make-code-tools cwd :settings settings
                                                       :on-image-event (and link (%link-callback link))
-                                                      :supervisor supervisor))
+                                                      :supervisor supervisor
+                                                      :skills (context-skills context)))
+                   (%link-skill-tools instruction-set (code-skill-tools sources))
                    ;; H4b: the image starts before the terminal is touched; its
                    ;; events wait in the link until TUI-INIT.
                    (when link
@@ -431,10 +448,14 @@ configuration errors of -p signal here."
                    (let* ((offered (loop for source in sources
                                          append (mapcar #'llm:llm-tool-name
                                                         (agent:list-agent-tools source))))
-                          (instructions (assemble-system-prompt
-                                         cwd :tools offered :backend backend
-                                             :settings settings :user-config-dir config
-                                             :lisp-image (%sources-lisp-tools sources)))
+                          (render (lambda ()
+                                    (values (assemble-system-prompt
+                                             cwd :tools offered :backend backend
+                                                 :settings settings :user-config-dir config
+                                                 :lisp-image (%sources-lisp-tools sources)
+                                                 :context context
+                                                 :instruction-set instruction-set))))
+                          (instructions (funcall render))
                           (store (make-settings-rule-store
                                   (third (settings-file-paths cwd :user-config-dir config))))
                           (agent (agent:make-ai-agent
@@ -444,7 +465,7 @@ configuration errors of -p signal here."
                                   :instructions instructions
                                   :tools sources
                                   :permissions (%agent-permissions settings)
-                                  :settings (%agent-settings cwd settings)
+                                  :settings (%agent-settings cwd settings :discovery discovery)
                                   :permission-store store))
                           (cell (list nil))
                           (program
@@ -476,6 +497,10 @@ configuration errors of -p signal here."
                              :image-link link
                              :supervisor supervisor
                              :unit-tools (code-unit-tools sources)
+                             :instruction-context context
+                             :discovery discovery
+                             :instruction-set instruction-set
+                             :render render
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -598,12 +623,17 @@ revision store), or NIL when nothing was committed."
                                           :steering (copy-list (%cp-turn-steering program))
                                           :plan (let ((plan (%cp-plan program)))
                                                   (and plan (%cp-turn-plan program)
-                                                       (plan-record plan))))))
+                                                       (plan-record plan)))
+                                          ;; H3e-1
+                                          :instructions (let ((set (%cp-instruction-set program)))
+                                                          (and set (instruction-set-current set))))))
             (multiple-value-bind (revision store) (%commit-forking old record)
               (dolist (turn new) (setf (gethash turn committed) t))
               (setf (%cp-turn-usage program) (list 0 0 0 0)
                     (%cp-turn-steering program) '())
               (unless (eq store old)
+                ;; H3e-1: the set's revisions go to the clone from now on.
+                (%rehome-instruction-set (%cp-instruction-set program) store)
                 (setf (%cp-session program) store)
                 (%send program (list :session (session-id store)))
                 (%send program (list :notice (format nil "session ~a changed in another process; continuing as session ~a"
@@ -837,6 +867,16 @@ notices (lisp-mcp/agent has no way to queue them again)."
   (setf (%cp-run program) nil
         (%cp-handle program) nil))
 
+(defun %program-follow-head (program)
+  "H3e-1, loop thread: the head moved; the instruction set follows it and the
+working directory's system prompt is rendered from it."
+  (when (%follow-head (%cp-instruction-set program) (%cp-session program))
+    (let ((prompt (and (%cp-render program) (funcall (%cp-render program)))))
+      (when prompt
+        (if (%cp-plan program)
+            (setf (%cp-cwd-instructions program) prompt)
+            (setf (agent:ai-agent-instructions (%cp-agent program)) prompt))))))
+
 (defun %session-reset (program &rest keys)
   (%send program (list* :session-reset :entries (session-entries (%cp-session program)) keys)))
 
@@ -850,6 +890,7 @@ notices (lisp-mcp/agent has no way to queue them again)."
     (multiple-value-bind (head prompt) (fork-turn session id)
       (declare (ignore head))
       (%drop-run program)
+      (%program-follow-head program)
       (%session-reset program :input prompt
                               :notice (format nil "forked before turn ~a: edit the message and press Enter"
                                               (subseq id 0 (min 8 (length id))))))))
@@ -872,11 +913,14 @@ from the tip's (H5b), else H3c's conversation rewind."
           (return-from %rewind nil)))))
   (rewind-session (%cp-session program) n)
   (%drop-run program)
+  (%program-follow-head program)
   (%session-reset program :notice (format nil "rewound ~d turn~:p" n)))
 
 (defun %clone (program)
   (let* ((old (%cp-session program))
          (new (clone-session old)))
+    ;; H3e-1: a continued session of the clone.
+    (%rehome-instruction-set (%cp-instruction-set program) new)
     (setf (%cp-session program) new)
     (%send program (list :session (session-id new)))
     (%send program (list :notice (format nil "cloned session ~a as ~a"
@@ -897,6 +941,8 @@ from the tip's (H5b), else H3c's conversation rewind."
   (let ((session (create-session (%cp-sessions-dir program)
                                  :project-dir (%cp-project-dir program))))
     (setf (%cp-session program) session)
+    ;; H3e-1: a new conversation starts from the set without lazily loaded rules.
+    (%restart-instruction-set (%cp-instruction-set program) (%cp-discovery program) session)
     (%send program (list :session (session-id session)))))
 
 ;;; Effects (UI thread).
@@ -1045,6 +1091,11 @@ goes back to the input)."
       (%link-attach link (lambda (event) (tui:tui-send (image-event-message event) run)))))
   ;; H8d: the supervisor's events from now on.
   (%start-units-ui program tui:*tui*)
+  ;; H3e-1: the instruction context's notes, once, as notices.
+  (let ((context (%cp-instruction-context program)))
+    (when context
+      (dolist (note (context-notes context))
+        (%apply-event program (list :notice (format nil "note: ~a" note))))))
   (let ((prompt (%cp-prompt program)))
     (when prompt
       (%apply-event program (list :submit prompt))))
@@ -1344,7 +1395,10 @@ goes back to the input)."
                          :settings settings
                          :supervisor sup
                          :scope (%plan-unit-scope sup plan)
+                         :skills (let ((ctx (%cp-instruction-context program)))
+                                   (and ctx (context-skills ctx)))
                          (plan-sandbox-tool-keys sandbox))))
+    (%link-skill-tools (%cp-instruction-set program) (code-skill-tools sources))
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
                             (%close-code-units nil :unit-tools (list (code-unit-tools sources))
@@ -1357,7 +1411,9 @@ goes back to the input)."
                  (%cp-cwd program) :tools offered :backend (agent:ai-agent-backend agent)
                                    :settings settings
                                    :user-config-dir (%cp-user-config-dir program)
-                                   :plan plan :sandbox sandbox))))))
+                                   :plan plan :sandbox sandbox
+                                   :context (%cp-instruction-context program)
+                                   :instruction-set (%cp-instruction-set program)))))))
 
 (defun %ensure-plan (program)
   "Open or reopen the plan when none is open; swap the agent's tools and
@@ -1562,6 +1618,7 @@ STATE-PLAN-PROMPT (made once per prompt), focus it. → NIL."
               (rewind-to (%cp-checkpointer program) session (princ-to-string turn) :parts parts))))
       (when (eq :moved (getf result :conversation))
         (%drop-run program)
+        (%program-follow-head program)
         (%session-reset program))
       ;; After a drift without an answer the drift dialog answers.
       (unless (and drifted (eq :aborted (getf result :files)))
