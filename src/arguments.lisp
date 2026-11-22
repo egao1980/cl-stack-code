@@ -124,6 +124,11 @@ ours to rebind, so it goes in as :BACKEND)."
                 :kind :flag)
            ;; ACP-2
            (opt "acp" "Serve the Agent Client Protocol on stdin/stdout (for editors: Zed, JetBrains, Emacs)"
+                :kind :flag)
+           ;; H3e-2a
+           (opt "mcp-config" "MCP servers from a file (or JSON text) in .mcp.json shape; repeatable"
+                :kind :list)
+           (opt "strict-mcp-config" "Use only the --mcp-config servers (ignore .mcp.json and settings)"
                 :kind :flag)))))
 
 (defun %lisp-image-flag (value observe)
@@ -265,7 +270,9 @@ are present is checked by RUN-CLI, not here."
                     :sandbox (and (get-opt :allow-network) (list :network :allow))
                     ;; H3e-1
                     :skill-dirs (%path-flags "--skill-dir" (get-opt :skill-dir) t)
-                    :context-files (%path-flags "--context-file" (get-opt :context-file) nil)))))))
+                    :context-files (%path-flags "--context-file" (get-opt :context-file) nil)
+                    ;; H3e-2a
+                    :mcp (%mcp-flags (get-opt :mcp-config) (get-opt :strict-mcp-config))))))))
 
 (defun %usage-text (stream)
   "Write the --help text to STREAM."

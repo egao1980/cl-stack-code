@@ -1,5 +1,5 @@
 (defsystem "cl-stack-code"
-  :version "0.12.3"
+  :version "0.13.0"
   :description "Coding agent CLI on cl-stack: a supervisor per session (shell jobs, servers and subagents as units with capped rotated logs; a TUI process panel (/ps, Ctrl-P) to follow, search, stop, restart and feed them, the same model over --rpc units/* methods, both behind the agent's unit_control permission rules), an SDK and a JSON-RPC 2.0 server over stdio (--rpc) on one core: sessions, turns with streamed events, approvals answered by the caller, steering, interrupts, plans, checkpoints and rewinds, the same event shapes as stream-JSON; a live Lisp image for the agent (lisp-mcp/agent tools, debugger entries in other threads delivered to the agent's inbox, restarts gated by permission rules), checkpoints (every turn that changes files records a composite revision of the conversation and the files: a pathlib snapshot, a git commit on a private ref, or a jj working-copy commit) and per-part rewinds (conversation, files or both, drift-checked), plan mode (edits and shell commands in a copy of the project, the shell confined to it by a kernel sandbox: Seatbelt on macOS, Landlock on Linux, network off; asking before each command where there is none; a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
@@ -52,7 +52,15 @@
                ;; R4d-4b: plan mode's shell runs confined (Windows: none until R4e-1)
                (:version "compute-protocol" "0.3.2")
                (:feature :darwin (:version "compute-backend-seatbelt" "0.1.1"))
-               (:feature :linux (:version "compute-backend-landlock" "0.1.0")))
+               (:feature :linux (:version "compute-backend-landlock" "0.1.0"))
+               ;; H3e-2a. The implementation raises these to the releases of
+               ;; mcp-protocol#14 (0.4.0), ai-agent-protocol#37 (0.15.0, /mcp 0.2.0),
+               ;; mcp-backend-stdio#7 (0.3.0), mcp-backend-streamable-http#9 (0.4.0)
+               ;; and supervisor-protocol#13 (0.5.0).
+               (:version "mcp-protocol" "0.3.1")
+               (:version "mcp-backend-stdio" "0.2.0")
+               (:version "mcp-backend-streamable-http" "0.3.0")
+               (:version "ai-agent-protocol/mcp" "0.1.0"))
   ;; H4b: --lisp-image spawn starts ros +Q run images that load swank / slynk
   ;; (install roots, as in lisp-mcp; never dependencies).
   :properties (:cl-repo (:ci (:with ("swank" "slynk"))))
@@ -61,6 +69,8 @@
   :components ((:file "package")
                (:file "conditions")
                (:file "settings")
+               ;; H3e-2a
+               (:file "mcp-config")
                (:file "permissions")
                (:file "instructions")
                ;; H3e-1
@@ -85,6 +95,8 @@
                ;; H8d
                (:file "units")
                (:file "unit-panel")
+               ;; H3e-2a
+               (:file "mcp")
                (:file "interactive")
                (:file "headless")
                (:file "program")
@@ -133,6 +145,10 @@
                "compute-protocol"
                (:feature :darwin "compute-backend-seatbelt")
                (:feature :linux "compute-backend-landlock")
+               ;; H3e-2a
+               "mcp-protocol"
+               "mcp-backend-streamable-http"
+               "http-protocol"
                "rove")
   :pathname "tests"
   :serial t
@@ -210,7 +226,13 @@
                (:file "rules-test")
                (:file "instruction-sets-test")
                (:file "h3e1-cli-test")
-               (:file "h3e1-client-test"))
+               (:file "h3e1-client-test")
+               ;; H3e-2a
+               (:file "mcp-support")
+               (:file "mcp-config-test")
+               (:file "mcp-cli-test")
+               (:file "mcp-client-test")
+               (:file "mcp-program-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

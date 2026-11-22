@@ -173,7 +173,9 @@
     "settings/get" "tools/list"
     ;; H8d
     "units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
-    "units/control")
+    "units/control"
+    ;; H3e-2a
+    "mcp/list" "mcp/reconnect")
   "Every --rpc method, in this order (initialize's \"methods\").")
 
 (defparameter +rpc-error-codes+
@@ -197,6 +199,8 @@
     (unit-control-needs-confirmation . -32017)
     (subscription-not-found . -32018)
     (unit-control-failed . -32019)
+    ;; H3e-2a
+    (mcp-server-not-found . -32020)
     (code-usage-error . -32602)
     (code-error . -32000)
     (error . -32603))

@@ -46,7 +46,7 @@
                "session/close" "turn/start" "turn/steer" "turn/interrupt" "approval/respond"
                "plan/approve" "plan/reject" "checkpoint/list" "rewind" "settings/get" "tools/list"
                "units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
-               "units/control")
+               "units/control" "mcp/list" "mcp/reconnect")
              +rpc-methods+))
   (ok (equal "event" +rpc-event-method+))
   (ok (eql 1 +rpc-protocol-version+))
@@ -126,7 +126,7 @@
              (new (response-for objects 2)))
         (ok (every (lambda (o) (equal "2.0" (gethash "jsonrpc" o))) objects) "only JSON-RPC on output")
         (ok (equal "cl-stack-code" (event-value init "result" "name")))
-        (ok (equal "0.12.3" (event-value init "result" "version")))
+        (ok (equal "0.13.0" (event-value init "result" "version")))
         (ok (eql 1 (event-value init "result" "protocol")))
         (ok (equal +rpc-methods+ (coerce (event-value init "result" "methods") 'list)))
         (ok (equal +event-types+ (coerce (event-value init "result" "events") 'list)))
