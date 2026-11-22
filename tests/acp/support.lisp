@@ -321,7 +321,8 @@ MAKE-ACP-LOOPBACK, initialized with CAPS unless INITIALIZE is NIL."
                           &allow-other-keys)
                          &body body)
   (let ((a (or agent (gensym "AGENT")))
-        (b (or backend (gensym "BACKEND")))
+        ;; Contract fix: tests refer to BACKEND freely; bind it by default.
+        (b (or backend 'backend))
         (keys (loop for (k v) on keys by #'cddr
                     unless (member k '(:agent :backend)) append (list k v))))
     `(call-with-loopback ,project ,config
