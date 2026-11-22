@@ -36,6 +36,9 @@
 ;;;                                and the annotation, if any, for a tag. Ref
 ;;;                                names are [A-Za-z0-9._-]+; another name →
 ;;;                                SESSION-ERROR before anything is written
+;;;   <id>/instructions/           H3e-1: the session's instruction-set
+;;;                                revisions and their texts (content-
+;;;                                addressed; src/instruction-sets.lisp)
 ;;;   <id>/lock                    exists while a process writes:
 ;;;                                "<pid or 0> <universal-time>" LF
 ;;;
@@ -158,7 +161,7 @@ dashes are dropped)."
 (defstruct (turn-record (:constructor make-turn-record
                             (&key prompt turns replace-p (finish :stop) model
                                   (permission-mode :default) (usage (list 0 0 0 0))
-                                  steering plan rules (version +version+)))
+                                  steering plan instructions (version +version+)))
                         (:conc-name record-))
   "One turn of a session. PROMPT is the user's message as typed (before @
 mentions were expanded). TURNS are the LLM-TURNs the turn added to the
@@ -171,8 +174,9 @@ or :FAILED. MODEL is the model designator the turn ran with,
 PERMISSION-MODE its mode keyword, USAGE (input output cache-read
 cache-write) summed over the turn's responses, STEERING the steering
 messages delivered into the turn, as typed, in order. PLAN (H5a) is the
-PLAN-RECORD of the plan the turn ran in (plan mode), or NIL. RULES (H3e-1) are
-the native paths of the path-scoped rules first loaded in the turn, in order."
+PLAN-RECORD of the plan the turn ran in (plan mode), or NIL. INSTRUCTIONS
+(H3e-1) is the id of the instruction-set revision current at the turn's end
+(src/instruction-sets.lisp: 64 lowercase hex characters), or NIL."
   (prompt "" :type string)
   (turns '() :type list)
   (replace-p nil)
@@ -182,7 +186,7 @@ the native paths of the path-scoped rules first loaded in the turn, in order."
   (usage (list 0 0 0 0) :type list)
   (steering '() :type list)
   (plan nil :type list)
-  (rules '() :type list)
+  (instructions nil :type (or null string))
   (version +version+))
 
 (defparameter +record-finishes+ '(:stop :max-steps :canceled :failed))
@@ -193,8 +197,8 @@ lists:
   (:format 1 :prompt S :turns (LLM:TURN-STATE …) :replace BOOL :finish K
    :model S-or-NIL :permission-mode K :usage (I O CR CW) :steering (S …)
    :version S [:plan (:id S :kind K :base S :root S :status K)])
-The :PLAN key (H5a) is present only when the record has a plan; :RULES (S …)
-(H3e-1) only when it has rules."
+The :PLAN key (H5a) is present only when the record has a plan; :INSTRUCTIONS S
+(H3e-1, an instruction-set revision id) only when it has one."
   (check-type record turn-record)
   (append
    (list :format +session-format+
@@ -209,8 +213,8 @@ The :PLAN key (H5a) is present only when the record has a plan; :RULES (S …)
         :version (record-version record))
    (when (record-plan record)
      (list :plan (copy-list (record-plan record))))
-   (when (record-rules record)
-     (list :rules (copy-list (record-rules record))))))
+   (when (record-instructions record)
+     (list :instructions (record-instructions record)))))
 
 (defun %malformed-record (content &optional cause)
   (error 'session-error
@@ -223,7 +227,7 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                (handler-case (progn (getf content :format) t) (error () nil)))
     (%malformed-record content "not a plist"))
   (destructuring-bind (&key format prompt turns replace finish model permission-mode
-                            usage steering version plan rules &allow-other-keys)
+                            usage steering version plan instructions &allow-other-keys)
       content
     (unless (eql format +session-format+) (%malformed-record content ":format"))
     (unless (stringp prompt) (%malformed-record content ":prompt"))
@@ -237,8 +241,10 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
       (%malformed-record content ":steering"))
     (unless (and (listp plan) (evenp (length plan)))
       (%malformed-record content ":plan"))
-    (unless (and (listp rules) (every #'stringp rules))
-      (%malformed-record content ":rules"))
+    (unless (or (null instructions)
+                (and (stringp instructions) (= 64 (length instructions))
+                     (%hex-string-p instructions)))
+      (%malformed-record content ":instructions"))
     (make-turn-record :prompt prompt
                       :turns (mapcar #'llm:state-turn turns)
                       :replace-p (and replace t)
@@ -248,7 +254,7 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                       :usage (copy-list usage)
                       :steering (copy-list steering)
                       :plan (copy-list plan)
-                      :rules (copy-list rules)
+                      :instructions (and instructions (copy-seq instructions))
                       :version version)))
 
 (defun revision-record (revision)
@@ -274,7 +280,11 @@ file header), or NIL.")
    ;; H5b
    (checkpoints :initform nil :accessor %session-checkpoints
                 :documentation "This session's CHECKPOINT-STORE once CHECKPOINT-STORE made
-it (one per session store object), or NIL."))
+it (one per session store object), or NIL.")
+   ;; H3e-1
+   (instructions :initform nil :accessor %session-instructions
+                 :documentation "This session's INSTRUCTION-STORE once SESSION-INSTRUCTION-STORE
+made it (one per session store object), or NIL."))
   (:documentation "A session: revision-protocol's in-memory store written
 through to its directory (see the file header). Make one with CREATE-SESSION,
 OPEN-SESSION or CLONE-SESSION, not MAKE-INSTANCE."))
@@ -831,16 +841,6 @@ system prompt is assembled again by every process that runs the session."
                       (copy-list (record-turns record))
                       (append turns (record-turns record)))))
     (remove :system turns :key #'llm:llm-turn-role)))
-
-(defun session-loaded-rules (store &optional (designator +head-ref+))
-  "H3e-1: → the native paths of the rules loaded on DESIGNATOR's first-parent
-line: the RECORD-RULES of SESSION-RECORDS root first, duplicates dropped (the
-first kept). No head → NIL."
-  (let ((out '()))
-    (dolist (record (session-records store designator) (nreverse out))
-      (dolist (rule (record-rules record))
-        (unless (member rule out :test #'string=)
-          (push rule out))))))
 
 ;;; Writing a session.
 

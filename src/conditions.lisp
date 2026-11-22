@@ -417,3 +417,11 @@ be a list of strings or a comma-separated string\"."))
                                         (and (rule-format-error-path c)
                                              (uiop:native-namestring (rule-format-error-path c)))
                                         (rule-format-error-reason c)))))))
+
+(define-condition instruction-set-error (code-error)
+  ()
+  (:documentation "H3e-1: the instruction set cannot be committed or read: two
+components with one role, a snapshot that is not data, a text that is missing
+or does not match its hash (src/instruction-sets.lisp). The message says which.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c) "instruction set error")))))

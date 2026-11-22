@@ -605,8 +605,38 @@
    #:discovery-loaded-rules
    #:settings-skill-dirs
    #:settings-context-files
-   #:record-rules
-   #:session-loaded-rules
+   #:record-instructions
+   ;; H3e-1: the instruction set (src/instruction-sets.lisp)
+   #:+instruction-set-format+
+   #:+instruction-set-roles+
+   #:+instruction-set-reasons+
+   #:+instruction-start-ref+
+   #:component-role
+   #:component-snapshot
+   #:component-restore
+   #:instruction-set-components
+   #:instruction-store
+   #:instruction-store-p
+   #:instruction-store-session
+   #:instructions-directory
+   #:session-instruction-store
+   #:instruction-set
+   #:instruction-set-p
+   #:instruction-set-store
+   #:instruction-set-current
+   #:make-instruction-set
+   #:add-instruction-component
+   #:commit-instruction-set
+   #:restore-instruction-set
+   #:read-instruction-set
+   #:instruction-set-id
+   #:instruction-set-blocks
+   #:instruction-set-loaded-rules
+   #:intern-instruction-text
+   #:instruction-text
+   #:session-instruction-set
+   #:checkpoint-instructions-id
+   #:instruction-set-error
    #:skill-format-error
    #:skill-format-error-path
    #:skill-format-error-reason
@@ -652,5 +682,5 @@
 (defun %h3e1-pending (what)
   "H3e-1 contract stub: WHAT is not implemented yet. The implementation removes
 this function and every call of it (src/imports.lisp, src/skills.lisp,
-src/rules.lisp)."
+src/rules.lisp, src/instruction-sets.lisp)."
   (error "H3e-1: ~a is not implemented yet" what))

@@ -1,7 +1,7 @@
 (in-package #:cl-stack-code/tests)
 
 ;;; H3e-1: rules (src/rules.lisp): roots, the format, globs, the lazy
-;;; discovery and its once-per-session set, the turn records.
+;;; discovery and its once-per-session set.
 
 (defun rule-paths-of (rules)
   (mapcar #'steer:steer-directive-path rules))
@@ -206,25 +206,5 @@ x
       (ok (has "Sub rules." (steer:steer-directive-body (first found))) "nested AGENTS.md first, as before")
       (ok (eq :rule (steer:steer-directive-kind (second found)))))))
 
-;;; Turn records.
-
-(deftest rules-record-content
-  (let* ((with (make-turn-record :prompt "p" :rules (list "/r/lisp.md")))
-         (without (make-turn-record :prompt "p")))
-    (ok (equal '("/r/lisp.md") (getf (record-content with) :rules)))
-    (ok (not (member :rules (record-content without))) "older record shapes are unchanged")
-    (ok (equal '("/r/lisp.md") (record-rules (content-record (record-content with)))))
-    (ok (null (record-rules (content-record (record-content without)))))
-    (ok (signals (content-record (append (record-content without) (list :rules '(3))))
-                 'session-error))))
-
-(deftest rules-session-loaded-rules
-  (with-sessions-dir (dir)
-    (let* ((s (create-session dir))
-           (r1 (commit-turn s (simple-record "one" "1" :rules (list "/r/a.md")))))
-      (commit-turn s (simple-record "two" "2"))
-      (commit-turn s (simple-record "three" "3" :rules (list "/r/b.md" "/r/a.md")))
-      (ok (equal '("/r/a.md" "/r/b.md") (session-loaded-rules s)) "line order, duplicates dropped")
-      (ok (equal '("/r/a.md") (session-loaded-rules s (rev:revision-id r1)))
-          "a rewind to turn 1 drops the later rules")
-      (ok (null (session-loaded-rules (create-session dir)))))))
+;;; Turn records name the instruction set's revision instead of a rules list:
+;;; tests/instruction-sets-test.lisp.

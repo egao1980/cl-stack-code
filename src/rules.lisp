@@ -38,7 +38,8 @@
 ;;; CODE-INSTRUCTION-DISCOVERY (a STEER:INSTRUCTION-DISCOVERY rooted at CWD,
 ;;; names +INSTRUCTION-FILE-NAMES+, :INCLUDE-ROOT NIL, as %AGENT-SETTINGS' today)
 ;;; over RULES (DISCOVER-RULES'), PROJECT-DIR and LOADED (native paths already
-;;; in context: the always-on rules and SESSION-LOADED-RULES). The
+;;; in context: the always-on rules and, for a continued session, the
+;;; INSTRUCTION-SET-LOADED-RULES of its head's instruction set). The
 ;;; implementation puts it in %AGENT-SETTINGS' :INSTRUCTIONS-DISCOVERY.
 ;;; STEER:DISCOVER-INSTRUCTIONS on it, for a path or a list of paths: the nested
 ;;; AGENTS.md directives exactly as the parent class gives them, then, for each
@@ -59,10 +60,15 @@
 ;;; the forgotten rules from the set, so they load again on demand.
 ;;; DISCOVERY-LOADED-RULES → the set, native strings in load order.
 ;;;
-;;; Records. A turn's TURN-RECORD gets :RULES, the native paths of the
-;;; path-scoped rules first loaded in that turn (the run's :instructions events'
-;;; :rule directives), in order. -p, the TUI and the SDK seed a resumed or
-;;; continued session's discovery with SESSION-LOADED-RULES of its head.
+;;; The instruction set (src/instruction-sets.lisp). The loaded set is the
+;;; :rules component's live state: MAKE-INSTRUCTION-SET :DISCOVERY links a
+;;; discovery (and so its copies) to a set. A linked discovery commits the
+;;; set (:RULE) after each STEER:DISCOVER-INSTRUCTIONS call that loaded one or
+;;; more rules, before returning them, and (:FORGET) after a
+;;; STEER:FORGET-INSTRUCTIONS that removed any; RESTORE-INSTRUCTION-SET sets
+;;; the loaded set to the revision's (a rewind: rules loaded later load again
+;;; on the next matching path). Turn records name the set's revision
+;;; (RECORD-INSTRUCTIONS); there is no per-turn rules list.
 ;;;
 ;;; Events. Each :instructions agent event becomes, in -p stream-json, SDK and
 ;;; --rpc, {"type":"instructions","files":[{"path":NATIVE,"kind":"agents"|"rule"}]}

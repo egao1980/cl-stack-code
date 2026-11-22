@@ -70,8 +70,10 @@
 ;;; found: NATIVE". The blocks' IMPORTS and NOTES, in prompt order. SKILLS and
 ;;; their notes (DISCOVER-SKILLS), RULES and their notes (DISCOVER-RULES).
 ;;; LOADED-RULES = the always-on rules' native paths, then SESSION-RULES (native
-;;; strings from SESSION-LOADED-RULES, for a resumed session) that are still
-;;; found. Notes in this order: instruction files, skills, rules.
+;;; strings from INSTRUCTION-SET-LOADED-RULES of the head's instruction set,
+;;; for a resumed session) that are still found. The context is what the
+;;; built-in components of the instruction set are made from
+;;; (MAKE-INSTRUCTION-SET, src/instruction-sets.lisp). Notes in this order: instruction files, skills, rules.
 
 (defparameter +max-import-hops+ 4
   "H3e-1: the deepest import expanded (the instruction file is hop 0), as

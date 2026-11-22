@@ -85,3 +85,11 @@ Use deftest and ok."))
         (list ".lisp-workspace/rules/lisp.md" (rule-md '("**/*.lisp") +fixture-rule-body+))
         (list ".lisp-workspace/plugin/context.md" (format nil "PLUGIN CONTEXT ONLY~%"))
         (list "src/a.lisp" (format nil "(in-package :cl-user)~%"))))
+
+(defun records-loaded-rules (project config id)
+  "For each turn record of session ID on disk, root first: the rules loaded in
+the instruction set it names."
+  (let* ((s (open-session (project-sessions project config) id))
+         (store (session-instruction-store s)))
+    (mapcar (lambda (r) (instruction-set-loaded-rules store (record-instructions r)))
+            (session-records s))))

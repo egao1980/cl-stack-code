@@ -11,6 +11,19 @@
 ;;;   :conversation  the session revision (H3c turn) the files belong to,
 ;;;                  DEPENDS-ON (:files). Absent for a checkpoint recorded
 ;;;                  before the session's first turn ("session start").
+;;;   :instructions  (H3e-1) the instruction-set revision (src/instruction-
+;;;                  sets.lisp) that goes with the conversation part:
+;;;                  SESSION-INSTRUCTION-SET of the conversation revision, or
+;;;                  of "0" without a conversation part. DEPENDS-ON
+;;;                  (:conversation) when there is one. Its REV:PART-STORE is
+;;;                  SESSION-INSTRUCTION-STORE of the session (also when read
+;;;                  back from disk). Absent when that id is NIL (records
+;;;                  written without the H3e-1 wiring, and every checkpoint
+;;;                  recorded before 0.12.0), so older checkpoints read
+;;;                  unchanged. CHECKPOINT-INSTRUCTIONS-ID is its id or NIL.
+;;;                  REWIND-TO restores it with the conversation part, never
+;;;                  alone: the process's instruction set follows the head
+;;;                  (src/instruction-sets.lisp, "The process").
 ;;; :db and :image (+CHECKPOINT-ROLES+) are reserved for H5c / H5d: H5b
 ;;; never records them, and a rewind that asks for them reports nothing for
 ;;; them.
@@ -36,7 +49,11 @@
 ;;;   A checkpoint revision's content on disk is
 ;;;     (:checkpoint 1 :parts ((:role :files :kind K :revision ID)
 ;;;                            (:role :conversation :kind :session :revision ID
-;;;                             :depends-on (:files))))
+;;;                             :depends-on (:files))
+;;;                            (:role :instructions :kind :instruction-set
+;;;                             :revision ID :depends-on (:conversation))))
+;;;   (H3e-1: the :instructions part only when there is one; without a
+;;;   conversation part it has no :depends-on)
 ;;;   and in memory a REV:REVISION-MANIFEST (so REV:COMPOSITE-MANIFEST works).
 ;;;   The :conversation part's REV:PART-STORE is the session store; the
 ;;;   :files part's is the checkpointer's open GIT-STORE / JJ-STORE for a
@@ -268,9 +285,9 @@
 (defparameter +checkpoint-reasons+ '(:before :turn :plan-before :plan-after :rewind)
   "CHECKPOINT-REASON values.")
 
-(defparameter +checkpoint-roles+ '(:files :conversation :db :image)
-  "Manifest roles. H5b records :files and :conversation; :db (H5c) and :image
-(H5d) are reserved.")
+(defparameter +checkpoint-roles+ '(:files :conversation :instructions :db :image)
+  "Manifest roles. H5b records :files and :conversation, H3e-1 :instructions;
+:db (H5c) and :image (H5d) are reserved.")
 
 (defparameter +checkpoint-ref+ "checkpoints"
   "The checkpoint store's ref naming the tip.")
@@ -302,7 +319,9 @@ DATETIME-PROTOCOL instant; REVISION the composite REV:REVISION."
   (message "" :type string)
   (recorded-at nil)
   (expired-p nil)
-  (revision nil))
+  (revision nil)
+  ;; H3e-1: the :instructions part's revision id, or NIL
+  (instructions-id nil))
 
 (defstruct (files-state (:constructor %make-files-state (kind id &optional tree)))
   "The project's files as READ-FILES-STATE read them: KIND :COPY :GIT :JJ and

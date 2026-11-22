@@ -125,7 +125,7 @@ then, as its own section, +PLAN-MODE-FEEDBACK+. → list of two strings."
           +plan-mode-feedback+)))
 
 (defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan lisp-image
-                                     sandbox context)
+                                     sandbox context instruction-set)
   "→ (values prompt files). Sections joined by one blank line: steer's
 BUILD-SYSTEM-PROMPT for TOOLS (offered names) and BACKEND, the # Environment
 section, each instruction file as <instructions path=\"…\">…</instructions>,
@@ -143,7 +143,11 @@ instruction blocks are then INSTRUCTION-BLOCK of each CONTEXT-FILES entry (its
 imports expanded), followed by RULE-BLOCK of each always-on rule, then
 SKILL-LISTING-SECTION of CONTEXT-SKILLS (when there are skills), then
 SETTINGS-APPEND-SYSTEM-PROMPT. → (values prompt files context): FILES is
-CONTEXT-FILES. Until then CONTEXT is returned as given and unused."
+CONTEXT-FILES. With INSTRUCTION-SET (an INSTRUCTION-SET with a current
+revision), those blocks are INSTRUCTION-SET-BLOCKS of its current revision
+instead (a rewound or resumed session renders the set it continues). Until
+then CONTEXT is returned as given and unused, and INSTRUCTION-SET is ignored."
+  (declare (ignore instruction-set))
   (let* ((settings (or settings (make-settings)))
          (cwd (%truename-directory cwd))
          (files (instruction-files cwd :user-config-dir user-config-dir))

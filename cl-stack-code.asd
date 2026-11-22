@@ -71,6 +71,8 @@
                (:file "mentions")
                (:file "transcript")
                (:file "sessions")
+               ;; H3e-1: the instruction set's revisions
+               (:file "instruction-sets")
                (:file "session-views")
                (:file "plans")
                ;; R4d-4b
@@ -203,6 +205,7 @@
                (:file "imports-test")
                (:file "skills-test")
                (:file "rules-test")
+               (:file "instruction-sets-test")
                (:file "h3e1-cli-test")
                (:file "h3e1-client-test"))
   :perform (test-op (o c)
