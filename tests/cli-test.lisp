@@ -165,7 +165,7 @@
   (with-project (project config) '()
     (multiple-value-bind (exit out err) (code project config '("--version") :cwd nil :model nil)
       (ok (eql 0 exit))
-      (ok (equal (nl "cl-stack-code 0.9.0") out))
+      (ok (equal (nl "cl-stack-code 0.9.1") out))
       (ok (equal "" err)))))
 
 (deftest cli-model-params-reach-generate

@@ -126,7 +126,7 @@
              (new (response-for objects 2)))
         (ok (every (lambda (o) (equal "2.0" (gethash "jsonrpc" o))) objects) "only JSON-RPC on output")
         (ok (equal "cl-stack-code" (event-value init "result" "name")))
-        (ok (equal "0.9.0" (event-value init "result" "version")))
+        (ok (equal "0.9.1" (event-value init "result" "version")))
         (ok (eql 1 (event-value init "result" "protocol")))
         (ok (equal +rpc-methods+ (coerce (event-value init "result" "methods") 'list)))
         (ok (equal +event-types+ (coerce (event-value init "result" "events") 'list)))
