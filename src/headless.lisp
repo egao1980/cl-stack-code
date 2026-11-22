@@ -1082,6 +1082,13 @@ USER-DATA-DIRECTORY: sessions live under it."
                 ((invocation-version-p inv)
                  (format output "cl-stack-code ~a~%" +version+)
                  0)
+                ;; ACP-2: an ACP agent until INPUT ends (cl-stack-code/acp,
+                ;; through *ACP-SERVER*; src/rpc.lisp). Before --rpc, so
+                ;; --acp --rpc is CHECK-ACP-FLAGS's usage error.
+                ((invocation-acp-p inv)
+                 (%run-acp inv :output output :input input :error-output error-output
+                               :providers providers :user-config-dir user-config-dir
+                               :getenv getenv :data-dir data-dir))
                 ;; H3d: a JSON-RPC server until INPUT ends (src/rpc.lisp).
                 ((invocation-rpc-p inv)
                  (%run-rpc inv :output output :input input :error-output error-output

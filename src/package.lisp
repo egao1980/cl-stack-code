@@ -474,6 +474,12 @@
    #:rpc-client-process
    #:close-rpc-client
 
+   ;; ACP-2: --acp (src/rpc.lisp); the server is cl-stack-code/acp
+   #:invocation-acp-p
+   #:check-acp-flags
+   #:*acp-server*
+   #:*acp-system*
+
    ;; H8d: units (src/units.lisp, src/unit-panel.lisp)
    #:+unit-panel-key+
    #:+unit-log-scrollback+

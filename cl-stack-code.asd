@@ -175,6 +175,8 @@
                (:file "client-plan-test")
                (:file "rpc-test")
                (:file "rpc-process-test")
+               ;; ACP-2: the --acp flag (the server is cl-stack-code/acp/tests)
+               (:file "acp-flag-test")
                ;; H8d
                (:file "units-support")
                (:file "units-test")
@@ -190,6 +192,55 @@
                (:file "sandbox-real-support" :if-feature (:or :darwin :linux))
                (:file "sandbox-seatbelt-test" :if-feature :darwin)
                (:file "sandbox-landlock-test" :if-feature :linux))
+  :perform (test-op (o c)
+             (unless (symbol-call :rove :run c)
+               (error "tests failed for ~A" (component-name c)))))
+
+;;; ACP-2: an Agent Client Protocol agent over the SDK (src/client.lisp),
+;;; served on stdio by cl-stack-code --acp. The core never depends on it: it
+;;; sets CL-STACK-CODE:*ACP-SERVER* when it loads (src/rpc.lisp, "ACP-2").
+(defsystem "cl-stack-code/acp"
+  :description "cl-stack-code as an ACP agent (Zed, JetBrains, Emacs agent-shell): a code-acp-agent with methods on acp-protocol's agent-side generic functions over the SDK, served on stdio by acp-backend-stdio (cl-stack-code --acp)"
+  :author "egao1980"
+  :license "MIT"
+  :depends-on ("cl-stack-code"
+               (:version "acp-protocol" "0.1.0")
+               (:version "acp-backend-stdio" "0.1.0")
+               "json-protocol"
+               "bordeaux-threads")
+  :serial t
+  :pathname "src/acp"
+  :components ((:file "package")
+               (:file "mapping")
+               (:file "agent")
+               (:file "serve"))
+  ;; A binary that has --acp built in (the core's binary loads this system
+  ;; at flag time when ASDF can find it).
+  :build-operation "program-op"
+  :build-pathname "bin/cl-stack-code-acp"
+  :entry-point "cl-stack-code:main"
+  :in-order-to ((test-op (test-op "cl-stack-code/acp/tests"))))
+
+(defsystem "cl-stack-code/acp/tests"
+  :depends-on ("cl-stack-code/acp"
+               ;; the scripted mock LLM and the project helpers
+               "cl-stack-code/tests"
+               "acp-protocol"
+               "acp-backend-stdio"
+               "rpc-backend-stdio"
+               "json-protocol"
+               "bordeaux-threads"
+               "rove")
+  :pathname "tests/acp"
+  :serial t
+  :components ((:file "package")
+               (:file "support")
+               ;; the harness itself, against a stand-in agent (passes on the stubs)
+               (:file "harness-test")
+               (:file "mapping-test")
+               (:file "loopback-test")
+               (:file "loopback-tools-test")
+               (:file "process-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

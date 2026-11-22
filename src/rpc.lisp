@@ -544,6 +544,60 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
                :data-dir data-dir
                :getenv (or getenv #'uiop:getenv))))
 
+;;; ACP-2: --acp. The agent core never depends on ACP: the server lives in
+;;; the system cl-stack-code/acp, which sets the hook *ACP-SERVER* when it
+;;; loads. The core only parses and checks the flag and builds the client
+;;; arguments, exactly as for --rpc.
+;;;   *ACP-SERVER*: NIL, or a function (&rest client-args &key input output
+;;;   &allow-other-keys) → an exit code, as SERVE-RPC but on streams:
+;;;   cl-stack-code/acp sets it to CL-STACK-CODE/ACP:SERVE-ACP.
+;;;   *ACP-SYSTEM*: the ASDF system that provides it ("cl-stack-code/acp").
+;;;   RUN-CLI → %RUN-ACP: CHECK-ACP-FLAGS (exit 2), %RESOLVE-CWD (exit 2),
+;;;   then the server: *ACP-SERVER*, else (when ASDF is in the image and
+;;;   finds *ACP-SYSTEM*) ASDF:LOAD-SYSTEM of it with *STANDARD-OUTPUT* bound
+;;;   to ERROR-OUTPUT (stdout is the protocol) and *ACP-SERVER* again, else
+;;;   CODE-USAGE-ERROR "--acp needs the cl-stack-code/acp system: load it
+;;;   or build the binary from it" (exit 2). The server is called with
+;;;   :INPUT and :OUTPUT (RUN-CLI's), :CWD, :SETTINGS (the flag layer),
+;;;   :PLAN-AREA, :PROVIDERS, :USER-CONFIG-DIR, :DATA-DIR and :GETENV, with
+;;;   *STANDARD-OUTPUT* bound to ERROR-OUTPUT while it runs; its value is
+;;;   the exit code.
+
+(defvar *acp-server* nil
+  "NIL, or the --acp server: (lambda (&rest client-args &key input output
+&allow-other-keys)) → an exit code. Set by the cl-stack-code/acp system.")
+
+(defvar *acp-system* "cl-stack-code/acp"
+  "The ASDF system --acp loads when *ACP-SERVER* is NIL.")
+
+(defun %acp-server (error-output)
+  (or *acp-server*
+      (let ((asdf (find-package "ASDF")))
+        (when (and asdf (uiop:symbol-call asdf "FIND-SYSTEM" *acp-system* nil))
+          (let ((*standard-output* error-output))
+            (uiop:symbol-call asdf "LOAD-SYSTEM" *acp-system*)))
+        *acp-server*)
+      (error 'code-usage-error
+             :message (format nil "--acp needs the ~a system: load it or build the binary from it"
+                              *acp-system*))))
+
+(defun %run-acp (inv &key output input error-output providers user-config-dir getenv data-dir)
+  (check-acp-flags inv)
+  (let* ((error-output (or error-output *error-output*))
+         (cwd (%resolve-cwd (invocation-cwd inv)))
+         (server (%acp-server error-output)))
+    (let ((*standard-output* error-output))
+      (funcall server
+               :input input
+               :output output
+               :cwd cwd
+               :settings (invocation-settings inv)
+               :plan-area (or (invocation-plan-area inv) :auto)
+               :providers providers
+               :user-config-dir user-config-dir
+               :data-dir data-dir
+               :getenv (or getenv #'uiop:getenv)))))
+
 ;;; The subprocess client.
 
 (defun connect-rpc-client (&key command transport on-event (error-output :interactive))
