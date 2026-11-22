@@ -290,6 +290,9 @@ or NIL when a key is missing."
    (on-event :initarg :on-event :initform nil :accessor %client-on-event)
    (on-approval :initarg :on-approval :initform nil :accessor %client-on-approval)
    (plan-area :initarg :plan-area :initform :auto :reader %client-plan-area)
+   ;; R4d-4b
+   (plan-backend :initarg :plan-backend :initform nil :reader %client-plan-backend
+                 :documentation "PLAN-COMPUTE-BACKEND, resolved by MAKE-CLIENT (its thread).")
    (lock :initform (bt:make-lock "cl-stack-code client") :reader %client-lock)
    (sessions :initform '() :accessor %client-sessions
              :documentation "Open CODE-SESSIONs, newest first.")
@@ -363,6 +366,8 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
   agent sources link checkpointer cwd-instructions
   ;; H5a
   plan plan-sources plan-turn-p
+  ;; R4d-4b
+  plan-sandbox
   ;; the run (kept across turns: CONTINUE-AI-AGENT-ASYNC)
   run handle
   (committed (make-hash-table :test 'eq))
@@ -403,7 +408,15 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
          (agent:*off-loop-specials*
            (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                   agent:*off-loop-specials*)))
-    (handler-bind ((agent:agent-approval-required
+    (handler-bind ((agent:agent-tool-error
+                     ;; R4d-4b: a confined bash the backend refused. The SDK's
+                     ;; notice is the plan event's "sandbox" object.
+                     (%plan-sandbox-refusal-handler
+                      (lambda (c)
+                        (let ((session (%session-of-run client (agent:agent-error-run c))))
+                          (and session (%s-plan-sandbox (%session-state session)))))
+                      nil))
+                   (agent:agent-approval-required
                      (lambda (c)
                        ;; Only a bypassPermissions session answers; otherwise
                        ;; the run pauses and the caller answers.
@@ -472,7 +485,9 @@ there. Its error is signalled again in the caller (the same object)."
                                 :getenv (or getenv #'uiop:getenv)
                                 :on-event on-event
                                 :on-approval on-approval
-                                :plan-area (or plan-area :auto)))
+                                :plan-area (or plan-area :auto)
+                                ;; R4d-4b: here, not on the loop thread.
+                                :plan-backend (plan-compute-backend)))
          (eb (event-backend-libuv:make-libuv-backend))
          (el (event:make-event-loop eb))
          (loop (%make-loop))
@@ -896,54 +911,99 @@ attached already)."
     (let ((st (%session-state session)))
       (%finish-turn session st (%s-run st) condition))))
 
+(defun %sdk-plan-settings (st)
+  (merge-settings (%s-settings st)
+                  (make-settings :permission-mode :plan
+                                 :lisp-image '(:image (:off)))))
+
+(defun %sdk-plan-agent (st plan settings sandbox)
+  "The area's tool sources for PLAN (confined while SANDBOX is) and the
+instructions. → (values sources instructions). H8d: on the session's
+supervisor, under an :agent scope \"plan-<id8>\"."
+  (let* ((agent (%s-agent st))
+         (sup (%s-supervisor st))
+         (sources (apply #'make-code-tools (plan-tool-root plan (%s-cwd st))
+                         :settings settings
+                         :supervisor sup
+                         :scope (%plan-unit-scope sup plan)
+                         (plan-sandbox-tool-keys sandbox))))
+    (handler-bind ((error (lambda (e)
+                            (declare (ignore e))
+                            (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                                                   :shell-tools (list (second sources))))))
+      (let ((offered (loop for source in sources
+                           append (mapcar #'llm:llm-tool-name
+                                          (agent:list-agent-tools source)))))
+        (values sources
+                (assemble-system-prompt
+                 (%s-cwd st) :tools offered :backend (agent:ai-agent-backend agent)
+                             :settings settings :user-config-dir (%s-config st)
+                             :plan plan :sandbox sandbox))))))
+
 (defun %sdk-ensure-plan (session st report)
   "H5a: open (or reopen) the session's plan and give the agent the area's
 tools and instructions (as %ENSURE-PLAN); the run is dropped. The plan
-\"opened\" / \"reopened\" event."
-  (unless (%s-plan st)
-    (let* ((client (code-session-client session))
-           (cwd (%s-cwd st))
-           (data-dir (%s-data-dir st))
-           (store (code-session-store session))
-           (entry (%head-plan-entry store))
-           (reopened nil)
-           (plan (or (and entry (eq :open (getf entry :status))
-                          (handler-case (prog1 (reopen-plan (plans-directory cwd :data-dir data-dir)
-                                                            (getf entry :id))
-                                          (setf reopened t))
-                            (plan-not-found () nil)))
-                     (open-plan (%s-project-dir st) :kind (%client-plan-area client)
-                                                    :data-dir data-dir
-                                                    :session-id (session-id store))))
-           (agent (%s-agent st))
-           (settings (merge-settings (%s-settings st)
-                                     (make-settings :permission-mode :plan
-                                                    :lisp-image '(:image (:off)))))
-           ;; H8d: the area's tools on the session's supervisor, under an
-           ;; :agent scope "plan-<id8>".
-           (sup (%s-supervisor st))
-           (sources (make-code-tools (plan-tool-root plan cwd) :settings settings
-                                                               :supervisor sup
-                                                               :scope (%plan-unit-scope sup plan))))
-      (handler-bind ((error (lambda (e)
-                              (declare (ignore e))
-                              (%close-code-units nil :unit-tools (list (code-unit-tools sources))
-                                                     :shell-tools (list (second sources))))))
-        (let* ((offered (loop for source in sources
-                              append (mapcar #'llm:llm-tool-name
-                                             (agent:list-agent-tools source))))
-               (instructions (assemble-system-prompt
-                              cwd :tools offered :backend (agent:ai-agent-backend agent)
-                                  :settings settings :user-config-dir (%s-config st)
-                                  :plan plan)))
+\"opened\" / \"reopened\" event, with its \"sandbox\" object (R4d-4b: probed
+when the plan opens; failIfUnavailable: the plan does not open). While a plan
+is open, a sandbox that refused a command gets unconfined shell tools that
+ask (%SDK-REFRESH-PLAN-SHELL)."
+  (if (%s-plan st)
+      (%sdk-refresh-plan-shell st)
+      (let* ((client (code-session-client session))
+             (cwd (%s-cwd st))
+             (data-dir (%s-data-dir st))
+             (store (code-session-store session))
+             (entry (%head-plan-entry store))
+             (reopened nil)
+             (plan (or (and entry (eq :open (getf entry :status))
+                            (handler-case (prog1 (reopen-plan (plans-directory cwd :data-dir data-dir)
+                                                              (getf entry :id))
+                                            (setf reopened t))
+                              (plan-not-found () nil)))
+                       (open-plan (%s-project-dir st) :kind (%client-plan-area client)
+                                                      :data-dir data-dir
+                                                      :session-id (session-id store))))
+             (agent (%s-agent st))
+             (settings (%sdk-plan-settings st))
+             (sandbox (handler-bind ((plan-sandbox-unavailable
+                                       (lambda (e)
+                                         (declare (ignore e))
+                                         ;; A fresh plan does not stay open behind it.
+                                         (unless reopened (reject-plan plan)))))
+                        (open-plan-sandbox plan settings
+                                           :backend (%client-plan-backend client)))))
+        (multiple-value-bind (sources instructions) (%sdk-plan-agent st plan settings sandbox)
           (setf (%s-cwd-instructions st) (agent:ai-agent-instructions agent)
                 (agent:ai-agent-tools agent) sources
                 (agent:ai-agent-instructions agent) instructions
+                (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
                 (%s-plan st) plan
                 (%s-plan-sources st) sources
+                (%s-plan-sandbox st) sandbox
                 (%s-run st) nil
-                (%s-handle st) nil)))
-      (apply #'%emit-event report "plan" (%plan-open-keys plan reopened)))))
+                (%s-handle st) nil))
+        (apply #'%emit-event report "plan" (%plan-open-keys plan reopened sandbox)))))
+
+(defun %sdk-refresh-plan-shell (st)
+  "R4d-4b, at a turn's start: after a refusal, the plan's shell tools again
+without the confinement and the rules without the shell allows (bash and
+job_input ask; denied with failIfUnavailable); the old sources are closed and
+the run is dropped."
+  (let ((sandbox (%s-plan-sandbox st))
+        (old (%s-plan-sources st)))
+    (when (%plan-shell-stale-p sandbox old)
+      (let ((settings (%sdk-plan-settings st))
+            (agent (%s-agent st)))
+        (multiple-value-bind (sources instructions)
+            (%sdk-plan-agent st (%s-plan st) settings sandbox)
+          (setf (agent:ai-agent-tools agent) sources
+                (agent:ai-agent-instructions agent) instructions
+                (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
+                (%s-plan-sources st) sources
+                (%s-run st) nil
+                (%s-handle st) nil))
+        (%close-code-units nil :unit-tools (list (code-unit-tools old))
+                               :shell-tools (list (second old)))))))
 
 (defun %restore-cwd-tools (st)
   "H5a: the plan closed: the working directory's tools and instructions
@@ -955,9 +1015,12 @@ again, the run dropped."
       (setf (agent:ai-agent-instructions agent) (%s-cwd-instructions st)))
     (setf (%s-plan st) nil
           (%s-plan-sources st) nil
+          (%s-plan-sandbox st) nil
           (%s-plan-turn-p st) nil
           (%s-run st) nil
           (%s-handle st) nil)
+    ;; R4d-4b: the mode's rules, without the plan's sandbox.
+    (setf (agent:ai-agent-permissions agent) (%agent-permissions (%s-settings st)))
     ;; H8d: the area's unit tools, then its shell tools (the plan scope's
     ;; units stop with the supervisor).
     (%close-code-units nil :unit-tools (list (code-unit-tools sources))

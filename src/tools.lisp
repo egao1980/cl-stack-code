@@ -7,7 +7,8 @@
   (let ((hidden (hidden-tool-names settings names)))
     (remove-if (lambda (name) (member name hidden :test #'string=)) names)))
 
-(defun make-code-tools (cwd &key settings on-image-event supervisor scope)
+(defun make-code-tools (cwd &key settings on-image-event supervisor scope
+                              confinement compute-backend)
   "→ (file-tools shell-tools), both rooted at CWD. The shell tools need
 approval and get SETTINGS-ENV of SETTINGS as their :env. H4b: with
 LISP-IMAGE-ENABLED-P, (file-tools shell-tools lisp-tools), the lisp tools
@@ -20,7 +21,13 @@ the root), and a UNIT-TOOLS source over SUPERVISOR (approval for
 unit_control, every other unit tool free, the names SETTINGS does not hide)
 comes LAST: (file-tools shell-tools [lisp-tools] unit-tools). The lisp tools
 stay third, so (THIRD sources) is still the lisp tools when the image is on;
-CODE-UNIT-TOOLS finds the unit tools."
+CODE-UNIT-TOOLS finds the unit tools.
+
+R4d-4b: CONFINEMENT and COMPUTE-BACKEND (both or neither) go to
+MAKE-SHELL-TOOLS unchanged, so every bash command line (and its job) runs
+confined, under SUPERVISOR as a confined unit; the bash description then ends
+with the policy (AGENT-TOOLS:CONFINEMENT-DESCRIPTION). Plan mode passes its
+PLAN-SANDBOX's confinement and backend while the sandbox is :CONFINED."
   (let* ((settings (or settings (make-settings)))
          (root (uiop:ensure-directory-pathname cwd))
          (files (tools:make-file-tools
@@ -31,9 +38,12 @@ CODE-UNIT-TOOLS finds the unit tools."
                        :needs-approval t
                        :env (settings-env settings)
                        :tools (%offered-names settings tools:+shell-tool-names+)
-                       (and supervisor
-                            (append (list :supervisor supervisor)
-                                    (and scope (list :scope scope))))))
+                       (append
+                        (and supervisor
+                             (append (list :supervisor supervisor)
+                                     (and scope (list :scope scope))))
+                        (and confinement
+                             (list :confinement confinement :compute-backend compute-backend)))))
          (lisp nil)
          (units nil))
     ;; Everything made so far is closed when a later source cannot be made.

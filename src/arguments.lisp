@@ -99,6 +99,9 @@ ours to rebind, so it goes in as :BACKEND)."
                 :kind :flag)
            (opt "on-drift" "With --apply, when the working copy changed under the plan: abort (default), rebase or overwrite")
            (opt "plan-area" "Plan mode: auto (default), git or copy")
+           ;; R4d-4b
+           (opt "allow-network" "Plan mode: let the confined shell reach the network (sandbox.network allow)"
+                :kind :flag)
            ;; H5b
            (opt "rewind" "With --resume or --continue and no prompt: rewind the session to turn N (0 = its start)")
            (opt "rewind-mode" "With --rewind: both (default), conversation or files")
@@ -237,7 +240,9 @@ are present is checked by RUN-CLI, not here."
                     :model-params (%model-param-flags (get-opt :model-param))
                     ;; H4b
                     :lisp-image (%lisp-image-flag (get-opt :lisp-image)
-                                                  (get-opt :lisp-observe))))))))
+                                                  (get-opt :lisp-observe))
+                    ;; R4d-4b
+                    :sandbox (and (get-opt :allow-network) (list :network :allow))))))))
 
 (defun %usage-text (stream)
   "Write the --help text to STREAM."
@@ -294,6 +299,7 @@ permission mode (flags over settings); otherwise CODE-USAGE-ERROR:
   --on-drift without --apply or --rewind  → \"--on-drift needs --apply or --rewind\"
   --apply with a prompt and MODE not :PLAN, or --plan-area with MODE not :PLAN
                                           → \"--apply and --plan-area need --permission-mode plan\"
+  --allow-network with MODE not :PLAN     → \"--allow-network needs --permission-mode plan\"
 An action-only invocation (--apply or --reject, --resume or --continue, no
 prompt) does not need plan mode; it acts on the session's open plan."
   (let* ((apply-p (invocation-apply-p invocation))
@@ -311,7 +317,15 @@ prompt) does not need plan mode; it acts on the session's open plan."
                (or (and apply-p (or prompt (not resumed)))
                    (invocation-plan-area invocation)))
       (%usage-fail "--apply and --plan-area need --permission-mode plan"))
+    ;; R4d-4b
+    (when (and (not plan-mode-p) (invocation-allow-network-p invocation))
+      (%usage-fail "--allow-network needs --permission-mode plan"))
     t))
+
+(defun invocation-allow-network-p (invocation)
+  "R4d-4b: true when INVOCATION has --allow-network (the flag layer's
+sandbox.network \"allow\")."
+  (eq :allow (getf (settings-sandbox (invocation-settings invocation)) :network)))
 
 ;;; H5b: rewind flags.
 

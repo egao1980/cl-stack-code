@@ -48,6 +48,13 @@ See LISP-IMAGE-SETTINGS.")
                  :documentation "The \"modelParams\" object as an alist (wire-name
 . value) in first-set order; a :NULL value means unset. See
 MODEL-PARAMS-LLM-SETTINGS.")
+   ;; R4d-4b
+   (sandbox :initarg :sandbox :reader settings-sandbox :initform nil
+            :documentation "The \"sandbox\" object as a plist of the keys this
+layer sets: :NETWORK (:NONE or :ALLOW), :EXTRA-WRITABLE (a list of absolute
+directory pathnames), :FAIL-IF-UNAVAILABLE (T or NIL). An absent key is unset;
+a present :FAIL-IF-UNAVAILABLE NIL means false. LOAD-SETTINGS keeps it from the
+user file and the flag layer only. See SANDBOX-SETTINGS.")
    (files :initarg :files :reader settings-files :initform nil
           :documentation "Settings files this layer was read from, in order."))
   (:documentation "One settings layer, or the merge of several."))
@@ -62,11 +69,11 @@ MODEL-PARAMS-LLM-SETTINGS.")
 
 (defun make-settings (&key model max-turns permission-mode allow ask deny env
                         append-system-prompt files checkpoints lisp-image
-                        model-params)
+                        model-params sandbox)
   "A SETTINGS layer. NIL means unset for every scalar. CHECKPOINTS (H5b): a
 plist of the checkpoints keys this layer sets. LISP-IMAGE (H4b): a plist of the
 lispImage keys this layer sets. MODEL-PARAMS: an alist (wire-name . value) of
-the modelParams keys this layer sets (:NULL = unset)."
+the modelParams keys this layer sets (:NULL = unset). SANDBOX (R4d-4b): a plist of the sandbox keys this layer sets."
   (make-instance 'settings :model model :max-turns max-turns
                            :permission-mode permission-mode
                            :allow allow :ask ask :deny deny :env env
@@ -74,6 +81,7 @@ the modelParams keys this layer sets (:NULL = unset)."
                            :checkpoints (copy-list checkpoints)
                            :lisp-image (copy-list lisp-image)
                            :model-params (copy-alist model-params)
+                           :sandbox (copy-list sandbox)
                            :files files))
 
 ;;; H5b: the checkpoints object.
@@ -225,6 +233,80 @@ NIL, on-debugger :TURN."
   "True when SETTINGS's lispImage.image is spawn or attach."
   (not (eq :off (first (lisp-image-settings settings)))))
 
+;;; R4d-4b: the sandbox object (given code).
+;;;
+;;;   "sandbox": {"network": "none", "extraWritable": ["/abs/dir", "~/cache"],
+;;;               "failIfUnavailable": false}
+;;;
+;;; network            "none" (default) or "allow": the network policy of plan
+;;;                    mode's confinement. --allow-network sets "allow" in the
+;;;                    flag layer.
+;;; extraWritable      array of directories (absolute, or starting with "~/"
+;;;                    for the user's home) that plan mode's confinement also
+;;;                    makes writable, after the area and the scratch dir.
+;;;                    Existence is checked when a plan opens (PLAN-CONFINEMENT).
+;;; failIfUnavailable  boolean (default false): when plan mode cannot confine,
+;;;                    refuse to run (PLAN-SANDBOX-UNAVAILABLE, exit 1) instead
+;;;                    of asking before each bash and job_input call. Claude Code
+;;;                    runs unsandboxed unless its failIfUnavailable is set; we
+;;;                    never run unconfined silently, so false means "ask".
+;;; Layers merge per key (last wins), but LOAD-SETTINGS takes "sandbox" from
+;;; the user file and the flag layer only: the project and local files live in
+;;; the repository, which must not widen its own sandbox. A bad value signals
+;;; SETTINGS-ERROR with key path "sandbox", "sandbox.network",
+;;; "sandbox.extraWritable", "sandbox.extraWritable[i]" or
+;;; "sandbox.failIfUnavailable".
+
+(defparameter +sandbox-network-names+ '("none" "allow")
+  "R4d-4b: the sandbox.network values.")
+
+(defun %sandbox-directory (string)
+  "STRING (absolute, or \"~/…\") as a directory pathname, or NIL when it is
+neither. \"~/\" is the user's home (USER-HOMEDIR-PATHNAME)."
+  (cond ((not (and (stringp string) (plusp (length string)))) nil)
+        ((uiop:string-prefix-p "~/" string)
+         (uiop:merge-pathnames* (uiop:parse-native-namestring (subseq string 2)
+                                                              :ensure-directory t)
+                                (user-homedir-pathname)))
+        (t (%absolute-directory string))))
+
+(defun %parse-sandbox (file value)
+  (unless (hash-table-p value)
+    (%settings-fail file "sandbox" "must be an object with network, extraWritable and failIfUnavailable"))
+  (let ((out '()))
+    (multiple-value-bind (network present) (%json-present value "network")
+      (when present
+        (unless (and (stringp network) (member network +sandbox-network-names+ :test #'string=))
+          (%settings-fail file "sandbox.network" "must be one of ~{~a~^, ~}"
+                          +sandbox-network-names+))
+        (setf out (list* :network (intern (string-upcase network) :keyword) out))))
+    (multiple-value-bind (dirs present) (%json-present value "extraWritable")
+      (when present
+        (unless (%json-array-p dirs)
+          (%settings-fail file "sandbox.extraWritable" "must be an array of directories"))
+        (setf out (list* :extra-writable
+                         (loop for item across dirs
+                               for i from 0
+                               collect (or (%sandbox-directory item)
+                                           (%settings-fail file (format nil "sandbox.extraWritable[~d]" i)
+                                                           "must be an absolute directory or start with ~~/")))
+                         out))))
+    (multiple-value-bind (fail present) (%json-present value "failIfUnavailable")
+      (when present
+        (unless (member fail '(t nil))
+          (%settings-fail file "sandbox.failIfUnavailable" "must be true or false"))
+        (setf out (list* :fail-if-unavailable fail out))))
+    out))
+
+(defun sandbox-settings (settings)
+  "→ (values network extra-writable fail-if-unavailable) of SETTINGS's sandbox
+object with the defaults applied: network :NONE, extra-writable NIL,
+fail-if-unavailable NIL."
+  (let ((plist (and settings (settings-sandbox settings))))
+    (values (getf plist :network :none)
+            (getf plist :extra-writable nil)
+            (getf plist :fail-if-unavailable nil))))
+
 
 ;;; The modelParams object: sampling parameters for every model call.
 ;;;
@@ -365,7 +447,10 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
                            (and present (%parse-lisp-image file value))))
              (model-params (multiple-value-bind (value present)
                                (%json-present object "modelParams")
-                             (and present (%parse-model-params file value)))))
+                             (and present (%parse-model-params file value))))
+             ;; R4d-4b
+             (sandbox (multiple-value-bind (value present) (%json-present object "sandbox")
+                        (and present (%parse-sandbox file value)))))
         (make-settings
          :model model
          :max-turns max-turns
@@ -378,6 +463,7 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
          :checkpoints checkpoints
          :lisp-image lisp-image
          :model-params model-params
+         :sandbox sandbox
          :files (and file (list file)))))))
 
 (defun read-settings-file (pathname)
@@ -445,6 +531,7 @@ gives the value (NIL = unset). Fresh conses; the layers are not modified."
        :checkpoints (%merge-checkpoints (mapcar #'settings-checkpoints layers))
        :lisp-image (%merge-checkpoints (mapcar #'settings-lisp-image layers))
        :model-params (%merge-env (mapcar #'settings-model-params layers))
+       :sandbox (%merge-checkpoints (mapcar #'settings-sandbox layers))
        :files (loop for layer in layers append (settings-files layer))))))
 
 ;;; Where the files are.
@@ -485,8 +572,17 @@ when there is no project root."
 
 (defun load-settings (cwd &key user-config-dir cli)
   "→ the merge of the user, project and local files for CWD, then CLI (the
-flag layer). SETTINGS-ERROR restarts are visible to a handler around it."
-  (apply #'merge-settings
-         (append (mapcar #'read-settings-file
-                         (settings-file-paths cwd :user-config-dir user-config-dir))
-                 (list cli))))
+flag layer). SETTINGS-ERROR restarts are visible to a handler around it.
+R4d-4b: the project and local files' \"sandbox\" objects are dropped (a
+repository cannot widen its own sandbox); the user file's and CLI's are kept."
+  (destructuring-bind (user project local)
+      (mapcar #'read-settings-file (settings-file-paths cwd :user-config-dir user-config-dir))
+    (merge-settings user (%without-sandbox project) (%without-sandbox local) cli)))
+
+(defun %without-sandbox (layer)
+  "LAYER (a SETTINGS or NIL) with its sandbox object unset."
+  (if (and layer (settings-sandbox layer))
+      (let ((copy (merge-settings layer)))
+        (setf (slot-value copy 'sandbox) nil)
+        copy)
+      layer))
