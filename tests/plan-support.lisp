@@ -162,15 +162,15 @@ tree engine without rename detection, :CONTEXT 3, :UNIFIED."
         (list path node))))
 
 (defun plan-events (out)
-  "The stream-json plan events of OUT."
-  (events out "plan"))
+  "The stream-json preview events of OUT (H5a plan events, renamed)."
+  (events out "preview"))
 
 (defun plan-event (out subtype)
   (find subtype (plan-events out) :key (lambda (e) (jget e "subtype")) :test #'equal))
 
 (defun result-plan (out)
-  "The \"plan\" object of the last result line of OUT."
-  (jget (car (last (events out "result"))) "plan"))
+  "The \"preview\" object of the last result line of OUT."
+  (jget (car (last (events out "result"))) "preview"))
 
 (defun json-changes (object)
   "(kind path) lists of a JSON \"changes\" vector."

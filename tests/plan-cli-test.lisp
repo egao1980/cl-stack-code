@@ -1,11 +1,11 @@
 (in-package #:cl-stack-code/tests)
 
-;;; H5a: plan mode in -p (src/headless.lisp header, "H5a").
+;;; H5a: preview mode (H5a plan mode, renamed in 0.15.0) in -p (src/headless.lisp header, "H5a").
 
 (defun plan-run (project config steps &rest argv)
   "A stream-json plan run of PROJECT with prompt \"go\". → (values exit out
 err backend)."
-  (code project config (append '("-p" "--output-format" "stream-json" "--permission-mode" "plan")
+  (code project config (append '("-p" "--output-format" "stream-json" "--permission-mode" "preview")
                                argv '("go"))
         :steps steps))
 
@@ -20,7 +20,7 @@ err backend)."
 (defun the-plan-of (out)
   "The plan the stream-json run OUT opened or reopened, read from disk."
   (let ((opened (or (plan-event out "opened") (plan-event out "reopened"))))
-    (find (jget opened "plan_id") (list-plans (uiop:ensure-directory-pathname
+    (find (jget opened "preview_id") (list-plans (uiop:ensure-directory-pathname
                                                (uiop:pathname-parent-directory-pathname
                                                 (uiop:pathname-parent-directory-pathname
                                                  (uiop:parse-native-namestring (jget opened "area")
@@ -33,13 +33,13 @@ err backend)."
     ((argv needle)
      :ids ("apply-and-reject" "reject-with-prompt" "on-drift-alone" "apply-not-plan"
            "plan-area-not-plan" "bad-on-drift" "bad-plan-area")
-     ('("--permission-mode" "plan" "--apply" "--reject" "x") "--apply and --reject cannot be used together")
+     ('("--permission-mode" "preview" "--apply" "--reject" "x") "--apply and --reject cannot be used together")
      ('("--reject" "x") "--reject needs --resume or --continue and no prompt")
-     ('("--permission-mode" "plan" "--on-drift" "rebase" "x") "--on-drift needs --apply")
-     ('("--apply" "x") "--apply and --plan-area need --permission-mode plan")
-     ('("--plan-area" "copy" "x") "--apply and --plan-area need --permission-mode plan")
-     ('("--permission-mode" "plan" "--apply" "--on-drift" "maybe" "x") "unknown --on-drift \"maybe\"")
-     ('("--permission-mode" "plan" "--plan-area" "zfs" "x") "unknown --plan-area \"zfs\""))
+     ('("--permission-mode" "preview" "--on-drift" "rebase" "x") "--on-drift needs --apply")
+     ('("--apply" "x") "--apply and --preview-area need --permission-mode preview")
+     ('("--preview-area" "copy" "x") "--apply and --preview-area need --permission-mode preview")
+     ('("--permission-mode" "preview" "--apply" "--on-drift" "maybe" "x") "unknown --on-drift \"maybe\"")
+     ('("--permission-mode" "preview" "--preview-area" "zfs" "x") "unknown --preview-area \"zfs\""))
   (with-project (project config) '()
     (multiple-value-bind (exit out err) (code project config (cons "-p" argv) :steps '("unused")
                                                                                :input "from stdin")
@@ -51,23 +51,23 @@ err backend)."
 (deftest plan-cli-check-plan-flags
   (flet ((inv (&rest argv) (parse-arguments (cons "-p" argv))))
     (ok (check-plan-flags (inv "x") :default) "no plan flag")
-    (ok (check-plan-flags (inv "--apply" "x") :plan))
-    (ok (check-plan-flags (inv "--apply" "--on-drift" "rebase" "x") :plan))
+    (ok (check-plan-flags (inv "--apply" "x") :preview))
+    (ok (check-plan-flags (inv "--apply" "--on-drift" "rebase" "x") :preview))
     (ok (check-plan-flags (inv "--resume" "abcd" "--apply") :default) "action only needs no mode")
     (ok (check-plan-flags (inv "-c" "--reject") :default))
     (ok (typep (failure (check-plan-flags (inv "--apply" "x") :accept-edits)) 'code-usage-error))
     (ok (eq :rebase (invocation-on-drift (inv "--on-drift" "rebase" "x"))))
-    (ok (eq :git (invocation-plan-area (inv "--plan-area" "git" "x"))))
+    (ok (eq :git (invocation-preview-area (inv "--preview-area" "git" "x"))))
     (ok (invocation-apply-p (inv "--apply" "x")))
     (ok (invocation-reject-p (inv "--reject" "x")))))
 
 (deftest plan-cli-plan-area-git-needs-a-worktree
   (with-project (project config) '(("a.txt" "alpha"))
     (multiple-value-bind (exit out err)
-        (code project config '("-p" "--permission-mode" "plan" "--plan-area" "git" "x") :steps '("unused"))
+        (code project config '("-p" "--permission-mode" "preview" "--preview-area" "git" "x") :steps '("unused"))
       (ok (eql 2 exit))
       (ok (equal "" out))
-      (ok (has "--plan-area git" err))
+      (ok (has "--preview-area git" err))
       (ok (has "is not a git worktree" err)))))
 
 ;;; A plan run.
@@ -77,7 +77,7 @@ err backend)."
   (with-kind-project (kind project config) '(("a.txt" "alpha
 "))
     (multiple-value-bind (exit out err)
-        (code project config '("-p" "--permission-mode" "plan" "make it beta")
+        (code project config '("-p" "--permission-mode" "preview" "make it beta")
               :steps (list (write-tool "a.txt" (nl "beta")) "Done."))
       (ok (eql 0 exit))
       (ok (equal (nl "alpha") (read-file project "a.txt")) "the project is untouched")
@@ -89,16 +89,16 @@ err backend)."
                            (expected-diff (list (list "a.txt" (nl "alpha") (nl "beta")))))
                    out)
             "the answer, an empty line, the projected diff")
-        (ok (has (format nil "plan ~a: 1 file changed, not applied" (plan-id plan)) err) err)
+        (ok (has (format nil "preview ~a: 1 file changed, not applied" (plan-id plan)) err) err)
         (ok (has "--apply" err))))))
 
 (deftest plan-cli-no-changes
   (with-project (project config) '(("a.txt" "alpha"))
     (multiple-value-bind (exit out err)
-        (code project config '("-p" "--permission-mode" "plan" "look") :steps '("Nothing to do."))
+        (code project config '("-p" "--permission-mode" "preview" "look") :steps '("Nothing to do."))
       (ok (eql 0 exit))
       (ok (equal (nl "Nothing to do.") out))
-      (ok (has (format nil "plan ~a: no changes" (plan-id (only-plan project config))) err) err))))
+      (ok (has (format nil "preview ~a: no changes" (plan-id (only-plan project config))) err) err))))
 
 (deftest-parametrize plan-cli-stream-json
     ((kind) :ids ("copy" "git") (:copy) (:git))
@@ -113,10 +113,10 @@ err backend)."
              (projected (plan-event out "projected"))
              (diff (expected-diff (list (list "a.txt" (nl "alpha") (nl "beta"))))))
         (ok (equal "system" (first types)))
-        (ok (equal "plan" (second types)) "the plan event follows system init")
+        (ok (equal "preview" (second types)) "the preview event follows system init")
         (ok (equal "result" (car (last types))))
-        (ok (equal "plan" (car (last types 2))) "projected comes right before the result")
-        (ok (equal (plan-id plan) (jget opened "plan_id")))
+        (ok (equal "preview" (car (last types 2))) "projected comes right before the result")
+        (ok (equal (plan-id plan) (jget opened "preview_id")))
         (ok (equal (string-downcase (string kind)) (jget opened "kind")))
         (ok (equal (native (plan-root plan)) (jget opened "area")))
         (ok (equal (plan-base plan) (jget opened "base")))
@@ -134,11 +134,11 @@ err backend)."
 (deftest plan-cli-json
   (with-project (project config) '(("a.txt" "alpha"))
     (multiple-value-bind (exit out)
-        (code project config '("-p" "--output-format" "json" "--permission-mode" "plan" "go")
+        (code project config '("-p" "--output-format" "json" "--permission-mode" "preview" "go")
               :steps (list (write-tool "b.txt" "new") "Done."))
       (ok (eql 0 exit))
       (ok (= 1 (length (lines out))))
-      (let ((rp (jget (first (json-lines out)) "plan")))
+      (let ((rp (jget (first (json-lines out)) "preview")))
         (ok (equal "open" (jget rp "status")))
         (ok (equal '(("added" "b.txt")) (json-changes (jget rp "changes"))))))))
 
@@ -150,7 +150,7 @@ err backend)."
       (ok (eql 0 exit))
       (ok (equal "beta" (read-file project "a.txt")))
       (ok (null (plan-events out)))
-      (ok (eq :absent (gethash "plan" (car (last (events out "result"))) :absent))
+      (ok (eq :absent (gethash "preview" (car (last (events out "result"))) :absent))
           "the result shape is unchanged")
       (ok (null (project-plans project config))))))
 
@@ -158,15 +158,15 @@ err backend)."
   (with-project (project config) '("sub/" ("AGENTS.md" "Rule one.
 "))
     (multiple-value-bind (exit out err backend)
-        (code project config '("-p" "--output-format" "stream-json" "--permission-mode" "plan" "go")
+        (code project config '("-p" "--output-format" "stream-json" "--permission-mode" "preview" "go")
               :steps '("ok"))
       (declare (ignore exit err))
       (let* ((plan (the-plan-of out))
              (system (request-system (first-request backend))))
         (ok (has (format nil "- Working directory: ~a" (native (plan-root plan))) system))
-        (ok (has (format nil "- Plan: ~a (copy), a copy of ~a" (plan-id plan) (native project)) system))
-        (ok (has "- Permission mode: plan" system))
-        (ok (has +plan-mode-feedback+ system))
+        (ok (has (format nil "- Preview: ~a (copy), a copy of ~a" (plan-id plan) (native project)) system))
+        (ok (has "- Permission mode: preview" system))
+        (ok (has +preview-mode-feedback+ system))
         (ok (has "Rule one." system) "the instruction files are still read")))))
 
 ;;; Tools in the area.
@@ -252,7 +252,7 @@ err backend)."
         (ok (not (uiop:directory-exists-p (plan-root plan))))
         (ok (equal '(("modified" "a.txt")) (json-changes (jget (plan-event out "applied") "changes"))))
         (ok (equal "applied" (jget (result-plan out) "status")))
-        (ok (has (format nil "plan ~a: applied 1 file" (plan-id plan)) err) err)
+        (ok (has (format nil "preview ~a: applied 1 file" (plan-id plan)) err) err)
         (ok (eq :applied (getf (head-plan project config (session-id-of out)) :status))
             "the turn record has the plan after --apply")))))
 
@@ -274,7 +274,7 @@ err backend)."
   (with-kind-project (kind project config) '(("a.txt" "alpha"))
     (let* ((out1 (nth-value 1 (plan-run project config (list (write-tool "a.txt" "beta") "one"))))
            (session (session-id-of out1))
-           (id (jget (plan-event out1 "opened") "plan_id")))
+           (id (jget (plan-event out1 "opened") "preview_id")))
       (ok (equal id (getf (head-plan project config session) :id)) "the turn record names the plan")
       (ok (eq :open (getf (head-plan project config session) :status)))
       (ok (eq kind (getf (head-plan project config session) :kind)))
@@ -283,7 +283,7 @@ err backend)."
                     "--resume" session)
         (declare (ignore err))
         (ok (eql 0 exit))
-        (ok (equal id (jget (plan-event out2 "reopened") "plan_id")) "the same plan")
+        (ok (equal id (jget (plan-event out2 "reopened") "preview_id")) "the same plan")
         (ok (null (plan-event out2 "opened")))
         (ok (has "beta" (result-content (car (last (tool-results-of backend)))))
             "the second turn sees the first turn's edit")
@@ -293,12 +293,12 @@ err backend)."
 (deftest plan-cli-resume-after-apply-opens-a-new-plan
   (with-project (project config) '(("a.txt" "alpha"))
     (let* ((out1 (nth-value 1 (plan-run project config (list (write-tool "a.txt" "beta") "one") "--apply")))
-           (old (jget (plan-event out1 "opened") "plan_id")))
+           (old (jget (plan-event out1 "opened") "preview_id")))
       (multiple-value-bind (exit out2 err)
           (plan-run project config '("two") "--resume" (session-id-of out1))
         (ok (eql 0 exit))
         (ok (plan-event out2 "opened"))
-        (ok (not (equal old (jget (plan-event out2 "opened") "plan_id"))))
+        (ok (not (equal old (jget (plan-event out2 "opened") "preview_id"))))
         (ok (not (has "no longer open" err)) "an applied plan is not a lost one")))))
 
 (deftest plan-cli-resume-lost-plan
@@ -309,9 +309,9 @@ err backend)."
       (multiple-value-bind (exit out2 err)
           (plan-run project config '("two") "--resume" (session-id-of out1))
         (ok (eql 0 exit))
-        (let ((new (jget (plan-event out2 "opened") "plan_id")))
+        (let ((new (jget (plan-event out2 "opened") "preview_id")))
           (ok new)
-          (ok (has (format nil "plan ~a is no longer open; opened plan ~a" (plan-id old) new) err)
+          (ok (has (format nil "preview ~a is no longer open; opened preview ~a" (plan-id old) new) err)
               err))))))
 
 ;;; Action only.
@@ -343,14 +343,14 @@ err backend)."
           (code project config (list "-p" "--output-format" "stream-json" "--continue" "--apply")
                 :steps '())
         (ok (eql 0 exit))
-        (ok (equal '("plan" "result") (mapcar (lambda (o) (jget o "type")) (json-lines out))))
+        (ok (equal '("preview" "result") (mapcar (lambda (o) (jget o "type")) (json-lines out))))
         (ok (equal "applied" (jget (first (json-lines out)) "subtype")))
         (let ((result (second (json-lines out))))
           (ok (equal "success" (jget result "subtype")))
           (ok (eql 0 (jget result "num_turns")))
           (ok (equal "" (jget result "result")))
           (ok (equal session (jget result "session_id")))
-          (ok (equal "applied" (jget result "plan" "status"))))))))
+          (ok (equal "applied" (jget result "preview" "status"))))))))
 
 (deftest plan-cli-action-reject
   (with-project (project config) '(("a.txt" "alpha"))
@@ -360,7 +360,7 @@ err backend)."
         (ok (eql 0 exit))
         (ok (equal "" out))
         (let ((plan (only-plan project config)))
-          (ok (has (format nil "plan ~a: discarded" (plan-id plan)) err))
+          (ok (has (format nil "preview ~a: discarded" (plan-id plan)) err))
           (ok (eq :discarded (plan-status plan)))
           (ok (not (uiop:directory-exists-p (plan-root plan)))))
         (ok (equal "alpha" (read-file project "a.txt")))))))
@@ -373,7 +373,7 @@ err backend)."
           (code project config (list "-p" "--resume" (session-id-of out1) "--apply") :steps '())
         (ok (eql 2 exit))
         (ok (equal "" out))
-        (ok (has "has no open plan" err))))))
+        (ok (has "has no open preview" err))))))
 
 ;;; Drift on --apply.
 

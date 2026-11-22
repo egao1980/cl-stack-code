@@ -69,7 +69,7 @@
   (with-project (project config) (list (list "a.txt" (nl "alpha")))
     (let ((*plan-compute-backend* (funcall make)))
       (with-test-client (client backend events project config :steps (list "Done."))
-        (let ((s (client-new-session client :permission-mode :plan)))
+        (let ((s (client-new-session client :permission-mode :preview)))
           (multiple-value-bind (result turn-events) (client-query s "go" :timeout 60)
             (declare (ignore result))
             (let ((opened (client-plan-event turn-events "opened")))

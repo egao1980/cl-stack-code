@@ -64,11 +64,15 @@
   (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow))
              (rule-lists (settings-permission-rules (make-settings :permission-mode :accept-edits)))))
   (ok (null (settings-permission-rules (make-settings :permission-mode :bypass-permissions))))
-  ;; H5a: plan mode edits the area, so its base rules are acceptEdits'; since
-  ;; 0.4.1 they allow the shell too (rooted at the area, unconfined until R4d).
-  (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow)
-               ("bash" "*" :allow) ("job_input" "*" :allow))
-             (rule-lists (settings-permission-rules (make-settings :permission-mode :plan))))))
+  ;; H5a: preview mode (H5a plan mode) edits the area, so its base rules are
+  ;; acceptEdits'; since 0.4.1 they allow the shell too (confined since R4d-4b).
+  ;; H5c-0: plan mode has the same base rules; its policy confines the edits to
+  ;; .plan-scratch/ (PLAN-MODE-TOOLS).
+  (dolist (mode '(:preview :plan))
+    (ok (equal '(("write" "*" :allow) ("edit" "*" :allow) ("multi_edit" "*" :allow)
+                 ("bash" "*" :allow) ("job_input" "*" :allow))
+               (rule-lists (settings-permission-rules (make-settings :permission-mode mode))))
+        (string mode))))
 
 (deftest permission-plan-mode-shell-rules-still-win
   ;; 0.4.1: plan mode's shell allow is the lowest layer.
@@ -105,10 +109,12 @@
     (ok (eq :allow (a:permission-rules-effect rules "bash" '("bash:git status"))))))
 
 (deftest permission-plan-policy
-  ;; H5a: no mode has a policy; plan mode runs edits and the shell in its area.
+  ;; H5a: preview mode has no policy, it runs edits and the shell in its area.
+  ;; H5c-0: plan mode's policy is PLAN-MODE-PERMISSION-POLICY.
   (ok (null (settings-permission-policy (make-settings))))
   (ok (null (settings-permission-policy (make-settings :permission-mode :accept-edits))))
-  (ok (null (settings-permission-policy (make-settings :permission-mode :plan)))))
+  (ok (null (settings-permission-policy (make-settings :permission-mode :preview))))
+  (ok (functionp (settings-permission-policy (make-settings :permission-mode :plan)))))
 
 (deftest permission-hidden-tools
   (let ((names '("read" "write" "edit" "bash" "job_output" "job_input" "job_kill" "job_list")))
@@ -127,5 +133,7 @@
   (ok (has "headless" +headless-denial-feedback+))
   (ok (has "--allowed-tools" +headless-denial-feedback+))
   (ok (has "bypassPermissions" +headless-denial-feedback+))
-  (ok (has "plan mode" +plan-mode-feedback+))
-  (ok (has "copy of the project" +plan-mode-feedback+)))
+  (ok (has "preview mode" +preview-mode-feedback+))
+  (ok (has "copy of the project" +preview-mode-feedback+))
+  (ok (has "plan mode" +plan-mode-edit-feedback+))
+  (ok (has "propose_plan" +plan-mode-edit-feedback+)))

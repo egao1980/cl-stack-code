@@ -1,6 +1,6 @@
 (in-package #:cl-stack-code/tests)
 
-;;; R4d-4b: plan mode's sandbox in -p (src/sandbox.lisp header), portable:
+;;; R4d-4b: preview mode's sandbox (H5a plan mode, renamed in 0.15.0) in -p (src/sandbox.lisp header), portable:
 ;;; the recording backend (it runs commands unchanged, so these tests check
 ;;; what is passed and what asks, not what the kernel denies; the real
 ;;; backends are tests/sandbox-seatbelt-test.lisp and sandbox-landlock-test.lisp).
@@ -93,7 +93,7 @@
         (code project config '("-p" "--allow-network" "go") :steps '("ok"))
       (declare (ignore out))
       (ok (eql 2 exit))
-      (ok (has "--allow-network needs --permission-mode plan" err)))))
+      (ok (has "--allow-network needs --permission-mode plan or preview" err)))))
 
 (deftest sandbox-cli-environment
   (with-project (project config) '()
@@ -152,9 +152,9 @@
           (ok (equal "denied" (jget bash "status")) "bash asks, which -p refuses")
           (ok (has +headless-denial-feedback+ (jget bash "content")))
           (ok (not (file-exists project "ran.txt")) "nothing ran")
-          (ok (has (format nil "cl-stack-code: plan ~a: no sandbox (" id8) err) "the notice on stderr")
+          (ok (has (format nil "cl-stack-code: preview ~a: no sandbox (" id8) err) "the notice on stderr")
           (ok (has "bash and job_input ask before each command" err))
-          (ok (= 1 (count-substring (format nil "plan ~a: no sandbox" id8) err)) "once")
+          (ok (= 1 (count-substring (format nil "preview ~a: no sandbox" id8) err)) "once")
           (ok (equal "beta" (area-file plan "a.txt")) "the file tools still work in the area")
           (let ((sandbox (plan-sandbox-event out)))
             (ok (and sandbox (equal "unavailable" (jget sandbox "status"))))
@@ -173,7 +173,7 @@
   (with-project (project config) '()
     (let ((*plan-compute-backend* nil))
       (multiple-value-bind (exit out err)
-          (code project config '("-p" "--permission-mode" "plan" "go") :steps '("ok"))
+          (code project config '("-p" "--permission-mode" "preview" "go") :steps '("ok"))
         (ok (eql 0 exit))
         (ok (not (has "no sandbox" out)) "stdout is the answer")
         (ok (has "no sandbox (" err))))))
@@ -234,7 +234,7 @@
           (ok (every (lambda (r) (has "test: refused on purpose" (jget r "content"))) results))
           (ok (not (file-exists project "ran.txt")) "nothing ran")
           (ok (not (file-exists project "ran2.txt")) "the rest of the turn stays confined: refused again")
-          (ok (= 1 (count-substring (format nil "plan ~a: the sandbox refused a command" id8) err))
+          (ok (= 1 (count-substring (format nil "preview ~a: the sandbox refused a command" id8) err))
               "the notice once, on stderr"))))))
 
 ;;; Other modes are unchanged.
@@ -258,17 +258,17 @@
         (when (unix-p)
           (ok (equal "done" (jget (first (tool-results out "bash")) "status"))))))))
 
-;;; The image stays refused in plan mode (H5d).
+;;; The image stays refused in preview mode (H5d), and in plan mode.
 
 (deftest sandbox-cli-lisp-image-still-refused
   (with-project (project config) '()
     (with-plan-backend (b)
       (multiple-value-bind (exit out err)
-          (code project config '("-p" "--permission-mode" "plan" "--lisp-image" "spawn" "go")
+          (code project config '("-p" "--permission-mode" "preview" "--lisp-image" "spawn" "go")
                 :steps '("ok"))
         (declare (ignore out))
         (ok (eql 2 exit))
-        (ok (has "--lisp-image is not available in plan mode yet" err))
+        (ok (has "--lisp-image is not available in preview mode yet" err))
         (ok (null (launches b)))))))
 
 ;;; Windows: no backend yet, plan mode asks.

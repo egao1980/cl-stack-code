@@ -84,7 +84,7 @@
 
 (deftest-parametrize lisp-image-checks
     ((plist mode error)
-     :ids ("off" "spawn" "attach" "observe-attach" "observe-spawn" "observe-off" "plan" "plan-off")
+     :ids ("off" "spawn" "attach" "observe-attach" "observe-spawn" "observe-off" "plan" "plan-off" "preview" "preview-off")
      ('() :default nil)
      ('(:image (:spawn)) :default nil)
      ('(:image (:attach "127.0.0.1" 4005)) :accept-edits nil)
@@ -95,7 +95,10 @@
       "--lisp-observe needs --lisp-image attach:[HOST:]PORT (an observer attaches; it does not spawn)")
      ('(:image (:spawn)) :plan
       "--lisp-image is not available in plan mode yet (the image would not see the plan area)")
-     ('() :plan nil))
+     ('() :plan nil)
+     ('(:image (:spawn)) :preview
+      "--lisp-image is not available in preview mode yet (the image would not see the preview area)")
+     ('() :preview nil))
   (let ((c (failure (check-lisp-image-settings (apply #'image-layer plist) mode))))
     (if error
         (ok (and (typep c 'code-usage-error) (equal error (princ-to-string c))) error)

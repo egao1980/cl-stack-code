@@ -7,7 +7,7 @@
 ;;; Flags.
 
 (deftest rpc-flags-parse
-  (let ((i (parse-arguments '("--rpc" "--cwd" "x" "--model" "mock" "--plan-area" "copy"
+  (let ((i (parse-arguments '("--rpc" "--cwd" "x" "--model" "mock" "--preview-area" "copy"
                               "--permission-mode" "acceptEdits"))))
     (ok (invocation-rpc-p i))
     (ok (eq t (check-rpc-flags i)))
@@ -23,8 +23,8 @@
      ('("--rpc" "--continue") "--rpc opens sessions with session/new and session/resume")
      ('("--rpc" "--resume" "abcd") "--rpc opens sessions with session/new and session/resume")
      ('("--rpc" "--list-sessions") "--rpc opens sessions with session/new and session/resume")
-     ('("--rpc" "--apply") "--rpc approves plans and rewinds with plan/approve")
-     ('("--rpc" "--rewind" "1") "--rpc approves plans and rewinds with plan/approve"))
+     ('("--rpc" "--apply") "--rpc applies previews with preview/apply")
+     ('("--rpc" "--rewind" "1") "--rpc applies previews with preview/apply"))
   (with-project (project config) '()
     (multiple-value-bind (exit out err) (code project config argv)
       (ok (eql 2 exit))
@@ -44,7 +44,8 @@
 (deftest rpc-constants
   (ok (equal '("initialize" "session/new" "session/resume" "session/list" "session/fork"
                "session/close" "turn/start" "turn/steer" "turn/interrupt" "approval/respond"
-               "plan/approve" "plan/reject" "checkpoint/list" "rewind" "settings/get" "tools/list"
+               "plan/approve" "plan/reject" "plan/revise" "plan/get" "plan/update" "plan/save"
+               "preview/apply" "preview/reject" "checkpoint/list" "rewind" "settings/get" "tools/list"
                "units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
                "units/control" "mcp/list" "mcp/reconnect" "session/compact" "turn/retry")
              +rpc-methods+))
@@ -126,7 +127,7 @@
              (new (response-for objects 2)))
         (ok (every (lambda (o) (equal "2.0" (gethash "jsonrpc" o))) objects) "only JSON-RPC on output")
         (ok (equal "cl-stack-code" (event-value init "result" "name")))
-        (ok (equal "0.14.0" (event-value init "result" "version")))
+        (ok (equal "0.15.0" (event-value init "result" "version")))
         (ok (eql 1 (event-value init "result" "protocol")))
         (ok (equal +rpc-methods+ (coerce (event-value init "result" "methods") 'list)))
         (ok (equal +event-types+ (coerce (event-value init "result" "events") 'list)))
@@ -299,18 +300,19 @@
         (ok (equal fid (event-value (call rpc "session/resume" "last" t) "session_id"))
             "last: the session that committed last (the fork)")))))
 
-(deftest rpc-plan-approve-and-reject
+(deftest rpc-preview-apply-and-reject
+  ;; H5a's plan/approve and plan/reject, renamed preview/apply and preview/reject in 0.15.0.
   (with-project (project config) (list (list "a.txt" (nl "alpha")))
     (with-rpc (rpc backend project config :steps (list (write-tool "a.txt" (nl "beta")) "Done."))
-      (let ((id (new-session rpc "permission_mode" "plan")))
+      (let ((id (new-session rpc "permission_mode" "preview")))
         (call rpc "turn/start" "session_id" id "prompt" "beta")
         (let ((result (rpc-result rpc id)))
-          (ok (equal "open" (event-value result "plan" "status"))))
+          (ok (equal "open" (event-value result "preview" "status"))))
         (ok (equal (nl "alpha") (read-file project "a.txt")))
-        (let ((applied (call rpc "plan/approve" "session_id" id)))
+        (let ((applied (call rpc "preview/apply" "session_id" id)))
           (ok (equal "applied" (event-value applied "subtype"))))
         (ok (equal (nl "beta") (read-file project "a.txt")))
-        (multiple-value-bind (code data) (fault rpc "plan/reject" "session_id" id)
+        (multiple-value-bind (code data) (fault rpc "preview/reject" "session_id" id)
           (ok (eql -32008 code))
           (ok (equal "plan-not-found" (event-value data "condition"))))))))
 

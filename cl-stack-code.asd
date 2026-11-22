@@ -1,5 +1,5 @@
 (defsystem "cl-stack-code"
-  :version "0.14.0"
+  :version "0.15.0"
   :description "Coding agent CLI on cl-stack: a supervisor per session (shell jobs, servers and subagents as units with capped rotated logs; a TUI process panel (/ps, Ctrl-P) to follow, search, stop, restart and feed them, the same model over --rpc units/* methods, both behind the agent's unit_control permission rules), an SDK and a JSON-RPC 2.0 server over stdio (--rpc) on one core: sessions, turns with streamed events, approvals answered by the caller, steering, interrupts, plans, checkpoints and rewinds, the same event shapes as stream-JSON; a live Lisp image for the agent (lisp-mcp/agent tools, debugger entries in other threads delivered to the agent's inbox, restarts gated by permission rules), checkpoints (every turn that changes files records a composite revision of the conversation and the files: a pathlib snapshot, a git commit on a private ref, or a jj working-copy commit) and per-part rewinds (conversation, files or both, drift-checked), plan mode (edits and shell commands in a copy of the project, the shell confined to it by a kernel sandbox: Seatbelt on macOS, Landlock on Linux, network off; asking before each command where there is none; a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
@@ -78,7 +78,10 @@
                ;; OCI install of cl-stack-code brings them. Same versions as
                ;; cl-stack-code/acp's (tests/acp-flag-test.lisp checks).
                (:feature (:or) (:version "acp-protocol" "0.1.0"))
-               (:feature (:or) (:version "acp-backend-stdio" "0.1.1")))
+               (:feature (:or) (:version "acp-backend-stdio" "0.1.1"))
+               ;; H5c-0: plan mode's tool policy (rules-and-logic)
+               (:version "policy-protocol" "0.1.0")
+               (:version "logic-backend-datalog" "0.1.0"))
   ;; H4b: --lisp-image spawn starts ros +Q run images that load swank / slynk
   ;; (install roots, as in lisp-mcp; never dependencies).
   :properties (:cl-repo (:ci (:with ("swank" "slynk"))))
@@ -112,6 +115,8 @@
                ;; R4d-4b
                (:file "sandbox")
                (:file "checkpoints")
+               ;; H5c-0
+               (:file "plan-docs")
                (:file "lisp-image")
                ;; H8d
                (:file "units")
@@ -169,6 +174,8 @@
                "conversation-protocol/summary"
                ;; R4d-4b
                "compute-protocol"
+               ;; H5c-0
+               "policy-protocol"
                (:feature :darwin "compute-backend-seatbelt")
                (:feature :linux "compute-backend-landlock")
                ;; H3e-2a
@@ -264,7 +271,14 @@
                ;; H3f
                (:file "resilience-config-test")
                (:file "resilience-cli-test")
-               (:file "resilience-test"))
+               (:file "resilience-test")
+               ;; H5c-0
+               (:file "plan-doc-support")
+               (:file "plan-doc-test")
+               (:file "plan-doc-cli-test")
+               (:file "plan-doc-core-test")
+               (:file "plan-doc-program-test")
+               (:file "plan-doc-client-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

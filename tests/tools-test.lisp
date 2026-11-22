@@ -192,8 +192,8 @@
       (ok (equal "denied" (jget (result-named out "bash") "status")))
       (ok (equal "keep" (read-file project "x.txt"))))))
 
-(deftest tools-plan-mode
-  ;; H5a: plan mode writes into the plan's area, never the project.
+(deftest tools-preview-mode
+  ;; H5a: preview mode (H5a plan mode, 0.15.0) writes into the area, never the project.
   (with-project (project config) '(("a.txt" "alpha"))
     (multiple-value-bind (exit out)
         (streamed project config
@@ -201,12 +201,12 @@
                               (list "read" (json-args "file_path" "a.txt"))
                               (list "write" (json-args "file_path" "a.txt" "content" "beta")))
                         "ok")
-                  "--permission-mode" "plan")
+                  "--permission-mode" "preview")
       (ok (eql 0 exit))
       (ok (equal "done" (jget (result-named out "read") "status")))
       (ok (equal "done" (jget (result-named out "write") "status")) "edits are allowed")
       (ok (equal "alpha" (read-file project "a.txt")) "the project is untouched")
-      (ok (equal "plan" (jget (first (json-lines out)) "permission_mode"))))))
+      (ok (equal "preview" (jget (first (json-lines out)) "permission_mode"))))))
 
 (deftest tools-hidden-by-bare-deny
   (with-project (project config) '()

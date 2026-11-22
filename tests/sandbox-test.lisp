@@ -84,7 +84,7 @@
 (deftest sandbox-plan-confinement-ignores-settings-env
   (with-copy-plan (plan project config) '()
     (let ((c (plan-confinement plan (merge-settings
-                                     (make-settings :permission-mode :plan
+                                     (make-settings :permission-mode :preview
                                                     :env '(("FOO" . "bar")))))))
       (ok (null (assoc "FOO" (sc:confinement-env c) :test #'string=))))))
 
@@ -226,11 +226,11 @@
           "confined: no notice")
       (let ((sb (open-plan-sandbox plan (plan-settings)
                                    :backend (make-recording-backend :available "no luck"))))
-        (ok (equal (format nil "plan ~a: no sandbox (no luck); bash and job_input ask before each command" id8)
+        (ok (equal (format nil "preview ~a: no sandbox (no luck); bash and job_input ask before each command" id8)
                    (plan-sandbox-notice sb))))
       (let ((sb (open-plan-sandbox plan (plan-settings) :backend (make-recording-backend))))
         (plan-sandbox-refused sb "gone")
-        (ok (equal (format nil "plan ~a: the sandbox refused a command (gone); bash and job_input ask before each command from the next turn" id8)
+        (ok (equal (format nil "preview ~a: the sandbox refused a command (gone); bash and job_input ask before each command from the next turn" id8)
                    (plan-sandbox-notice sb)))))))
 
 (deftest sandbox-prompt-section
@@ -370,7 +370,7 @@
                                            :cli (make-settings :sandbox '(:network :allow))))))))
 
 (deftest sandbox-allow-network-flag
-  (let ((inv (parse-arguments '("-p" "--permission-mode" "plan" "--allow-network" "go"))))
+  (let ((inv (parse-arguments '("-p" "--permission-mode" "preview" "--allow-network" "go"))))
     (ok (eq :allow (sandbox-settings (invocation-settings inv)))))
-  (let ((inv (parse-arguments '("-p" "--permission-mode" "plan" "go"))))
+  (let ((inv (parse-arguments '("-p" "--permission-mode" "preview" "go"))))
     (ok (null (settings-sandbox (invocation-settings inv))))))

@@ -1,55 +1,55 @@
 (in-package #:cl-stack-code/tests)
 
-;;; H3d: plans (H5a), checkpoints and rewinds (H5b) through the SDK. The
+;;; H3d: previews (H5a plans, renamed in 0.15.0), checkpoints and rewinds (H5b) through the SDK. The
 ;;; objects are -p's (src/client.lisp, "Plans …").
 
 (defun subtype-of (e) (event-value e "subtype"))
 
 (defun client-plan-event (events subtype)
-  (find subtype (events-of events "plan") :key #'subtype-of :test #'equal))
+  (find subtype (events-of events "preview") :key #'subtype-of :test #'equal))
 
 (deftest-parametrize client-plan-turn-and-approve
     ((kind) :ids ("copy" "git") (:copy) (:git))
   (with-kind-project (kind project config) (list (list "a.txt" (nl "alpha")))
     (with-test-client (client backend events project config
                        :steps (list (write-tool "a.txt" (nl "beta")) "Done."))
-      (let ((s (client-new-session client :permission-mode :plan)))
+      (let ((s (client-new-session client :permission-mode :preview)))
         (multiple-value-bind (result turn-events) (client-query s "make it beta" :timeout 60)
           (ok (equal "success" (event-value result "subtype")))
           (let ((opened (first turn-events)))
-            (ok (equal "plan" (event-type opened)) "the plan opens first")
+            (ok (equal "preview" (event-type opened)) "the preview opens first")
             (ok (equal "opened" (subtype-of opened)))
             (ok (equal (string-downcase (symbol-name kind)) (event-value opened "kind"))))
           (let ((projected (client-plan-event turn-events "projected")))
             (ok projected)
             (ok (has "+beta" (event-value projected "diff")))
             (ok (equal "a.txt" (event-value projected "changes" 0 "path"))))
-          (ok (equal '("plan" "result") (last (event-types turn-events) 2)) "projected, then the result")
-          (ok (equal "open" (event-value result "plan" "status")))
+          (ok (equal '("preview" "result") (last (event-types turn-events) 2)) "projected, then the result")
+          (ok (equal "open" (event-value result "preview" "status")))
           (ok (equal (nl "alpha") (read-file project "a.txt")) "the project is untouched"))
-        (let ((applied (client-approve-plan s)))
-          (ok (equal "plan" (event-type applied)))
+        (let ((applied (client-apply-preview s)))
+          (ok (equal "preview" (event-type applied)))
           (ok (equal "applied" (subtype-of applied)))
           (ok (equal "a.txt" (event-value applied "changes" 0 "path")))
           (ok (equal "modified" (event-value applied "changes" 0 "kind")))
-          (ok (member applied (events-of events "plan")) "delivered as an event too"))
+          (ok (member applied (events-of events "preview")) "delivered as an event too"))
         (ok (equal (nl "beta") (read-file project "a.txt")))
         (ok (equal '("plan_after" "plan_before")
                    (mapcar (lambda (k) (event-value k "reason")) (client-checkpoints s)))
             "the approval's checkpoints")
         (let ((c (failure (client-approve-plan s))))
           (ok (typep c 'plan-not-found) "applied: no open plan")
-          (ok (has "has no open plan" (princ-to-string c))))))))
+          (ok (has "has no open preview" (princ-to-string c))))))))
 
 (deftest client-plan-reject
   (with-project (project config) (list (list "a.txt" (nl "alpha")))
     (with-test-client (client backend events project config
                        :steps (list (write-tool "a.txt" (nl "beta")) "Done."))
-      (let ((s (client-new-session client :permission-mode :plan)))
+      (let ((s (client-new-session client :permission-mode :preview)))
         (client-query s "make it beta" :timeout 60)
-        (let ((discarded (client-reject-plan s)))
+        (let ((discarded (client-reject-preview s)))
           (ok (equal "discarded" (subtype-of discarded)))
-          (ok (stringp (event-value discarded "plan_id"))))
+          (ok (stringp (event-value discarded "preview_id"))))
         (ok (equal (nl "alpha") (read-file project "a.txt")))
         (ok (signals (client-reject-plan s) 'plan-not-found))))))
 
@@ -57,7 +57,7 @@
   (with-project (project config) (list (list "a.txt" (nl "alpha")))
     (with-test-client (client backend events project config
                        :steps (list (write-tool "a.txt" (nl "beta")) "Done."))
-      (let ((s (client-new-session client :permission-mode :plan)))
+      (let ((s (client-new-session client :permission-mode :preview)))
         (client-query s "make it beta" :timeout 60)
         (write-file project "a.txt" (nl "user"))
         (let ((drift (client-approve-plan s)))
@@ -73,14 +73,14 @@
     (with-test-client (client backend events project config
                        :steps (list (write-tool "a.txt" (nl "beta")) "One."
                                     (write-tool "a.txt" (nl "gamma")) "Two."))
-      (let ((s (client-new-session client :permission-mode :plan)))
+      (let ((s (client-new-session client :permission-mode :preview)))
         (let* ((first-events (nth-value 1 (client-query s "beta" :timeout 60)))
-               (first-id (event-value (client-plan-event first-events "opened") "plan_id")))
+               (first-id (event-value (client-plan-event first-events "opened") "preview_id")))
           (client-approve-plan s)
           (let* ((second-events (nth-value 1 (client-query s "gamma" :timeout 60)))
                  (opened (client-plan-event second-events "opened")))
             (ok opened "a new plan")
-            (ok (not (equal first-id (event-value opened "plan_id"))))
+            (ok (not (equal first-id (event-value opened "preview_id"))))
             (ok (has "+gamma" (event-value (client-plan-event second-events "projected") "diff")))))))))
 
 (deftest client-plan-and-rewind-refuse-a-busy-session
@@ -88,7 +88,7 @@
     (let ((gate (make-gate)))
       (with-test-client (client backend events project config
                          :steps (list (list :gate gate "Done.")))
-        (let* ((s (client-new-session client :permission-mode :plan))
+        (let* ((s (client-new-session client :permission-mode :preview))
                (turn (client-turn s "think")))
           (ok (wait-until (lambda () (gate-waiting-p gate))))
           (ok (signals (client-approve-plan s) 'turn-busy))
