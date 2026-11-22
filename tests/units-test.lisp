@@ -18,7 +18,7 @@
              (last +rpc-methods+ 6)))
   (ok (equal "unit" (car (last +event-types+))))
   (ok (has "/ps" +help-text+))
-  (ok (equal "0.9.0" +version+)))
+  (ok (equal "0.9.1" +version+)))
 
 (deftest units-directory-layout
   (with-project (project config) '()

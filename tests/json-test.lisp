@@ -74,7 +74,7 @@
              (result (car (last all))))
         (ok (equal "system" (jget init "type")))
         (ok (equal "init" (jget init "subtype")))
-        (ok (equal "0.9.0" (jget init "version")))
+        (ok (equal "0.9.1" (jget init "version")))
         (ok (equal (native project) (jget init "cwd")))
         (ok (equal (native project) (jget init "project_root")))
         (ok (equal "mock:big" (jget init "model")) "the designator as given")
