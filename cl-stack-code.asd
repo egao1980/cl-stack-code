@@ -1,5 +1,5 @@
 (defsystem "cl-stack-code"
-  :version "0.12.0"
+  :version "0.12.1"
   :description "Coding agent CLI on cl-stack: a supervisor per session (shell jobs, servers and subagents as units with capped rotated logs; a TUI process panel (/ps, Ctrl-P) to follow, search, stop, restart and feed them, the same model over --rpc units/* methods, both behind the agent's unit_control permission rules), an SDK and a JSON-RPC 2.0 server over stdio (--rpc) on one core: sessions, turns with streamed events, approvals answered by the caller, steering, interrupts, plans, checkpoints and rewinds, the same event shapes as stream-JSON; a live Lisp image for the agent (lisp-mcp/agent tools, debugger entries in other threads delivered to the agent's inbox, restarts gated by permission rules), checkpoints (every turn that changes files records a composite revision of the conversation and the files: a pathlib snapshot, a git commit on a private ref, or a jj working-copy commit) and per-part rewinds (conversation, files or both, drift-checked), plan mode (edits and shell commands in a copy of the project, the shell confined to it by a kernel sandbox: Seatbelt on macOS, Landlock on Linux, network off; asking before each command where there is none; a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
@@ -30,6 +30,9 @@
                "event-backend-libuv"
                "http-protocol"
                (:version "http-backend-async" "0.2.20")
+               ;; Content-Encoding backends the async client advertises (cl-stack-code#29)
+               (:version "http-encoding-zstd" "0.1.1") (:version "http-encoding-brotli" "0.1.1")
+               (:version "http-encoding-snappy" "0.1.1")
                ;; H4b
                (:version "lisp-mcp" "0.7.0")
                (:version "lisp-mcp/agent" "0.7.0")
