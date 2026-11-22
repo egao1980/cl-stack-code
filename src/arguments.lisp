@@ -99,6 +99,9 @@ ours to rebind, so it goes in as :BACKEND)."
                 :kind :flag)
            (opt "on-drift" "With --apply, when the working copy changed under the plan: abort (default), rebase or overwrite")
            (opt "plan-area" "Plan mode: auto (default), git or copy")
+           ;; R4d-4b
+           (opt "allow-network" "Plan mode: let the confined shell reach the network (sandbox.network allow)"
+                :kind :flag)
            ;; H5b
            (opt "rewind" "With --resume or --continue and no prompt: rewind the session to turn N (0 = its start)")
            (opt "rewind-mode" "With --rewind: both (default), conversation or files")
@@ -237,7 +240,9 @@ are present is checked by RUN-CLI, not here."
                     :model-params (%model-param-flags (get-opt :model-param))
                     ;; H4b
                     :lisp-image (%lisp-image-flag (get-opt :lisp-image)
-                                                  (get-opt :lisp-observe))))))))
+                                                  (get-opt :lisp-observe))
+                    ;; R4d-4b
+                    :sandbox (and (get-opt :allow-network) (list :network :allow))))))))
 
 (defun %usage-text (stream)
   "Write the --help text to STREAM."

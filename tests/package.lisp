@@ -28,6 +28,8 @@
                     (#:stdio #:rpc-backend-stdio)
                     ;; H8d
                     (#:sup #:supervisor-protocol)
-                    (#:ss #:supervisor-protocol/search)))
+                    (#:ss #:supervisor-protocol/search)
+                    ;; R4d-4b
+                    (#:sc #:compute-protocol)))
 
 (in-package #:cl-stack-code/tests)

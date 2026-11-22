@@ -196,6 +196,27 @@ Exit 1.")
 
 (defmethod condition-exit-code ((condition plan-not-found)) 2)
 
+;;; R4d-4b: plan mode's sandbox (src/sandbox.lisp).
+
+(define-condition plan-sandbox-unavailable (plan-error)
+  ((reason :initarg :reason :reader plan-sandbox-unavailable-reason :initform nil
+           :documentation "Why plan mode cannot confine: a string (the backend's
+CONFINEMENT-UNAVAILABLE reason, the printed refusal, the canary's failure, or
++NO-SANDBOX-BACKEND-REASON+).")
+   (backend :initarg :backend :reader plan-sandbox-unavailable-backend :initform nil
+            :documentation "The confining backend that refused, or NIL when the
+platform has none."))
+  (:documentation "OPEN-PLAN-SANDBOX with sandbox.failIfUnavailable set: plan
+mode cannot confine the shell, and the user asked to refuse rather than ask
+before each bash and job_input call. Signalled before the model is called and
+before anything runs. Exit 1.")
+  (:report (lambda (c s)
+             (format s "~a" (or (code-error-message c)
+                                (format nil "plan ~a: no sandbox (~a) and sandbox.failIfUnavailable is set; nothing ran"
+                                        (let ((p (plan-error-plan c)))
+                                          (if p (subseq (plan-id p) 0 8) "?"))
+                                        (plan-sandbox-unavailable-reason c)))))))
+
 ;;; H5b: checkpoints (src/checkpoints.lisp).
 
 (define-condition checkpoint-error (code-error)

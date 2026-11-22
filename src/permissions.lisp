@@ -133,7 +133,7 @@ parentheses; empty pieces dropped."
 (defparameter +shell-tool-names+ '("bash" "job_input")
   "The shell tools plan mode's base rules allow (0.4.1).")
 
-(defun %mode-base-rules (mode)
+(defun %mode-base-rules (mode &key (plan-shell-allowed t))
   (flet ((rules (tools effect)
            (mapcar (lambda (tool) (agent:make-permission-rule tool "*" effect)) tools)))
     (case (or mode :default)
@@ -143,14 +143,18 @@ parentheses; empty pieces dropped."
       ;; acceptEdits. 0.4.1 (the user's decision): the shell is allowed too,
       ;; rooted at the area but NOT confined to it until R4d; these are the
       ;; lowest rules, so ask and deny rules from settings or flags still win.
+      ;; R4d-4b: the shell allows hold while the plan's sandbox confines
+      ;; (PLAN-SHELL-ALLOWED); without it bash asks again, as in 0.4.0.
       (:plan (append (rules +edit-tool-names+ :allow)
-                     (rules +shell-tool-names+ :allow)))
+                     (and plan-shell-allowed (rules +shell-tool-names+ :allow))))
       (t '()))))
 
-(defun settings-permission-rules (settings)
+(defun settings-permission-rules (settings &key (plan-shell-allowed t))
   "The agent's :permissions for merged SETTINGS: base rules of its mode, then
-SETTINGS-ALLOW, SETTINGS-ASK, SETTINGS-DENY."
-  (append (%mode-base-rules (settings-permission-mode settings))
+SETTINGS-ALLOW, SETTINGS-ASK, SETTINGS-DENY. R4d-4b: PLAN-SHELL-ALLOWED NIL
+drops plan mode's bash and job_input allows (no sandbox: they ask)."
+  (append (%mode-base-rules (settings-permission-mode settings)
+                            :plan-shell-allowed plan-shell-allowed)
           (settings-allow settings)
           (settings-ask settings)
           (settings-deny settings)))

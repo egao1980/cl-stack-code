@@ -2,6 +2,7 @@
   (:use #:cl)
   (:nicknames #:stack-code)
   (:local-nicknames (#:agent #:ai-agent-protocol)
+                    (#:sc #:compute-protocol)
                     (#:llm #:llm-protocol)
                     (#:tools #:agent-tools)
                     (#:steer #:steer-protocol)
@@ -545,9 +546,44 @@
    #:unit-control-failed-unit
    #:unit-control-failed-action
    #:subscription-not-found
-   #:subscription-not-found-id))
+   #:subscription-not-found-id
+   ;; R4d-4b: plan mode's sandbox
+   #:*plan-compute-backend*
+   #:+no-sandbox-backend-reason+
+   #:+plan-sandbox-statuses+
+   #:+plan-sandbox-canary-timeout+
+   #:default-plan-compute-backend
+   #:plan-compute-backend
+   #:plan-scratch-directory
+   #:plan-confinement
+   #:plan-sandbox
+   #:plan-sandbox-p
+   #:plan-sandbox-plan
+   #:plan-sandbox-status
+   #:plan-sandbox-backend
+   #:plan-sandbox-confinement
+   #:plan-sandbox-reason
+   #:plan-sandbox-confined-p
+   #:plan-sandbox-tool-keys
+   #:open-plan-sandbox
+   #:plan-sandbox-refused
+   #:plan-sandbox-notice
+   #:plan-sandbox-section
+   #:plan-sandbox-object
+   #:plan-sandbox-refusal-result
+   #:plan-sandbox-unavailable
+   #:plan-sandbox-unavailable-reason
+   #:plan-sandbox-unavailable-backend
+   #:settings-sandbox
+   #:sandbox-settings
+   #:+sandbox-network-names+))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.9.1"
+(defparameter +version+ "0.10.0"
   "The product version, as in the .asd.")
+
+(defun %r4d4b-pending (what)
+  "R4d-4b contract stub: WHAT is not implemented yet. The implementation removes
+this function and every call of it (src/sandbox.lisp)."
+  (error "R4d-4b: ~a is not implemented yet" what))
