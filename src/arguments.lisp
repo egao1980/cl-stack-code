@@ -105,6 +105,11 @@ ours to rebind, so it goes in as :BACKEND)."
            ;; R4d-4b
            (opt "allow-network" "Plan mode: let the confined shell reach the network (sandbox.network allow)"
                 :kind :flag)
+           ;; H3e-1
+           (opt "skill-dir" "Another skill directory (holding NAME/SKILL.md), absolute or ~/; repeatable (skillDirs)"
+                :kind :list)
+           (opt "context-file" "Another user-level instruction file, absolute or ~/; repeatable (contextFiles)"
+                :kind :list)
            ;; H5b
            (opt "rewind" "With --resume or --continue and no prompt: rewind the session to turn N (0 = its start)")
            (opt "rewind-mode" "With --rewind: both (default), conversation or files")
@@ -149,6 +154,14 @@ an empty KEY, or a non-number temperature / top_p → CODE-USAGE-ERROR."
                         (settings-error ()
                           (%usage-fail "bad --model-param ~s: ~a must be a number"
                                        text key)))))))))
+
+(defun %path-flags (flag values directory)
+  "H3e-1: --skill-dir / --context-file VALUES as pathnames (SETTINGS-PATH); a
+value that is neither absolute nor \"~/…\" → CODE-USAGE-ERROR
+\"FLAG must be an absolute path or start with ~/: \\\"X\\\"\"."
+  (loop for value in values
+        collect (or (settings-path value :directory directory)
+                    (%usage-fail "~a must be an absolute path or start with ~~/: ~s" flag value))))
 
 (defun %output-format (value)
   (cond ((null value) :text)
@@ -249,7 +262,10 @@ are present is checked by RUN-CLI, not here."
                     :lisp-image (%lisp-image-flag (get-opt :lisp-image)
                                                   (get-opt :lisp-observe))
                     ;; R4d-4b
-                    :sandbox (and (get-opt :allow-network) (list :network :allow))))))))
+                    :sandbox (and (get-opt :allow-network) (list :network :allow))
+                    ;; H3e-1
+                    :skill-dirs (%path-flags "--skill-dir" (get-opt :skill-dir) t)
+                    :context-files (%path-flags "--context-file" (get-opt :context-file) nil)))))))
 
 (defun %usage-text (stream)
   "Write the --help text to STREAM."

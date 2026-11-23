@@ -229,6 +229,8 @@ count is 0."
   (rewind nil)                                ; the result's "rewind" object, or NIL
   ;; H4b
   (image-tools nil)                           ; the LISP-TOOLS, or NIL
+  ;; H3e-1
+  (instruction-set nil)                       ; the session's INSTRUCTION-SET, or NIL
   ;; H3d: one emitter, a sink per destination.
   (sink nil)                                  ; NIL: -p (stream-json lines); else (lambda (object))
   (denial-reason #'%headless-denial-reason))  ; decision → the denial's "reason"
@@ -346,12 +348,26 @@ the run is canceled and the error fails the run afterwards."
                                    "text" (llm:llm-thinking-part-text payload)))))
         (:response (%on-response report payload))
         (:permission (%on-permission report payload))
-        (:invocation (%on-invocation report payload)))
+        (:invocation (%on-invocation report payload))
+        ;; H3e-1
+        (:instructions (%on-instructions report payload)))
     (error (e)
       (unless (%report-failure report)
         (setf (%report-failure report) e))
       (let ((run (%report-run report)))
         (when run (agent:cancel-agent-run run))))))
+
+(defun %directive-file-object (directive)
+  (let ((path (steer:steer-directive-path directive)))
+    (%json-object "path" (uiop:native-namestring (or (ignore-errors (probe-file path)) path))
+                  "kind" (if (getf (steer:steer-directive-extra directive) :rule) "rule" "agents"))))
+
+(defun %on-instructions (report directives)
+  "H3e-1: the run injected DIRECTIVES (nested AGENTS.md, path-scoped rules)."
+  (let ((set (%report-instruction-set report)))
+    (%emit-event report "instructions"
+                 "files" (map 'vector #'%directive-file-object directives)
+                 "instruction_set" (or (and set (instruction-set-current set)) :null))))
 
 (defun %result-object (report subtype text error-message duration-ms)
   (apply #'%json-object "type" "result"
@@ -464,15 +480,16 @@ SOURCE, or a new session (--session-id or a random id)."
 
 ;;; The run.
 
-(defun %agent-settings (cwd settings)
+(defun %agent-settings (cwd settings &key discovery)
+  "The agent's settings. H3e-1: the instructions discovery is DISCOVERY (the
+session's CODE-INSTRUCTION-DISCOVERY), else a new one for CWD with no rules."
   (agent:make-agent-settings
    :llm (model-params-llm-settings settings)
    :max-steps (or (settings-max-turns settings) +default-max-turns+)
    :extra (list :permission-policy (settings-permission-policy settings)
                 :max-steps-wrap-up nil
                 :instructions-discovery
-                (steer:make-instruction-discovery cwd :names +instruction-file-names+
-                                                      :include-root nil))))
+                (or discovery (make-code-instruction-discovery cwd)))))
 
 (defun %agent-permissions (settings &key (plan-shell-allowed t))
   "The agent's rule list. The lowest rule makes a shell command's program:
@@ -603,7 +620,10 @@ or NIL when no run started."
                                       :model designator
                                       :permission-mode mode
                                       :usage (copy-list (%report-usage report))
-                                      :plan (and plan (plan-record plan)))))
+                                      :plan (and plan (plan-record plan))
+                                      ;; H3e-1
+                                      :instructions (let ((set (%report-instruction-set report)))
+                                                      (and set (instruction-set-current set))))))
         (multiple-value-bind (revision went-to) (%commit-forking store record)
           (unless (eq went-to store)
             (format error-output "cl-stack-code: session ~a changed in another process; this turn was saved as session ~a~%"
@@ -929,7 +949,10 @@ result, then signals its failure."
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (supervisor nil)
-         (sources nil))
+         (sources nil)
+         (context nil)
+         (discovery nil)
+         (instruction-set nil))
     (unwind-protect
          (let ((event:*event-backend* event-backend)
                (event:*event-loop* event-loop)
@@ -941,6 +964,10 @@ result, then signals its failure."
                (agent:*off-loop-specials*
                  (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                         agent:*off-loop-specials*)))
+           ;; H3e-1: the session's instruction set (:start or :resume).
+           (multiple-value-setq (context discovery instruction-set)
+             (%open-session-instructions cwd settings store :user-config-dir config))
+           (setf (%report-instruction-set report) instruction-set)
            ;; H8d: the run's supervisor, before the tools.
            (setf supervisor (make-code-supervisor cwd :data-dir data-dir
                                                       :getenv (or getenv #'uiop:getenv))
@@ -949,7 +976,9 @@ result, then signals its failure."
                                 :on-image-event (and link (%link-callback link))
                                 :supervisor supervisor
                                 :scope (and plan (%plan-unit-scope supervisor plan))
+                                :skills (context-skills context)
                                 (plan-sandbox-tool-keys sandbox)))
+           (%link-skill-tools instruction-set (code-skill-tools sources))
            ;; H4b: the image starts before the system event; its events are
            ;; written and posted on the loop thread.
            (when link
@@ -967,7 +996,8 @@ result, then signals its failure."
                  (assemble-system-prompt cwd :tools offered :backend backend
                                              :settings settings :user-config-dir config
                                              :plan plan :sandbox sandbox
-                                             :lisp-image (%sources-lisp-tools sources))
+                                             :lisp-image (%sources-lisp-tools sources)
+                                             :context context :instruction-set instruction-set)
                (let ((agent (agent:make-ai-agent
                              :name "cl-stack-code"
                              :backend backend
@@ -977,11 +1007,13 @@ result, then signals its failure."
                              :permissions (if sandbox
                                               (%plan-permissions settings sandbox)
                                               (%agent-permissions settings))
-                             :settings (%agent-settings cwd settings)))
+                             :settings (%agent-settings cwd settings :discovery discovery)))
                      (root (find-project-root cwd)))
                  (apply #'%emit-event report "system"
                         (%system-init-keys cwd root designator mode offered files
-                                           (and link settings)))
+                                           (and link settings)
+                                           :context context :discovery discovery
+                                           :instruction-set instruction-set))
                  (when plan
                    (apply #'%emit-event report "plan"
                           (%plan-open-keys plan (second plan-and-reopened) sandbox)))
@@ -1015,20 +1047,46 @@ result, then signals its failure."
       (close-checkpointer checkpointer)
       (event:close-event-loop event-backend event-loop))))
 
-(defun %system-init-keys (cwd root designator mode offered files image-settings)
+(defun %system-init-keys (cwd root designator mode offered files image-settings
+                          &key context discovery instruction-set)
   "The \"system\" init event's keys and values (after \"type\" and
 \"session_id\"); IMAGE-SETTINGS (the settings, when the image is on) adds
-\"lisp_image\". Shared by -p and the SDK (src/client.lisp)."
-  (list* "subtype" "init"
-         "version" +version+
-         "cwd" (uiop:native-namestring cwd)
-         "project_root" (if root (uiop:native-namestring root) :null)
-         "model" designator
-         "permission_mode" (permission-mode-name mode)
-         "tools" (coerce offered 'vector)
-         "instructions" (map 'vector #'uiop:native-namestring files)
-         ;; H4b: only with the image on.
-         (and image-settings (list "lisp_image" (%lisp-image-object image-settings)))))
+\"lisp_image\". Shared by -p and the SDK (src/client.lisp). H3e-1: CONTEXT,
+DISCOVERY and INSTRUCTION-SET give \"imports\", \"skills\", \"rules\",
+\"notes\" and \"instruction_set\" (always present)."
+  (let ((loaded (cond (discovery (discovery-loaded-rules discovery))
+                      (context (context-loaded-rules context)))))
+    (list* "subtype" "init"
+           "version" +version+
+           "cwd" (uiop:native-namestring cwd)
+           "project_root" (if root (uiop:native-namestring root) :null)
+           "model" designator
+           "permission_mode" (permission-mode-name mode)
+           "tools" (coerce offered 'vector)
+           "instructions" (map 'vector #'uiop:native-namestring files)
+           ;; H3e-1
+           "imports" (map 'vector (lambda (pair)
+                                    (%json-object "path" (uiop:native-namestring (car pair))
+                                                  "from" (uiop:native-namestring (cdr pair))))
+                          (and context (context-imports context)))
+           "skills" (map 'vector (lambda (skill)
+                                   (%json-object "name" (steer:steer-directive-name skill)
+                                                 "description" (steer:steer-directive-description skill)
+                                                 "path" (uiop:native-namestring
+                                                         (steer:steer-directive-path skill))
+                                                 "source" (skill-source skill)))
+                         (and context (context-skills context)))
+           "rules" (map 'vector (lambda (rule)
+                                  (let ((native (uiop:native-namestring (steer:steer-directive-path rule)))
+                                        (patterns (rule-patterns rule)))
+                                    (%json-object "path" native
+                                                  "paths" (if patterns (coerce patterns 'vector) :null)
+                                                  "loaded" (and (member native loaded :test #'string=) t))))
+                        (and context (context-rules context)))
+           "notes" (coerce (and context (context-notes context)) 'vector)
+           "instruction_set" (or (and instruction-set (instruction-set-current instruction-set)) :null)
+           ;; H4b: only with the image on.
+           (and image-settings (list "lisp_image" (%lisp-image-object image-settings))))))
 
 (defun %plan-open-keys (plan reopened-p &optional sandbox)
   "The plan \"opened\" / \"reopened\" event's keys and values. R4d-4b: with

@@ -56,16 +56,27 @@ that is a regular file, unless it is blank. → NIL when there is none."
           until (and root (equal dir root)))
     chain))
 
-(defun instruction-files (cwd &key user-config-dir)
+(defun %context-file (path)
+  "H3e-1: the truename of the context file PATH, or NIL when it is missing, a
+directory or blank."
+  (let ((p (probe-file path)))
+    (and p (pathname-name p) (not (%blank-p (%read-text p))) p)))
+
+(defun instruction-files (cwd &key user-config-dir context-files)
   "→ truenames of the instruction files for working directory CWD, in prompt
-order: the user-level file in USER-CONFIG-DIR, then one per directory from the
-project root (else the filesystem root) down to CWD. Blank files are left out."
+order: the user-level file in USER-CONFIG-DIR, then (H3e-1) the CONTEXT-FILES
+(pathnames, in order; missing or blank ones left out), then one per directory
+from the project root (else the filesystem root) down to CWD. Blank files are
+left out; a file named twice appears once, at its first place."
   (let ((cwd (%truename-directory cwd))
         (user (uiop:ensure-directory-pathname
                (or user-config-dir (user-config-directory)))))
-    (remove nil
-            (cons (%directory-instruction-file user)
-                  (mapcar #'%directory-instruction-file (%directory-chain cwd))))))
+    (remove-duplicates
+     (remove nil
+             (append (list (%directory-instruction-file user))
+                     (mapcar #'%context-file context-files)
+                     (mapcar #'%directory-instruction-file (%directory-chain cwd))))
+     :test #'equal :from-end t)))
 
 (defun %right-trim (text)
   (string-right-trim '(#\Space #\Tab #\Newline #\Return #\Page) text))
@@ -114,7 +125,7 @@ then, as its own section, +PLAN-MODE-FEEDBACK+. → list of two strings."
           +plan-mode-feedback+)))
 
 (defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan lisp-image
-                                     sandbox)
+                                     sandbox context instruction-set)
   "→ (values prompt files). Sections joined by one blank line: steer's
 BUILD-SYSTEM-PROMPT for TOOLS (offered names) and BACKEND, the # Environment
 section, each instruction file as <instructions path=\"…\">…</instructions>,
@@ -124,10 +135,27 @@ directories, the plan line, then +PLAN-MODE-FEEDBACK+); the instruction files
 are still CWD's own. H4b: with LISP-IMAGE (the LISP-MCP/AGENT:LISP-TOOLS source),
 %LISP-IMAGE-SECTIONS follow the environment sections. R4d-4b: with a SANDBOX
 (a PLAN-SANDBOX, plan runs only), PLAN-SANDBOX-SECTION follows the plan
-sections, before the image sections."
+sections, before the image sections.
+
+H3e-1 (the implementation wires it): CONTEXT is an INSTRUCTION-CONTEXT
+(LOAD-INSTRUCTION-CONTEXT for CWD, SETTINGS and USER-CONFIG-DIR when NIL). The
+instruction blocks are then INSTRUCTION-BLOCK of each CONTEXT-FILES entry (its
+imports expanded), followed by RULE-BLOCK of each always-on rule, then
+SKILL-LISTING-SECTION of CONTEXT-SKILLS (when there are skills), then
+SETTINGS-APPEND-SYSTEM-PROMPT. → (values prompt files context): FILES is
+CONTEXT-FILES. With INSTRUCTION-SET (an INSTRUCTION-SET with a current
+revision), those blocks are INSTRUCTION-SET-BLOCKS of its current revision
+instead (a rewound or resumed session renders the set it continues). "
   (let* ((settings (or settings (make-settings)))
          (cwd (%truename-directory cwd))
-         (files (instruction-files cwd :user-config-dir user-config-dir))
+         (context (or context
+                      (load-instruction-context cwd :settings settings
+                                                    :user-config-dir user-config-dir)))
+         (files (context-files context))
+         (blocks (if (and instruction-set (instruction-set-current instruction-set))
+                     (instruction-set-blocks (instruction-set-store instruction-set)
+                                             (instruction-set-current instruction-set))
+                     (%context-blocks context)))
          (append-prompt (settings-append-system-prompt settings))
          (sections (append
                     (list (steer:build-system-prompt :tools tools :model backend))
@@ -137,7 +165,15 @@ sections, before the image sections."
                         (list (%environment-section cwd (find-project-root cwd)
                                                     (settings-permission-mode settings))))
                     (and lisp-image (%lisp-image-sections lisp-image settings))
-                    (mapcar #'%instruction-block files)
+                    blocks
                     (and append-prompt (plusp (length append-prompt))
                          (list append-prompt)))))
-    (values (format nil "~{~a~^~%~%~}" sections) files)))
+    (values (format nil "~{~a~^~%~%~}" sections) files context)))
+
+(defun %context-blocks (context)
+  "H3e-1: the instruction blocks of CONTEXT: each file's block (imports
+expanded), each always-on rule's block, then the # Skills section."
+  (append (mapcar (lambda (entry) (getf entry :block)) (%context-file-entries context))
+          (mapcar #'rule-block (remove-if-not #'rule-always-p (context-rules context)))
+          (let ((section (skill-listing-section (context-skills context))))
+            (and section (list section)))))

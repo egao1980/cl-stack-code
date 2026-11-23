@@ -36,6 +36,9 @@
 ;;;                                and the annotation, if any, for a tag. Ref
 ;;;                                names are [A-Za-z0-9._-]+; another name →
 ;;;                                SESSION-ERROR before anything is written
+;;;   <id>/instructions/           H3e-1: the session's instruction-set
+;;;                                revisions and their texts (content-
+;;;                                addressed; src/instruction-sets.lisp)
 ;;;   <id>/lock                    exists while a process writes:
 ;;;                                "<pid or 0> <universal-time>" LF
 ;;;
@@ -158,7 +161,7 @@ dashes are dropped)."
 (defstruct (turn-record (:constructor make-turn-record
                             (&key prompt turns replace-p (finish :stop) model
                                   (permission-mode :default) (usage (list 0 0 0 0))
-                                  steering plan (version +version+)))
+                                  steering plan instructions (version +version+)))
                         (:conc-name record-))
   "One turn of a session. PROMPT is the user's message as typed (before @
 mentions were expanded). TURNS are the LLM-TURNs the turn added to the
@@ -171,7 +174,9 @@ or :FAILED. MODEL is the model designator the turn ran with,
 PERMISSION-MODE its mode keyword, USAGE (input output cache-read
 cache-write) summed over the turn's responses, STEERING the steering
 messages delivered into the turn, as typed, in order. PLAN (H5a) is the
-PLAN-RECORD of the plan the turn ran in (plan mode), or NIL."
+PLAN-RECORD of the plan the turn ran in (plan mode), or NIL. INSTRUCTIONS
+(H3e-1) is the id of the instruction-set revision current at the turn's end
+(src/instruction-sets.lisp: 64 lowercase hex characters), or NIL."
   (prompt "" :type string)
   (turns '() :type list)
   (replace-p nil)
@@ -181,6 +186,7 @@ PLAN-RECORD of the plan the turn ran in (plan mode), or NIL."
   (usage (list 0 0 0 0) :type list)
   (steering '() :type list)
   (plan nil :type list)
+  (instructions nil :type (or null string))
   (version +version+))
 
 (defparameter +record-finishes+ '(:stop :max-steps :canceled :failed))
@@ -191,7 +197,8 @@ lists:
   (:format 1 :prompt S :turns (LLM:TURN-STATE …) :replace BOOL :finish K
    :model S-or-NIL :permission-mode K :usage (I O CR CW) :steering (S …)
    :version S [:plan (:id S :kind K :base S :root S :status K)])
-The :PLAN key (H5a) is present only when the record has a plan."
+The :PLAN key (H5a) is present only when the record has a plan; :INSTRUCTIONS S
+(H3e-1, an instruction-set revision id) only when it has one."
   (check-type record turn-record)
   (append
    (list :format +session-format+
@@ -205,7 +212,9 @@ The :PLAN key (H5a) is present only when the record has a plan."
         :steering (copy-list (record-steering record))
         :version (record-version record))
    (when (record-plan record)
-     (list :plan (copy-list (record-plan record))))))
+     (list :plan (copy-list (record-plan record))))
+   (when (record-instructions record)
+     (list :instructions (record-instructions record)))))
 
 (defun %malformed-record (content &optional cause)
   (error 'session-error
@@ -218,7 +227,7 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                (handler-case (progn (getf content :format) t) (error () nil)))
     (%malformed-record content "not a plist"))
   (destructuring-bind (&key format prompt turns replace finish model permission-mode
-                            usage steering version plan &allow-other-keys)
+                            usage steering version plan instructions &allow-other-keys)
       content
     (unless (eql format +session-format+) (%malformed-record content ":format"))
     (unless (stringp prompt) (%malformed-record content ":prompt"))
@@ -232,6 +241,10 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
       (%malformed-record content ":steering"))
     (unless (and (listp plan) (evenp (length plan)))
       (%malformed-record content ":plan"))
+    (unless (or (null instructions)
+                (and (stringp instructions) (= 64 (length instructions))
+                     (%hex-string-p instructions)))
+      (%malformed-record content ":instructions"))
     (make-turn-record :prompt prompt
                       :turns (mapcar #'llm:state-turn turns)
                       :replace-p (and replace t)
@@ -241,6 +254,7 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                       :usage (copy-list usage)
                       :steering (copy-list steering)
                       :plan (copy-list plan)
+                      :instructions (and instructions (copy-seq instructions))
                       :version version)))
 
 (defun revision-record (revision)
@@ -266,7 +280,11 @@ file header), or NIL.")
    ;; H5b
    (checkpoints :initform nil :accessor %session-checkpoints
                 :documentation "This session's CHECKPOINT-STORE once CHECKPOINT-STORE made
-it (one per session store object), or NIL."))
+it (one per session store object), or NIL.")
+   ;; H3e-1
+   (instructions :initform nil :accessor %session-instructions
+                 :documentation "This session's INSTRUCTION-STORE once SESSION-INSTRUCTION-STORE
+made it (one per session store object), or NIL."))
   (:documentation "A session: revision-protocol's in-memory store written
 through to its directory (see the file header). Make one with CREATE-SESSION,
 OPEN-SESSION or CLONE-SESSION, not MAKE-INSTANCE."))
@@ -590,12 +608,17 @@ before refs."
     (dolist (ref (rev:list-refs store :kind :movable))
       (unless (assoc (rev:ref-name ref) disk-refs :test #'equal)
         (rev:delete-ref store (rev:ref-name ref))))
+    ;; H3e-1: instruction-set revisions other processes wrote.
+    (%session-read-instructions store)
     store))
 
 (defun %persist (store &key force-meta)
   "Write what STORE's memory has and its directory lacks: new revision files
 (parents first), changed and deleted refs, then session.sexp on the first
 write, and \"last\" when revisions were added (or FORCE-META)."
+  ;; H3e-1: the instruction sidecar first, so a record is never on disk
+  ;; without the instruction-set revision it names.
+  (%session-write-instructions store)
   (let* ((on-disk (make-hash-table :test 'equal))
          (changed nil)
          (added nil))
@@ -880,7 +903,11 @@ revision new-store). SESSION-LOCKED and file errors propagate."
                                      :actual (rev:ref-conflict-actual conflict))
           (fork-session (&optional new-id)
             :report "Save this turn as a new session cloned at the expected head."
-            (commit-turn (clone-session store :id new-id :at expected) record :id id))))))
+            (let ((clone (clone-session store :id new-id :at expected)))
+              ;; H3e-1: the revision RECORD names goes with it.
+              (when (record-instructions record)
+                (%copy-instruction-revisions store clone (list (record-instructions record))))
+              (commit-turn clone record :id id)))))))
 
 (defun %line-number-p (string)
   (and (stringp string) (plusp (length string)) (every #'digit-char-p string)))
@@ -969,6 +996,14 @@ directory is STORE's. Written at once, and \"last\" names the clone."
          (clone (%make-session-store dir (%new-session-id dir id)
                                      :project-dir (session-project-dir store)
                                      :cloned-from (list (session-id store) tip))))
+    ;; H3e-1: the instruction revisions the copied records name, the start
+    ;; ref and their texts; the clone's write below writes them.
+    (let ((ids (loop for r in line
+                     for id = (record-instructions (revision-record r))
+                     when id collect id)))
+      (when (or ids (%session-instructions store)
+                (uiop:directory-exists-p (instructions-directory store)))
+        (%copy-instruction-revisions store clone ids)))
     (%call-writing clone
                    (lambda ()
                      (loop for previous = nil then r

@@ -14,6 +14,8 @@
                     (#:tui #:tui-protocol)
                     (#:w #:tui-protocol/widgets)
                     (#:md #:tui-markdown)
+                    ;; H3e-1: import tokens come from the parsed markdown
+                    (#:mdp #:markdown-protocol)
                     (#:tty #:tui-backend-tty)
                     (#:rev #:revision-protocol)
                     (#:git #:revision-backend-git)
@@ -558,6 +560,89 @@
    #:unit-control-failed-action
    #:subscription-not-found
    #:subscription-not-found-id
+   ;; H3e-1: @imports, skills, path-scoped rules (src/imports.lisp,
+   ;; src/skills.lisp, src/rules.lisp)
+   #:import-tokens
+   #:resolve-import
+   #:instruction-block
+   #:+max-import-hops+
+   #:load-instruction-context
+   #:instruction-context
+   #:instruction-context-p
+   #:context-files
+   #:context-imports
+   #:context-skills
+   #:context-rules
+   #:context-notes
+   #:context-project-dir
+   #:context-loaded-rules
+   #:skill-roots
+   #:parse-skill-file
+   #:discover-skills
+   #:skill-directory
+   #:skill-source
+   #:skill-listing-section
+   #:make-skill-tools
+   #:skill-tools
+   #:skill-tools-p
+   #:skill-tools-skills
+   #:code-skill-tools
+   #:skill-tool-result
+   #:+skill-tool-name+
+   #:+skill-source-names+
+   #:+skill-listing-budget+
+   #:+max-skill-description-chars+
+   #:+skill-listing-preamble+
+   #:rule-roots
+   #:parse-rule-file
+   #:discover-rules
+   #:rule-patterns
+   #:rule-always-p
+   #:rule-matches-p
+   #:rule-block
+   #:make-code-instruction-discovery
+   #:code-instruction-discovery
+   #:discovery-loaded-rules
+   #:settings-skill-dirs
+   #:settings-context-files
+   #:record-instructions
+   ;; H3e-1: the instruction set (src/instruction-sets.lisp)
+   #:+instruction-set-format+
+   #:+instruction-set-roles+
+   #:+instruction-set-reasons+
+   #:+instruction-start-ref+
+   #:component-role
+   #:component-snapshot
+   #:component-restore
+   #:instruction-set-components
+   #:instruction-store
+   #:instruction-store-p
+   #:instruction-store-session
+   #:instructions-directory
+   #:session-instruction-store
+   #:instruction-set
+   #:instruction-set-p
+   #:instruction-set-store
+   #:instruction-set-current
+   #:make-instruction-set
+   #:add-instruction-component
+   #:commit-instruction-set
+   #:restore-instruction-set
+   #:read-instruction-set
+   #:instruction-set-id
+   #:instruction-set-blocks
+   #:instruction-set-loaded-rules
+   #:intern-instruction-text
+   #:instruction-text
+   #:session-instruction-set
+   #:checkpoint-instructions-id
+   #:instruction-set-error
+   #:skill-format-error
+   #:skill-format-error-path
+   #:skill-format-error-reason
+   #:rule-format-error
+   #:rule-format-error-path
+   #:rule-format-error-reason
    ;; R4d-4b: plan mode's sandbox
    #:*plan-compute-backend*
    #:+no-sandbox-backend-reason+
@@ -591,5 +676,5 @@
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.11.0"
+(defparameter +version+ "0.12.0"
   "The product version, as in the .asd.")

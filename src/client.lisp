@@ -287,6 +287,8 @@
     "assistant" "tool_use" "tool_result"
     "approval_request" "approval_resolved" "steering" "image_event"
     "plan" "rewind" "session" "result"
+    ;; H3e-1: lazily loaded instruction files and rules
+    "instructions"
     ;; H8d: units/subscribe notifications
     "unit")
   "Every event \"type\" the SDK, -p's stream-json and --rpc can deliver.")
@@ -416,6 +418,10 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
   closed close-pending
   ;; H8d (set once by %OPEN-CODE-SESSION)
   supervisor unit-tools
+  ;; H3e-1 (set once by %OPEN-CODE-SESSION): the instruction context, the
+  ;; session's discovery and instruction set, and the closure that renders
+  ;; the working directory's system prompt from the set's current revision.
+  context discovery instruction-set render
   (unit-subs '())                       ; ("sub-N" SUP:SUBSCRIPTION), loop thread
   (unit-sub-counter 0)                  ; loop thread
   (units-lock (bt:make-lock "cl-stack-code session units"))
@@ -610,7 +616,8 @@ events when TURN is given)."
                             (%deliver session object on-event))
                           (lambda (object) (%deliver session object nil)))
                 :denial-reason #'%sdk-denial-reason
-                :image-tools (%sources-lisp-tools (%s-sources (%session-state session)))))
+                :image-tools (%sources-lisp-tools (%s-sources (%session-state session)))
+                :instruction-set (%s-instruction-set (%session-state session))))
 
 ;;; Sessions.
 
@@ -687,17 +694,25 @@ event delivered."
          (checkpointer nil)
          (supervisor nil)
          (sources nil)
+         (context nil)
+         (discovery nil)
+         (instruction-set nil)
          (done nil))
     (unwind-protect
          (progn
            (setf store (funcall store-fn project-dir)
-                 checkpointer (%make-run-checkpointer settings dir data-dir getenv)
-                 ;; H8d: the session's supervisor, before the tools.
+                 checkpointer (%make-run-checkpointer settings dir data-dir getenv))
+           ;; H3e-1: the session's instruction set (:start or :resume).
+           (multiple-value-setq (context discovery instruction-set)
+             (%open-session-instructions dir settings store :user-config-dir config))
+           (setf ;; H8d: the session's supervisor, before the tools.
                  supervisor (make-code-supervisor dir :data-dir (%client-data-root client)
                                                       :getenv getenv)
                  sources (make-code-tools dir :settings settings
                                               :on-image-event (and link (%link-callback link))
-                                              :supervisor supervisor))
+                                              :supervisor supervisor
+                                              :skills (context-skills context)))
+           (%link-skill-tools instruction-set (code-skill-tools sources))
            ;; ACP-2: the caller's tool backends (TOOL-SOURCES, header).
            (when tool-sources
              (setf sources (%hooked-sources tool-sources sources)))
@@ -710,8 +725,15 @@ event delivered."
              (multiple-value-bind (instructions files)
                  (assemble-system-prompt dir :tools offered :backend backend
                                              :settings settings :user-config-dir config
-                                             :lisp-image (%sources-lisp-tools sources))
-               (let* ((rules (make-settings-rule-store
+                                             :lisp-image (%sources-lisp-tools sources)
+                                             :context context :instruction-set instruction-set)
+               (let* ((render (lambda ()
+                                (values (assemble-system-prompt
+                                         dir :tools offered :backend backend
+                                             :settings settings :user-config-dir config
+                                             :lisp-image (%sources-lisp-tools sources)
+                                             :context context :instruction-set instruction-set))))
+                      (rules (make-settings-rule-store
                               (third (settings-file-paths dir :user-config-dir config))))
                       (agent (agent:make-ai-agent
                               :name "cl-stack-code"
@@ -720,7 +742,7 @@ event delivered."
                               :instructions instructions
                               :tools sources
                               :permissions (%agent-permissions settings)
-                              :settings (%agent-settings dir settings)
+                              :settings (%agent-settings dir settings :discovery discovery)
                               :permission-store rules))
                       (session (make-instance 'code-session
                                               :client client
@@ -739,7 +761,9 @@ event delivered."
                                    :agent agent :sources sources :link link
                                    :checkpointer checkpointer
                                    :supervisor supervisor
-                                   :unit-tools (code-unit-tools sources)))
+                                   :unit-tools (code-unit-tools sources)
+                                   :context context :discovery discovery
+                                   :instruction-set instruction-set :render render))
                  (push session (%client-sessions client))
                  (setf done t)
                  (when link
@@ -753,7 +777,9 @@ event delivered."
                        (apply #'%emit-event (%session-report session) "system"
                               (append (%system-init-keys dir (find-project-root dir) designator
                                                          mode offered files
-                                                         (and link settings))
+                                                         (and link settings)
+                                                         :context context :discovery discovery
+                                                         :instruction-set instruction-set)
                                       (and turns (list "turns" turns))
                                       (and forked-from (list "forked_from" forked-from)))))
                  session))))
@@ -979,7 +1005,9 @@ supervisor, under an :agent scope \"plan-<id8>\"."
                          :settings settings
                          :supervisor sup
                          :scope (%plan-unit-scope sup plan)
+                         :skills (and (%s-context st) (context-skills (%s-context st)))
                          (plan-sandbox-tool-keys sandbox))))
+    (%link-skill-tools (%s-instruction-set st) (code-skill-tools sources))
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
                             (%close-code-units nil :unit-tools (list (code-unit-tools sources))
@@ -991,7 +1019,9 @@ supervisor, under an :agent scope \"plan-<id8>\"."
                 (assemble-system-prompt
                  (%s-cwd st) :tools offered :backend (agent:ai-agent-backend agent)
                              :settings settings :user-config-dir (%s-config st)
-                             :plan plan :sandbox sandbox))))))
+                             :plan plan :sandbox sandbox
+                             :context (%s-context st)
+                             :instruction-set (%s-instruction-set st)))))))
 
 (defun %sdk-ensure-plan (session st report)
   "H5a: open (or reopen) the session's plan and give the agent the area's
@@ -1251,7 +1281,8 @@ on the loop thread. The watcher only reads the session's state."
         (setf (%s-settings st) settings
               (%s-mode st) mode
               (code-session-permission-mode session) mode
-              (agent:ai-agent-settings agent) (%agent-settings (%s-cwd st) settings)
+              (agent:ai-agent-settings agent) (%agent-settings (%s-cwd st) settings
+                                                               :discovery (%s-discovery st))
               ;; The next turn starts a new run on SESSION-TURNS.
               (%s-run st) nil
               (%s-handle st) nil)
@@ -1404,12 +1435,17 @@ store) or NIL."
                                            :usage (copy-list (%s-usage st))
                                            :steering (copy-list (%s-steering st))
                                            :plan (and plan (%s-plan-turn-p st)
-                                                      (plan-record plan)))))
+                                                      (plan-record plan))
+                                           ;; H3e-1
+                                           :instructions (let ((set (%s-instruction-set st)))
+                                                           (and set (instruction-set-current set))))))
             (multiple-value-bind (revision store) (%commit-forking old record)
               (dolist (turn new) (setf (gethash turn committed) t))
               (setf (%s-usage st) (list 0 0 0 0)
                     (%s-steering st) '())
               (unless (eq store old)
+                ;; H3e-1: the set's revisions go to the clone from now on.
+                (%rehome-instruction-set (%s-instruction-set st) store)
                 (setf (code-session-store session) store
                       (code-session-id session) (session-id store)
                       (%report-session report) (session-id store))
@@ -1558,6 +1594,16 @@ queued for the next turn."
     (mapcar #'%checkpoint-object
             (reverse (session-checkpoints (code-session-store session))))))
 
+(defun %sdk-follow-head (session st)
+  "H3e-1: restore the instruction set to the session's head and render the
+working directory's system prompt from it."
+  (when (%follow-head (%s-instruction-set st) (code-session-store session))
+    (let ((prompt (and (%s-render st) (funcall (%s-render st)))))
+      (when prompt
+        (if (%s-plan st)
+            (setf (%s-cwd-instructions st) prompt)
+            (setf (agent:ai-agent-instructions (%s-agent st)) prompt))))))
+
 (defun client-rewind (session turn &key (mode :both) (on-drift :abort))
   (%on-client-loop ((code-session-client session))
     (let ((st (%live session)))
@@ -1575,7 +1621,9 @@ queued for the next turn."
                                   :parts (%rewind-parts mode)))))
         ;; The next turn starts a new run on the new head.
         (when (eq :moved (getf result :conversation))
-          (setf (%s-run st) nil (%s-handle st) nil))
+          (setf (%s-run st) nil (%s-handle st) nil)
+          ;; H3e-1: the instruction set follows the head.
+          (%sdk-follow-head session st))
         (apply #'%emit-event (%session-report session) "rewind" (%rewind-keys result))))))
 
 ;;; Introspection.

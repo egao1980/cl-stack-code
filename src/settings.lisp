@@ -55,6 +55,13 @@ layer sets: :NETWORK (:NONE or :ALLOW), :EXTRA-WRITABLE (a list of absolute
 directory pathnames), :FAIL-IF-UNAVAILABLE (T or NIL). An absent key is unset;
 a present :FAIL-IF-UNAVAILABLE NIL means false. LOAD-SETTINGS keeps it from the
 user file and the flag layer only. See SANDBOX-SETTINGS.")
+   ;; H3e-1
+   (skill-dirs :initarg :skill-dirs :reader settings-skill-dirs :initform nil
+               :documentation "\"skillDirs\": directory pathnames (absolute; \"~/\" expanded),
+in order. LOAD-SETTINGS keeps it from the user file and the flag layer only.")
+   (context-files :initarg :context-files :reader settings-context-files :initform nil
+                  :documentation "\"contextFiles\": file pathnames (absolute; \"~/\" expanded),
+in order. LOAD-SETTINGS keeps it from the user file and the flag layer only.")
    (files :initarg :files :reader settings-files :initform nil
           :documentation "Settings files this layer was read from, in order."))
   (:documentation "One settings layer, or the merge of several."))
@@ -69,11 +76,12 @@ user file and the flag layer only. See SANDBOX-SETTINGS.")
 
 (defun make-settings (&key model max-turns permission-mode allow ask deny env
                         append-system-prompt files checkpoints lisp-image
-                        model-params sandbox)
+                        model-params sandbox skill-dirs context-files)
   "A SETTINGS layer. NIL means unset for every scalar. CHECKPOINTS (H5b): a
 plist of the checkpoints keys this layer sets. LISP-IMAGE (H4b): a plist of the
 lispImage keys this layer sets. MODEL-PARAMS: an alist (wire-name . value) of
-the modelParams keys this layer sets (:NULL = unset). SANDBOX (R4d-4b): a plist of the sandbox keys this layer sets."
+the modelParams keys this layer sets (:NULL = unset). SANDBOX (R4d-4b): a plist of the sandbox keys this layer sets. SKILL-DIRS and
+CONTEXT-FILES (H3e-1): lists of pathnames."
   (make-instance 'settings :model model :max-turns max-turns
                            :permission-mode permission-mode
                            :allow allow :ask ask :deny deny :env env
@@ -82,6 +90,8 @@ the modelParams keys this layer sets (:NULL = unset). SANDBOX (R4d-4b): a plist 
                            :lisp-image (copy-list lisp-image)
                            :model-params (copy-alist model-params)
                            :sandbox (copy-list sandbox)
+                           :skill-dirs (copy-list skill-dirs)
+                           :context-files (copy-list context-files)
                            :files files))
 
 ;;; H5b: the checkpoints object.
@@ -308,6 +318,51 @@ fail-if-unavailable NIL."
             (getf plist :fail-if-unavailable nil))))
 
 
+;;; H3e-1: skillDirs and contextFiles (given code).
+;;;
+;;;   "skillDirs": ["/abs/skills", "~/more-skills"]
+;;;   "contextFiles": ["/abs/context.md", "~/notes.md"]
+;;;
+;;; Arrays of paths, absolute or starting with "~/" (the user's home). Each
+;;; skillDirs entry is a skill root like .claude/skills/ (it holds
+;;; <name>/SKILL.md); each contextFiles entry is a user-scope instruction file.
+;;; Existence is checked by LOAD-INSTRUCTION-CONTEXT (a note, never an error).
+;;; Layers concatenate (user, then the flags), later duplicates dropped; like
+;;; "sandbox", LOAD-SETTINGS reads them from the user file and the flag layer
+;;; only. --skill-dir and --context-file (repeatable) are the flag layer. A
+;;; bad value signals SETTINGS-ERROR with key path "skillDirs",
+;;; "skillDirs[i]", "contextFiles" or "contextFiles[i]".
+
+(defun settings-path (string &key directory)
+  "H3e-1: STRING (absolute, or \"~/…\") as a pathname (a directory pathname when
+DIRECTORY), or NIL when it is neither."
+  (cond ((not (and (stringp string) (plusp (length string)))) nil)
+        (directory (%sandbox-directory string))
+        ((uiop:string-prefix-p "~/" string)
+         (uiop:merge-pathnames* (uiop:parse-native-namestring (subseq string 2))
+                                (user-homedir-pathname)))
+        (t (let ((p (ignore-errors (uiop:parse-native-namestring string))))
+             (and p (uiop:absolute-pathname-p p) (pathname-name p) p)))))
+
+(defun %parse-path-array (file key value &key directory)
+  (unless (%json-array-p value)
+    (%settings-fail file key "must be an array of paths"))
+  (loop for item across value
+        for i from 0
+        collect (or (settings-path item :directory directory)
+                    (%settings-fail file (format nil "~a[~d]" key i)
+                                    "must be an absolute path or start with ~~/"))))
+
+(defun %merge-paths (lists)
+  "Path LISTS concatenated in order; a later duplicate (same native
+namestring) is dropped."
+  (let ((out '()))
+    (dolist (paths lists (nreverse out))
+      (dolist (p paths)
+        (unless (member (uiop:native-namestring p) out
+                        :key #'uiop:native-namestring :test #'string=)
+          (push p out))))))
+
 ;;; The modelParams object: sampling parameters for every model call.
 ;;;
 ;;;   "modelParams": {"temperature": 1.0, "top_p": 0.95, "top_k": 20,
@@ -450,7 +505,13 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
                              (and present (%parse-model-params file value))))
              ;; R4d-4b
              (sandbox (multiple-value-bind (value present) (%json-present object "sandbox")
-                        (and present (%parse-sandbox file value)))))
+                        (and present (%parse-sandbox file value))))
+             ;; H3e-1
+             (skill-dirs (multiple-value-bind (value present) (%json-present object "skillDirs")
+                           (and present (%parse-path-array file "skillDirs" value :directory t))))
+             (context-files (multiple-value-bind (value present)
+                                (%json-present object "contextFiles")
+                              (and present (%parse-path-array file "contextFiles" value)))))
         (make-settings
          :model model
          :max-turns max-turns
@@ -464,6 +525,8 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
          :lisp-image lisp-image
          :model-params model-params
          :sandbox sandbox
+         :skill-dirs skill-dirs
+         :context-files context-files
          :files (and file (list file)))))))
 
 (defun read-settings-file (pathname)
@@ -532,6 +595,8 @@ gives the value (NIL = unset). Fresh conses; the layers are not modified."
        :lisp-image (%merge-checkpoints (mapcar #'settings-lisp-image layers))
        :model-params (%merge-env (mapcar #'settings-model-params layers))
        :sandbox (%merge-checkpoints (mapcar #'settings-sandbox layers))
+       :skill-dirs (%merge-paths (mapcar #'settings-skill-dirs layers))
+       :context-files (%merge-paths (mapcar #'settings-context-files layers))
        :files (loop for layer in layers append (settings-files layer))))))
 
 ;;; Where the files are.
@@ -574,15 +639,20 @@ when there is no project root."
   "→ the merge of the user, project and local files for CWD, then CLI (the
 flag layer). SETTINGS-ERROR restarts are visible to a handler around it.
 R4d-4b: the project and local files' \"sandbox\" objects are dropped (a
-repository cannot widen its own sandbox); the user file's and CLI's are kept."
+repository cannot widen its own sandbox); the user file's and CLI's are kept.
+H3e-1: so are their skillDirs and contextFiles (dropped from project and local)."
   (destructuring-bind (user project local)
       (mapcar #'read-settings-file (settings-file-paths cwd :user-config-dir user-config-dir))
     (merge-settings user (%without-sandbox project) (%without-sandbox local) cli)))
 
 (defun %without-sandbox (layer)
-  "LAYER (a SETTINGS or NIL) with its sandbox object unset."
-  (if (and layer (settings-sandbox layer))
+  "LAYER (a SETTINGS or NIL) with its sandbox object, skillDirs and contextFiles
+unset (H3e-1: the user-only keys)."
+  (if (and layer (or (settings-sandbox layer) (settings-skill-dirs layer)
+                     (settings-context-files layer)))
       (let ((copy (merge-settings layer)))
-        (setf (slot-value copy 'sandbox) nil)
+        (setf (slot-value copy 'sandbox) nil
+              (slot-value copy 'skill-dirs) nil
+              (slot-value copy 'context-files) nil)
         copy)
       layer))
