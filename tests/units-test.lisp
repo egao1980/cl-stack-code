@@ -13,12 +13,13 @@
   (ok (eql 2000 +unit-log-scrollback+))
   (ok (eql 1 +unit-tick-interval+))
   (ok (eql (if (uiop:os-windows-p) 5 2) +unit-stats-interval+))
-  (ok (equal '("units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
-               "units/control")
-             (last +rpc-methods+ 6)))
+  ;; H3e-2a: the six in order, wherever later methods go
+  (ok (search '("units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
+                 "units/control")
+              +rpc-methods+ :test #'equal))
   (ok (equal "unit" (car (last +event-types+))))
   (ok (has "/ps" +help-text+))
-  (ok (equal "0.12.3" +version+)))
+  (ok (equal "0.13.0" +version+)))
 
 (deftest units-directory-layout
   (with-project (project config) '()

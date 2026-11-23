@@ -62,6 +62,12 @@ in order. LOAD-SETTINGS keeps it from the user file and the flag layer only.")
    (context-files :initarg :context-files :reader settings-context-files :initform nil
                   :documentation "\"contextFiles\": file pathnames (absolute; \"~/\" expanded),
 in order. LOAD-SETTINGS keeps it from the user file and the flag layer only.")
+   ;; H3e-2a (src/mcp-config.lisp)
+   (mcp :initarg :mcp :reader settings-mcp :initform nil
+        :documentation "The MCP keys this layer sets, as a plist: :SERVERS (alist name .
+MCP-SERVER-CONFIG, from \"mcpServers\"), :ENABLE-ALL-PROJECT, :ENABLED, :DISABLED (the
+project-server approvals), :TIMEOUT, :TOOL-TIMEOUT (ms), :CONFIG-FILES and :STRICT (the
+flags). See MCP-SETTINGS.")
    (files :initarg :files :reader settings-files :initform nil
           :documentation "Settings files this layer was read from, in order."))
   (:documentation "One settings layer, or the merge of several."))
@@ -76,7 +82,7 @@ in order. LOAD-SETTINGS keeps it from the user file and the flag layer only.")
 
 (defun make-settings (&key model max-turns permission-mode allow ask deny env
                         append-system-prompt files checkpoints lisp-image
-                        model-params sandbox skill-dirs context-files)
+                        model-params sandbox skill-dirs context-files mcp)
   "A SETTINGS layer. NIL means unset for every scalar. CHECKPOINTS (H5b): a
 plist of the checkpoints keys this layer sets. LISP-IMAGE (H4b): a plist of the
 lispImage keys this layer sets. MODEL-PARAMS: an alist (wire-name . value) of
@@ -92,6 +98,7 @@ CONTEXT-FILES (H3e-1): lists of pathnames."
                            :sandbox (copy-list sandbox)
                            :skill-dirs (copy-list skill-dirs)
                            :context-files (copy-list context-files)
+                           :mcp (copy-list mcp)
                            :files files))
 
 ;;; H5b: the checkpoints object.
@@ -511,7 +518,9 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
                            (and present (%parse-path-array file "skillDirs" value :directory t))))
              (context-files (multiple-value-bind (value present)
                                 (%json-present object "contextFiles")
-                              (and present (%parse-path-array file "contextFiles" value)))))
+                              (and present (%parse-path-array file "contextFiles" value))))
+             ;; H3e-2a
+             (mcp (%parse-mcp-settings file object)))
         (make-settings
          :model model
          :max-turns max-turns
@@ -527,6 +536,7 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
          :sandbox sandbox
          :skill-dirs skill-dirs
          :context-files context-files
+         :mcp mcp
          :files (and file (list file)))))))
 
 (defun read-settings-file (pathname)
@@ -597,6 +607,7 @@ gives the value (NIL = unset). Fresh conses; the layers are not modified."
        :sandbox (%merge-checkpoints (mapcar #'settings-sandbox layers))
        :skill-dirs (%merge-paths (mapcar #'settings-skill-dirs layers))
        :context-files (%merge-paths (mapcar #'settings-context-files layers))
+       :mcp (%merge-mcp (mapcar #'settings-mcp layers))
        :files (loop for layer in layers append (settings-files layer))))))
 
 ;;; Where the files are.
@@ -643,7 +654,10 @@ repository cannot widen its own sandbox); the user file's and CLI's are kept.
 H3e-1: so are their skillDirs and contextFiles (dropped from project and local)."
   (destructuring-bind (user project local)
       (mapcar #'read-settings-file (settings-file-paths cwd :user-config-dir user-config-dir))
-    (merge-settings user (%without-sandbox project) (%without-sandbox local) cli)))
+    (merge-settings (%mcp-layer user :user)
+                    (%mcp-layer (%without-sandbox project) :project)
+                    (%mcp-layer (%without-sandbox local) :local)
+                    (%mcp-layer cli :flag))))
 
 (defun %without-sandbox (layer)
   "LAYER (a SETTINGS or NIL) with its sandbox object, skillDirs and contextFiles

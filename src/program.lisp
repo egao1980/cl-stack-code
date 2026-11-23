@@ -379,7 +379,10 @@
    (instruction-set :initarg :instruction-set :initform nil :reader %cp-instruction-set
                     :documentation "The session's INSTRUCTION-SET (loop thread).")
    (render :initarg :render :initform nil :reader %cp-render
-           :documentation "→ the working directory's system prompt, from the set's current revision."))
+           :documentation "→ the working directory's system prompt, from the set's current revision.")
+   ;; H3e-2a (set by MAKE-CODE-PROGRAM)
+   (mcp :initarg :mcp :initform nil :reader %cp-mcp
+        :documentation "The session's MCP-MANAGER."))
   (:documentation "The interactive mode as a tui-protocol program."))
 
 (defun %make-input (program-cell)
@@ -406,6 +409,8 @@ configuration errors of -p signal here."
          (source (%session-source invocation sessions-dir))
          (designator (%session-model invocation source settings))
          (env (%env-lookup settings getenv))
+         ;; H3e-2a: the servers' configuration errors before the session is written.
+         (mcp-configs (effective-mcp-servers cwd settings :user-config-dir config :env env))
          (resolved (multiple-value-list
                     (resolve-model designator :providers providers :env env)))
          (backend (first resolved))
@@ -421,6 +426,8 @@ configuration errors of -p signal here."
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (supervisor nil)
+         (mcp nil)
+         (mcp-cell (list nil))
          (sources nil)
          (context nil)
          (discovery nil)
@@ -430,15 +437,33 @@ configuration errors of -p signal here."
          (let ((program
                  (let ((event:*event-backend* event-backend)
                        (event:*event-loop* event-loop))
+                   ;; H8d: the session's supervisor, before the tools; H3e-2a:
+                   ;; then the MCP manager, before the instruction set opens.
+                   ;; Every status change goes to the core as (:mcp-status …).
+                   (setf supervisor (make-code-supervisor cwd :data-dir data-dir :getenv getenv)
+                         mcp (make-mcp-manager
+                              mcp-configs :supervisor supervisor :settings settings :env env
+                                          :cwd cwd :http-backend http-protocol:*http-backend*
+                                          :on-status (lambda (connection)
+                                                       (declare (ignore connection))
+                                                       (let ((program (car mcp-cell)))
+                                                         (when (and program (not (%cp-closed program)))
+                                                           (%send program
+                                                                  (list :mcp-status
+                                                                        (mapcar #'mcp-connection-object
+                                                                                (mcp-manager-connections mcp)))))))))
                    ;; H3e-1: the session's instruction set (:start or :resume).
                    (multiple-value-setq (context discovery instruction-set)
-                     (%open-session-instructions cwd settings session :user-config-dir config))
-                   ;; H8d: the session's supervisor, before the tools.
-                   (setf supervisor (make-code-supervisor cwd :data-dir data-dir :getenv getenv)
-                         sources (make-code-tools cwd :settings settings
-                                                      :on-image-event (and link (%link-callback link))
-                                                      :supervisor supervisor
-                                                      :skills (context-skills context)))
+                     (%open-session-instructions cwd settings session
+                                                 :user-config-dir config
+                                                 :components (list (mcp-manager-component mcp))))
+                   (setf (mcp-manager-instruction-set mcp) instruction-set)
+                   (setf sources (append (make-code-tools cwd :settings settings
+                                                              :on-image-event (and link (%link-callback link))
+                                                              :supervisor supervisor
+                                                              :skills (context-skills context))
+                                         ;; H3e-2a: the MCP source, last.
+                                         (list (mcp-manager-tool-source mcp))))
                    (%link-skill-tools instruction-set (code-skill-tools sources))
                    ;; H4b: the image starts before the terminal is touched; its
                    ;; events wait in the link until TUI-INIT.
@@ -501,6 +526,7 @@ configuration errors of -p signal here."
                              :discovery discovery
                              :instruction-set instruction-set
                              :render render
+                             :mcp mcp
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -508,7 +534,8 @@ configuration errors of -p signal here."
                              :status (make-instance 'w:status-line
                                                     :style (w:text-run-style
                                                             (w:text-run "" :inverse t))))))
-                     (setf (car cell) program)
+                     (setf (car cell) program
+                           (car mcp-cell) program)
                      ;; A resumed session: its transcript and its prompts.
                      (setf (state-transcript (code-program-state program))
                            (session-entries session)
@@ -519,6 +546,8 @@ configuration errors of -p signal here."
            program)
       (unless done
         (%link-close link)
+        ;; H3e-2a: the MCP clients and units, before the supervisor.
+        (close-mcp-manager mcp)
         ;; H8d: unit tools, shell tools, then the supervisor.
         (%close-code-units supervisor :unit-tools (list (code-unit-tools sources))
                                       :shell-tools (list (second sources)))
@@ -560,6 +589,10 @@ in it becomes an :error message."
          (agent:*off-loop-specials*
            (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                   agent:*off-loop-specials*)))
+    ;; H3e-2a: the instruction set is this thread's; MCP changes made on other
+    ;; threads are committed here.
+    (%set-mcp-owner (%cp-mcp program) (bt:current-thread)
+                    (lambda (fn) (%on-loop program fn)))
     (handler-bind ((agent:agent-tool-error
                      ;; R4d-4b: a confined bash the backend refused.
                      (%plan-sandbox-refusal-handler
@@ -714,7 +747,9 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
                              (mapcar #'+ (%cp-turn-usage program) counts))
                        (%send program (list :usage counts))))
           (:inbox (%on-inbox program payload))
-          (:invocation (%send program (list :invocation payload))))
+          (:invocation (%send program (list :invocation payload)))
+          ;; H3e-2a: before the model call.
+          (:step (%mcp-before-model-call (%cp-mcp program))))
       (error (e) (%send program (list :error (%message-text e)))))))
 
 (defun %loop-start-turn (program text &key message more)
@@ -851,7 +886,8 @@ notices (lisp-mcp/agent has no way to queue them again)."
           (getf (agent:agent-settings-extra agent-settings) :permission-policy)
           ;; The run's settings are this object (RUN-AI-AGENT-ASYNC without
           ;; :settings uses the agent's), read on every permission check.
-          (settings-permission-policy settings))))
+          ;; H3e-2a: plan mode's MCP policy.
+          (code-permission-policy settings))))
 
 ;;; H3c session effects (loop thread).
 
@@ -1003,7 +1039,73 @@ from the tip's (H5b), else H3c's conversation rewind."
        (%on-loop program (lambda () (%loop-start-image-turn program))))
       ;; H8d
       (:units-panel (%panel-open program))
+      ;; H3e-2a
+      (:mcp-reconnect (let ((name (first args)))
+                        (%mcp-in-background program
+                                            (lambda (m) (reconnect-mcp-server m name)))))
+      (:mcp-approve (destructuring-bind (name choice) args
+                      (%on-loop program (lambda () (%mcp-approve program name choice)))))
       (:quit nil))))
+
+;;; H3e-2a: the MCP servers in the program.
+
+(defun %mcp-in-background (program fn)
+  "FN of the program's MCP manager on a thread of its own (a start or a
+reconnect waits for the servers), with the agent thread's HTTP backend. An
+error is an (:error M)."
+  (let ((m (%cp-mcp program)))
+    (when m
+      (%on-loop program
+                (lambda ()
+                  (let ((http http-protocol:*http-backend*))
+                    (bt:make-thread
+                     (lambda ()
+                       (let ((http-protocol:*http-backend* http))
+                         (handler-case (funcall fn m)
+                           (error (e) (%send program (list :error (%message-text e)))))))
+                     :name "cl-stack-code mcp")))))))
+
+(defun %mcp-ask (program)
+  "START-MCP-SERVERS's APPROVE in the program: queue the dialog, start nothing now."
+  (lambda (connection)
+    (%send program (list :mcp-approval (mcp-connection-name connection)
+                         (mcp-approval-message connection)))
+    nil))
+
+(defun %mcp-approve (program name choice)
+  "Loop thread: the dialog's answer CHOICE for server NAME: Yes and No are
+saved for the project (SAVE-MCP-APPROVAL); Yes starts it."
+  (let ((m (%cp-mcp program)))
+    (save-mcp-approval name (%cp-project-dir program) choice
+                       :user-config-dir (%cp-user-config-dir program))
+    (case choice
+      (:yes (%mcp-decide m name :approved)
+       (%mcp-in-background program (lambda (m) (reconnect-mcp-server m name))))
+      (:no (%mcp-decide m name :rejected)))))
+
+(defun %mcp-dialog-p (program)
+  (let ((key (%cp-dialog-invocation program)))
+    (and (consp key) (eq :mcp-dialog (first key)))))
+
+(defun %sync-mcp-dialog (program)
+  "UI thread: the approval dialog of the first STATE-MCP-PROMPT entry. → NIL."
+  (let* ((entry (first (state-mcp-prompt (code-program-state program))))
+         (key (list :mcp-dialog (car entry))))
+    (unless (equal key (%cp-dialog-invocation program))
+      (setf (code-program-dialog program)
+            (make-instance 'w:confirm-dialog
+                           :title "MCP server"
+                           ;; A long command line is cut to three rows, so the
+                           ;; choices stay on screen.
+                           :message (let ((text (cdr entry))
+                                          (most (* 3 (max 20 (- (%cp-width program) 4)))))
+                                      (if (> (length text) most)
+                                          (concatenate 'string (subseq text 0 (1- most)) "…")
+                                          text))
+                           :choices +mcp-approval-choices+)
+            (%cp-dialog-invocation program) key))
+    (setf (w:widget-focused-p (code-program-input program)) nil)
+    nil))
 
 (defun %interrupt-wins (program event)
   "EVENT, except that a turn end the user already interrupted is :canceled: an
@@ -1047,6 +1149,9 @@ goes back to the input)."
           ((and (null approvals) (state-rewind-prompt state))
            ;; H5b: the rewind or its drift dialog.
            (%sync-rewind-dialog program))
+          ((and (null approvals) (state-mcp-prompt state))
+           ;; H3e-2a: a project server's approval.
+           (%sync-mcp-dialog program))
           ((null approvals)
            (setf (code-program-dialog program) nil
                  (%cp-dialog-invocation program) nil
@@ -1091,6 +1196,11 @@ goes back to the input)."
       (%link-attach link (lambda (event) (tui:tui-send (image-event-message event) run)))))
   ;; H8d: the supervisor's events from now on.
   (%start-units-ui program tui:*tui*)
+  ;; H3e-2a: the servers start in the background; unapproved project servers ask.
+  (let ((m (%cp-mcp program)))
+    (when (and m (mcp-manager-connections m))
+      (%mcp-in-background program
+                          (lambda (m) (start-mcp-servers m :approve (%mcp-ask program))))))
   ;; H3e-1: the instruction context's notes, once, as notices.
   (let ((context (%cp-instruction-context program)))
     (when context
@@ -1148,9 +1258,16 @@ goes back to the input)."
       (dialog
        (multiple-value-bind (widget command event) (w:widget-update dialog message)
          (declare (ignore widget))
-         (cond ((w:confirm-event-p event)
+         (cond ((and (w:confirm-event-p event) (%mcp-dialog-p program))
+                ;; H3e-2a
+                (%apply-event program (list :mcp-reply (w:confirm-event-choice event)))
+                command)
+               ((w:confirm-event-p event)
                 (%apply-event program (list :reply (w:confirm-event-choice event)
                                             (w:confirm-event-feedback event)))
+                command)
+               ((and (w:cancel-event-p event) (%mcp-dialog-p program))
+                (%apply-event program '(:mcp-reply :later))
                 command)
                ((w:cancel-event-p event)
                 (%apply-event program '(:interrupt))
@@ -1331,6 +1448,8 @@ goes back to the input)."
       ;; H4b: no event is sent after this; a spawned image is killed, an
       ;; attached one keeps running.
       (%link-close (%cp-image-link program))
+      ;; H3e-2a: the MCP clients and units, before the supervisor.
+      (close-mcp-manager (%cp-mcp program))
       ;; H8d: the unit tools (the working directory's and, H5a, the open
       ;; plan area's), the shell tools, then the supervisor.
       (%close-code-units (code-program-supervisor program)
@@ -1391,13 +1510,15 @@ goes back to the input)."
 :agent scope \"plan-<id8>\"."
   (let* ((agent (%cp-agent program))
          (sup (code-program-supervisor program))
-         (sources (apply #'make-code-tools (plan-tool-root plan (%cp-cwd program))
-                         :settings settings
-                         :supervisor sup
-                         :scope (%plan-unit-scope sup plan)
-                         :skills (let ((ctx (%cp-instruction-context program)))
-                                   (and ctx (context-skills ctx)))
-                         (plan-sandbox-tool-keys sandbox))))
+         (sources (append (apply #'make-code-tools (plan-tool-root plan (%cp-cwd program))
+                                 :settings settings
+                                 :supervisor sup
+                                 :scope (%plan-unit-scope sup plan)
+                                 :skills (let ((ctx (%cp-instruction-context program)))
+                                           (and ctx (context-skills ctx)))
+                                 (plan-sandbox-tool-keys sandbox))
+                          ;; H3e-2a: the session's MCP source, last.
+                          (and (%cp-mcp program) (list (mcp-manager-tool-source (%cp-mcp program)))))))
     (%link-skill-tools (%cp-instruction-set program) (code-skill-tools sources))
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))

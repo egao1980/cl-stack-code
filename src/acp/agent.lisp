@@ -44,24 +44,28 @@
 ;;;     promptCapabilities {embeddedContext: true} (image and audio not
 ;;;     advertised), sessionCapabilities {list: {}, close: {}} (delete,
 ;;;     resume, additionalDirectories, systemPrompt and auth.logout not
-;;;     advertised); mcpCapabilities {http: false, sse: false} (both sent
-;;;     as false until H3e-2 connects MCP servers, see task.md); authMethods
+;;;     advertised); mcpCapabilities {http: true, sse: false} (#40: legacy
+;;;     HTTP+SSE servers are reported as unsupported by the SDK); authMethods
 ;;;     []; agentInfo the agent's info. The client's capabilities decide fs / terminal (below).
 ;;;   authenticate, logout, session/delete, session/resume,
 ;;;     session/set_config_option: not implemented (acp-protocol's default
 ;;;     answers -32601).
 ;;;   session/new {cwd, mcpServers} → CLIENT-NEW-SESSION :CWD cwd (an
-;;;     absolute path). mcpServers (stdio, http and sse servers alike) is
-;;;     decoded and kept on the session (CODE-ACP-AGENT-MCP-SERVERS), never
-;;;     refused, never connected yet: connecting them is H3e-2's SDK entry
-;;;     (a documented TODO, task.md). → sessionId =
+;;;     absolute path) :MCP-SERVERS (#40: stdio → command / args / env,
+;;;     http and sse → url / headers, as MCP-SERVER-CONFIGs of scope :sdk,
+;;;     trusted; an sse one is reported unsupported, a server that fails to
+;;;     start is reported failed, neither fails the session). The decoded
+;;;     servers are also kept on the session (CODE-ACP-AGENT-MCP-SERVERS),
+;;;     never refused. → sessionId =
 ;;;     the SDK session's id (CODE-SESSION-ID, 32 hex digits: the id of its
 ;;;     record on disk); modes {currentModeId: PERMISSION-MODE-MODE-ID of
 ;;;     the session's mode, availableModes: one SESSION-MODE per
 ;;;     +ACP-MODE-IDS+, in order}. A configuration error (CODE-USAGE-ERROR,
 ;;;     SETTINGS-ERROR, MODEL-NOT-FOUND, …) → ACP-INVALID-PARAMS with its text.
 ;;;   session/load {sessionId, cwd, mcpServers} (mcpServers kept as for
-;;;     session/new, replacing what the session had) → CLIENT-RESUME-SESSION of
+;;;     session/new, replacing what the session had; passed to
+;;;     CLIENT-RESUME-SESSION :MCP-SERVERS, or, for a session still open,
+;;;     CLIENT-ADD-MCP-SERVERS) → CLIENT-RESUME-SESSION of
 ;;;     sessionId (no such session → ACP-RESOURCE-NOT-FOUND, -32002, data
 ;;;     {"sessionId"}). Before the response, the session's record (the turns
 ;;;     of its head line, oldest first) is replayed as session/update
@@ -264,6 +268,27 @@
 (defun %mcp-servers (request)
   (coerce (or (%slot request 'acp:mcp-servers) #()) 'list))
 
+(defun %pairs (entries)
+  "ACP name / value objects (env-variable, http-header) → an alist."
+  (map 'list (lambda (e) (cons (acp:name e) (acp:value e))) (or entries #())))
+
+(defun %mcp-server-config (server)
+  "One ACP mcpServers entry → the SDK's MCP-SERVER-CONFIG (scope :sdk)."
+  (etypecase server
+    (acp:mcp-server-stdio
+     (code:make-mcp-server-config (acp:name server) :scope :sdk :transport :stdio
+                                  :command (acp:command server)
+                                  :args (coerce (or (%slot server 'acp:args) #()) 'list)
+                                  :env (%pairs (%slot server 'acp:env))))
+    ((or acp:mcp-server-http acp:mcp-server-sse)
+     (code:make-mcp-server-config (acp:name server) :scope :sdk
+                                  :transport (if (typep server 'acp:mcp-server-sse) :sse :http)
+                                  :url (acp:url server)
+                                  :headers (%pairs (%slot server 'acp:headers))))))
+
+(defun %mcp-server-configs (servers)
+  (mapcar #'%mcp-server-config servers))
+
 ;;; initialize
 
 (defmethod acp:acp-initialize ((agent code-acp-agent) request)
@@ -275,9 +300,9 @@
                                 :load-session t
                                 :prompt-capabilities (make-instance 'acp:prompt-capabilities
                                                                     :embedded-context t)
-                                ;; false until H3e-2 connects MCP servers (task.md)
+                                ;; #40: HTTP servers connect; legacy SSE is unsupported
                                 :mcp-capabilities (make-instance 'acp:mcp-capabilities
-                                                                 :http nil :sse nil)
+                                                                 :http t :sse nil)
                                 :session-capabilities
                                 (make-instance 'acp:session-capabilities
                                                :session-list (make-hash-table :test 'equal)
@@ -301,14 +326,13 @@
 (defmethod acp:acp-new-session ((agent code-acp-agent) request)
   (with-sdk-errors ()
     (let* ((client (code-acp-agent-client agent))
+           (servers (%mcp-servers request))
            (as (%open-asess agent (%client-caps)
                             (lambda (hook)
                               (code:client-new-session client :cwd (acp:cwd request)
-                                                              :tool-sources hook)))))
-      ;; TODO (H3e-2, cl-stack-code 0.13.0): pass the kept servers to the SDK's
-      ;; MCP entry (stdio → command / args / env, http → url / headers) and
-      ;; advertise mcpCapabilities.http. Until then they are kept, not connected.
-      (setf (%asess-mcp-servers as) (%mcp-servers request))
+                                                              :tool-sources hook
+                                                              :mcp-servers (%mcp-server-configs servers))))))
+      (setf (%asess-mcp-servers as) servers)
       (acp:make-acp 'acp:new-session-response
                     :session-id (courier-session-id (%asess-courier as))
                     :modes (%modes (%asess-session as))))))
@@ -317,15 +341,20 @@
   (with-sdk-errors ()
     (let* ((client (code-acp-agent-client agent))
            (id (acp:session-id request))
-           (as (or (%find-asess agent id :errorp nil)
+           (servers (%mcp-servers request))
+           (open (%find-asess agent id :errorp nil))
+           (as (or open
                    (%open-asess agent (%client-caps)
                                 (lambda (hook)
                                   (handler-case
-                                      (code:client-resume-session client id :cwd (acp:cwd request)
-                                                                            :tool-sources hook)
+                                      (code:client-resume-session
+                                       client id :cwd (acp:cwd request)
+                                                 :tool-sources hook
+                                                 :mcp-servers (%mcp-server-configs servers))
                                     (code:session-not-found () (%session-not-found id))))))))
-      ;; TODO (H3e-2, cl-stack-code 0.13.0): as session/new.
-      (setf (%asess-mcp-servers as) (%mcp-servers request))
+      (when (and open servers)
+        (code:client-add-mcp-servers (%asess-session as) (%mcp-server-configs servers)))
+      (setf (%asess-mcp-servers as) servers)
       (%replay as)
       (acp:make-acp 'acp:load-session-response :modes (%modes (%asess-session as))))))
 

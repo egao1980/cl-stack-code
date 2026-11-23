@@ -231,6 +231,8 @@ count is 0."
   (image-tools nil)                           ; the LISP-TOOLS, or NIL
   ;; H3e-1
   (instruction-set nil)                       ; the session's INSTRUCTION-SET, or NIL
+  ;; H3e-2a
+  (mcp nil)                                   ; the session's MCP-MANAGER, or NIL
   ;; H3d: one emitter, a sink per destination.
   (sink nil)                                  ; NIL: -p (stream-json lines); else (lambda (object))
   (denial-reason #'%headless-denial-reason))  ; decision → the denial's "reason"
@@ -313,7 +315,7 @@ ai-agent-protocol 0.13), :DENY a rule or policy (or a tool's own refusal)."
     (when (and (member status '(:done :error :denied))
                (not (gethash id (%report-seen report))))
       (setf (gethash id (%report-seen report)) t)
-      (%emit-event report "tool_result"
+      (apply #'%emit-event report "tool_result"
                    "step" (gethash id (%report-call-steps report) (%report-step report))
                    "id" id
                    "name" (agent:agent-invocation-name inv)
@@ -322,7 +324,22 @@ ai-agent-protocol 0.13), :DENY a rule or policy (or a tool's own refusal)."
                    "content" (let ((result (agent:agent-invocation-result inv)))
                                (cond ((null result) "")
                                      ((stringp result) result)
-                                     (t (princ-to-string result))))))))
+                                     (t (princ-to-string result))))
+                   ;; H3e-2a: rich tool output (MCP), only when there is any.
+                   (%invocation-output-keys inv)))))
+
+(defun %invocation-output-keys (inv)
+  "H3e-2a: \"images\" [{media_type, data}] and \"structured\" of INV's rich
+output, each only when present."
+  (let ((images (remove-if-not #'llm:llm-image-part-p (agent:agent-invocation-parts inv)))
+        (structured (agent:agent-invocation-structured inv)))
+    (append (and images
+                 (list "images"
+                       (map 'vector (lambda (part)
+                                      (%json-object "media_type" (llm:llm-image-part-media-type part)
+                                                    "data" (llm:llm-image-part-data part)))
+                            images)))
+            (and structured (list "structured" structured)))))
 
 (defun %on-agent-event (report kind payload)
   "The run's :ON-EVENT. It runs inside event-loop callbacks, where an ERROR
@@ -333,7 +350,9 @@ the run is canceled and the error fails the run afterwards."
         (:started (setf (%report-run report) payload)
          ;; H4b: events queued before the run reach its first step.
          (%post-if-going (%report-image-tools report) payload))
-        (:step (setf (%report-step report) payload))
+        (:step (setf (%report-step report) payload)
+         ;; H3e-2a: before the model call (the set's thread).
+         (%mcp-before-model-call (%report-mcp report)))
         (:part (cond ((and (llm:llm-text-part-p payload)
                            (plusp (length (llm:llm-text-part-text payload))))
                       (%emit-event report "text_delta"
@@ -486,7 +505,7 @@ session's CODE-INSTRUCTION-DISCOVERY), else a new one for CWD with no rules."
   (agent:make-agent-settings
    :llm (model-params-llm-settings settings)
    :max-steps (or (settings-max-turns settings) +default-max-turns+)
-   :extra (list :permission-policy (settings-permission-policy settings)
+   :extra (list :permission-policy (code-permission-policy settings)
                 :max-steps-wrap-up nil
                 :instructions-discovery
                 (or discovery (make-code-instruction-discovery cwd)))))
@@ -904,6 +923,9 @@ result, then signals its failure."
          (config (or user-config-dir (user-config-directory :getenv getenv)))
          (settings (load-settings cwd :user-config-dir config
                                       :cli (invocation-settings inv)))
+         ;; H3e-2a: the servers' configuration errors (exit 2) before anything is written.
+         (mcp-configs (effective-mcp-servers cwd settings :user-config-dir config
+                                                          :env (%env-lookup settings getenv)))
          (sessions-dir (%sessions-dir cwd data-dir getenv))
          (source (%session-source inv sessions-dir))
          (designator (%session-model inv source settings))
@@ -949,6 +971,7 @@ result, then signals its failure."
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (supervisor nil)
+         (mcp nil)
          (sources nil)
          (context nil)
          (discovery nil)
@@ -964,20 +987,30 @@ result, then signals its failure."
                (agent:*off-loop-specials*
                  (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
                         agent:*off-loop-specials*)))
-           ;; H3e-1: the session's instruction set (:start or :resume).
-           (multiple-value-setq (context discovery instruction-set)
-             (%open-session-instructions cwd settings store :user-config-dir config))
-           (setf (%report-instruction-set report) instruction-set)
-           ;; H8d: the run's supervisor, before the tools.
+           ;; H8d: the run's supervisor, before the tools; H3e-2a: then the
+           ;; MCP manager, before the instruction set opens.
            (setf supervisor (make-code-supervisor cwd :data-dir data-dir
                                                       :getenv (or getenv #'uiop:getenv))
-                 sources (apply #'make-code-tools (if plan (plan-tool-root plan cwd) cwd)
-                                :settings settings
-                                :on-image-event (and link (%link-callback link))
-                                :supervisor supervisor
-                                :scope (and plan (%plan-unit-scope supervisor plan))
-                                :skills (context-skills context)
-                                (plan-sandbox-tool-keys sandbox)))
+                 mcp (make-mcp-manager mcp-configs :supervisor supervisor :settings settings
+                                                   :env (%env-lookup settings getenv) :cwd cwd
+                                                   :http-backend http-protocol:*http-backend*)
+                 (%report-mcp report) mcp)
+           ;; H3e-1: the session's instruction set (:start or :resume).
+           (multiple-value-setq (context discovery instruction-set)
+             (%open-session-instructions cwd settings store
+                                         :user-config-dir config
+                                         :components (list (mcp-manager-component mcp))))
+           (setf (mcp-manager-instruction-set mcp) instruction-set
+                 (%report-instruction-set report) instruction-set)
+           (setf sources (append (apply #'make-code-tools (if plan (plan-tool-root plan cwd) cwd)
+                                        :settings settings
+                                        :on-image-event (and link (%link-callback link))
+                                        :supervisor supervisor
+                                        :scope (and plan (%plan-unit-scope supervisor plan))
+                                        :skills (context-skills context)
+                                        (plan-sandbox-tool-keys sandbox))
+                                 ;; H3e-2a: the MCP source, last.
+                                 (list (mcp-manager-tool-source mcp))))
            (%link-skill-tools instruction-set (code-skill-tools sources))
            ;; H4b: the image starts before the system event; its events are
            ;; written and posted on the loop thread.
@@ -989,9 +1022,20 @@ result, then signals its failure."
                                                    (lambda ()
                                                      (%headless-image-event report event)))))
              (start-lisp-image (third sources) settings))
+           ;; H3e-2a: the servers before the first model call (committed once
+           ;; they settled); a notice per server that did not connect.
+           (start-mcp-servers mcp)
+           (dolist (c (mcp-manager-connections mcp))
+             (let ((notice (mcp-status-notice c :user-config-dir config)))
+               (when notice
+                 (format error-output "~a~%" notice))))
+           (force-output error-output)
            (let ((offered (loop for source in sources
                                 append (mapcar #'llm:llm-tool-name
                                                (agent:list-agent-tools source)))))
+             (dolist (notice (%take-mcp-notices mcp))
+               (format error-output "~a~%" notice)
+               (force-output error-output))
              (multiple-value-bind (instructions files)
                  (assemble-system-prompt cwd :tools offered :backend backend
                                              :settings settings :user-config-dir config
@@ -1013,7 +1057,8 @@ result, then signals its failure."
                         (%system-init-keys cwd root designator mode offered files
                                            (and link settings)
                                            :context context :discovery discovery
-                                           :instruction-set instruction-set))
+                                           :instruction-set instruction-set
+                                           :mcp-servers (mcp-manager-connections mcp)))
                  (when plan
                    (apply #'%emit-event report "plan"
                           (%plan-open-keys plan (second plan-and-reopened) sandbox)))
@@ -1041,6 +1086,8 @@ result, then signals its failure."
       ;; H4b: no event reaches the loop after this; -p never waits for
       ;; events after the run (the queue goes with the tools).
       (%link-close link)
+      ;; H3e-2a: the MCP clients and their units, before the supervisor.
+      (close-mcp-manager mcp)
       ;; H8d: unit tools, shell tools, then the supervisor.
       (%close-code-units supervisor :unit-tools (list (code-unit-tools sources))
                                     :shell-tools (list (second sources)))
@@ -1048,7 +1095,7 @@ result, then signals its failure."
       (event:close-event-loop event-backend event-loop))))
 
 (defun %system-init-keys (cwd root designator mode offered files image-settings
-                          &key context discovery instruction-set)
+                          &key context discovery instruction-set mcp-servers)
   "The \"system\" init event's keys and values (after \"type\" and
 \"session_id\"); IMAGE-SETTINGS (the settings, when the image is on) adds
 \"lisp_image\". Shared by -p and the SDK (src/client.lisp). H3e-1: CONTEXT,
@@ -1085,8 +1132,12 @@ DISCOVERY and INSTRUCTION-SET give \"imports\", \"skills\", \"rules\",
                         (and context (context-rules context)))
            "notes" (coerce (and context (context-notes context)) 'vector)
            "instruction_set" (or (and instruction-set (instruction-set-current instruction-set)) :null)
-           ;; H4b: only with the image on.
-           (and image-settings (list "lisp_image" (%lisp-image-object image-settings))))))
+           (append
+            ;; H4b: only with the image on.
+            (and image-settings (list "lisp_image" (%lisp-image-object image-settings)))
+            ;; H3e-2a: only with at least one server (MCP-SERVERS: the connections).
+            (and mcp-servers
+                 (list "mcp_servers" (map 'vector #'mcp-connection-object mcp-servers)))))))
 
 (defun %plan-open-keys (plan reopened-p &optional sandbox)
   "The plan \"opened\" / \"reopened\" event's keys and values. R4d-4b: with

@@ -352,6 +352,7 @@
             "  /approve              apply the open plan to the project"
             "  /reject               discard the open plan"
             "  /ps                   the session's units (shell jobs, servers, subagents): logs, search, stop (also Ctrl-P)"
+            "  /mcp [reconnect [N]]  MCP servers, their status and tools; reconnect one or all"
             "  /exit                 quit (also Ctrl-D, or Ctrl-C on an empty input)"
             "Keys:"
             "  Enter send · Alt+Enter, Shift+Enter or Ctrl+J newline · Up/Down history"
@@ -432,7 +433,12 @@ asked about or run.")
           :documentation "NIL, or the image plist (see the \"H4b\" part of the file header).")
    ;; H8d
    (units-running :initform 0 :accessor state-units-running
-                  :documentation "Live units of the session's supervisor (the status line)."))
+                  :documentation "Live units of the session's supervisor (the status line).")
+   ;; H3e-2a (src/mcp.lisp)
+   (mcp :initform '() :accessor state-mcp
+        :documentation "The MCP servers (MCP-CONNECTION-OBJECT hash tables), from (:mcp-status …).")
+   (mcp-prompt :initform '() :accessor state-mcp-prompt
+               :documentation "((NAME . MESSAGE) …): project servers waiting for the approval dialog."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
@@ -591,6 +597,8 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
          (%plan-command state command argument))
         ;; H8d
         ((string= command "/ps") (%units-command state argument))
+        ;; H3e-2a
+        ((string= command "/mcp") (%mcp-command state argument))
         ((string= command "/help")
          (%add-entry state :kind :notice :text +help-text+)
          '())
@@ -743,7 +751,9 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               ((:image-event :image-return :image-pending)
                (if (state-image state) (%image-event state event) '()))
               ;; H8d
-              ((:units :unit-failed) (%units-event state event))))))
+              ((:units :unit-failed) (%units-event state event))
+              ;; H3e-2a
+              ((:mcp-status :mcp-approval :mcp-reply) (%mcp-event state event))))))
     (values state effects)))
 
 (defun %home-relative (dir)

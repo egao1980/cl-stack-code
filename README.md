@@ -4,7 +4,7 @@ A coding agent CLI on [cl-stack](https://github.com/egao1980/cl-stack): an [`ai-
 
 Plan: [HARNESS-PLAN.md](https://github.com/egao1980/cl-workspace/blob/main/docs/HARNESS-PLAN.md), Track H, milestone H3. Brief: [`cl-stack-code.md`](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/cl-stack-code.md).
 
-Version **0.12.3** (live token streaming: http-backend-async 0.2.27; ACP context updates, #41): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), and `--acp` (**ACP-2**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
+Version **0.13.0** (live token streaming: http-backend-async 0.2.27; ACP context updates, #41): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), `--acp` (**ACP-2**), instruction files, skills and rules as a revisioned instruction set (**H3e-1**), and MCP servers (**H3e-2a**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
 
 ```
 cl-stack-code -p "fix the failing test" --output-format stream-json --permission-mode acceptEdits
@@ -34,7 +34,7 @@ Serves cl-stack-code as an [Agent Client Protocol](https://agentclientprotocol.c
 - Prompts: text, `resource_link` to project files (attached as mentions) and embedded text resources; no images or audio.
 - When the client advertises them, file reads and writes go through `fs/read_text_file` / `fs/write_text_file` (the editor's buffers) and `bash` runs in the client's terminal (`terminal/*`).
 - What the session found shows as a finished read tool call "Context: …" before the first turn: its instruction files, skills and rules (path-scoped ones marked "on demand"). A rule or nested `AGENTS.md` loaded later shows as "Rule loaded: …" / "Instructions loaded: …", and a Lisp image event (the debugger entered, a job done) as a message line (#41).
-- `mcpServers` from the editor are accepted and kept, not connected yet (H3e-2).
+- `mcpServers` from the editor connect as the session's MCP servers (scope `sdk`, trusted; stdio and HTTP, `mcpCapabilities.http: true`; legacy SSE is reported unsupported) (#40).
 
 ## License
 

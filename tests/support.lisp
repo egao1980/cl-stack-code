@@ -46,9 +46,12 @@ pathname."
          (uiop:read-file-string path :external-format :utf-8))))
 
 (defun make-tree (dir entries)
-  "ENTRIES: (rel content), or \"rel/\" alone for an empty directory."
+  "ENTRIES: (rel content), (rel . content), or \"rel/\" alone for an empty directory."
   (dolist (e entries dir)
-    (destructuring-bind (rel &optional (content "")) (if (consp e) e (list e))
+    (destructuring-bind (rel &optional (content ""))
+        (cond ((not (consp e)) (list e))
+              ((stringp (cdr e)) (list (car e) (cdr e))) ; dotted (rel . content)
+              (t e))
       (if (char= #\/ (char rel (1- (length rel))))
           (ensure-directories-exist (subdir dir rel))
           (write-file dir rel content)))))
