@@ -22,7 +22,8 @@ the header of `src/acp/requests.lisp` (ACP). The acp system's tests are
   `inputResponses` (MRTR).
 - ai-agent-protocol **0.17.0** with ai-agent-protocol/mcp **0.3.0** (egao1980/ai-agent-protocol,
   the H3e-2b issue and its contract PR), after 0.16.0 (H3f): `make-deferred-tool-source`
-  (tool_search, the loaded set, `agent-deferred-tool-error`); `make-mcp-sampling-handler`
+  (tool_search, the loaded set, a deferred tool called by name loads, ON-LOAD `:via`, the
+  loop routing a name no source lists to the source that executes it); `make-mcp-sampling-handler`
   `:model` (the server's hints never pick the model), `:max-tokens` (the cap), image content.
 Raise the `.asd` versions to them. H3f (0.14.0) and H5c-0 (0.15.0) merge first; this lands as
 0.16.0 (renumber in merge order).
@@ -31,6 +32,8 @@ Implement every stub (`%h3e2b-pending`, then remove it), and wire:
 - configuration (`src/mcp-config.lisp`): `%parse-mcp-server-extras`, `%parse-mcp-search-keys`,
   `mcp-sampling-settings`, `mcp-server-includes-instructions-p`, `mcp-tool-search-settings`
   (the slots, the copy, the merge, the gated calls and the config hash are given).
+- the user's decisions of 2026-11-23 (in the headers): instructions of approved project / local
+  servers with `"includeInstructions": true`; a deferred tool called by name is loaded and run.
 - the manager (`src/mcp.lisp`): `make-mcp-request-handlers` passed to `mcp-connect`
   (`:sampling-handler`, `:elicitation-handler`) for stdio (both paths) and HTTP; the running
   MCP calls per server (for `tool_use_id`); the request counter; `mcp-manager-tool-source`

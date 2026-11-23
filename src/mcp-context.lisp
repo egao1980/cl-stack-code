@@ -11,8 +11,10 @@
 ;;; SERVER INSTRUCTIONS
 ;;;   MCP-CONNECTION-INSTRUCTIONS connection → the text for the prompt, or NIL:
 ;;;     NIL unless the connection is :CONNECTED and its config passes
-;;;     MCP-SERVER-INCLUDES-INSTRUCTIONS-P (trusted: user, flag, sdk; and
-;;;     "includeInstructions" not false). Otherwise the client's
+;;;     MCP-SERVER-INCLUDES-INSTRUCTIONS-P with the connection's approval (a
+;;;     connected project or local server was approved: trusted servers unless
+;;;     "includeInstructions" is false; project and local servers only when it
+;;;     is true). Otherwise the client's
 ;;;     MCP-PROTOCOL:MCP-CLIENT-INSTRUCTIONS (initialize's, or
 ;;;     server/discover's, "instructions"): not a string, or blank → NIL;
 ;;;     trimmed of whitespace; longer than +MAX-MCP-INSTRUCTIONS-CHARS+ → its
@@ -49,7 +51,7 @@
 ;;;       :mode MODE :threshold THRESHOLD          ; MCP-TOOL-SEARCH-SETTINGS
 ;;;       :keep (lambda (context tool) …)          ; true for alwaysLoad servers' tools
 ;;;       :search-tool-name +TOOL-SEARCH-TOOL-NAME+
-;;;       :on-load (lambda (names) …))             ; a commit is owed
+;;;       :on-load (lambda (names &key via) …))    ; a commit is owed
 ;;;   and nothing else in the product deals with deferral. The stack's rules,
 ;;;   as the product relies on them: deferral is on when MODE is :ALWAYS and a
 ;;;   tool can be deferred, or :AUTO and more than THRESHOLD can; :NEVER is the
@@ -60,10 +62,14 @@
 ;;;   query's words in their names and descriptions; the matches are loaded and
 ;;;   listed in the result ("NAME: DESCRIPTION" lines), and the next step offers
 ;;;   them. It never asks (no approval, read-only: plan mode runs it); a deny
-;;;   rule hides it as any tool. A deferred tool not loaded is not executable:
-;;;   its call gets AGENT:AGENT-DEFERRED-TOOL-ERROR ("call tool_search with
-;;;   select:NAME first"), a tool error the model reads. A loaded tool is an
-;;;   MCP tool as before (its rules, the ask default, plan mode).
+;;;   rule hides it as any tool. A deferred tool not loaded can still be called
+;;;   by its exact (prefixed) name (decided by the user, 2026-11-23: a skill or
+;;;   instructions may name it directly): the call goes through the normal
+;;;   permission path (its rules, the ask default, -p's denial, plan mode), and
+;;;   a call that runs loads the tool (ON-LOAD :VIA :CALL), recorded and
+;;;   restored as a tool_search load is; a denied call loads nothing. A name no
+;;;   server offers stays an unknown tool. A loaded tool is an MCP tool as
+;;;   before.
 ;;;   The loaded set lives as long as the session's manager (every turn and
 ;;;   run of the session) and only grows, except by a restore. It is part of
 ;;;   the instruction set:
@@ -72,8 +78,8 @@
 ;;;     loaded tools, in the server's order; NIL when not deferred). The entry
 ;;;     is (:name :scope :transport :config :status :tools :instructions
 ;;;     :deferred :loaded), in that order.
-;;;   Commits: a tool_search that loaded a tool owes a commit (made before the
-;;;     next model call, as a list_changed is).
+;;;   Commits: a load (by tool_search or by a call) owes a commit (made before
+;;;     the next model call, as a list_changed is).
 ;;;   Restore: the loaded set becomes the revision's (MCP-TOOL-NAME of each
 ;;;     :LOADED name of each entry): a tool the revision had loaded is offered
 ;;;     again, one loaded after it is deferred again.
@@ -96,8 +102,10 @@
 ;;;   object without these keys (0.13's) prints as before.
 ;;;   ACP: tool_search's tool kind is "search" (src/acp/mapping.lisp).
 ;;;
-;;; Non-goals: instructions of project and local servers (folder trust);
-;;; refreshing a running run's system prompt; deferring built-in tools;
+;;; Non-goals: instructions of project and local servers that are not
+;;; approved or not opted in; refreshing a running run's system prompt;
+;;; deferring built-in tools; a load event (tool_search's result and the call
+;;; itself show it);
 ;;; embeddings or BM25 for tool_search (the stack's ranking is words).
 
 ;;; Given: constants.

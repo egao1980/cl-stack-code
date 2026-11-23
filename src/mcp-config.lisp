@@ -109,12 +109,19 @@
 ;;;     "elicitation"  true (the default) | false. false: no elicitation
 ;;;                 handler, the capability not advertised.
 ;;;     "includeInstructions"  true | false; absent = :DEFAULT. The server's
-;;;                 initialize "instructions" join the system prompt only when
-;;;                 the server is trusted (MCP-SERVER-TRUSTED-P: user, flag,
-;;;                 sdk) and this is not false (MCP-SERVER-INCLUDES-
-;;;                 INSTRUCTIONS-P). Project and local servers never (a
-;;;                 repository must not write the system prompt through a server
-;;;                 it ships; folder trust is a later slice), whatever the key.
+;;;                 initialize "instructions" join the system prompt
+;;;                 (MCP-SERVER-INCLUDES-INSTRUCTIONS-P config &key (approval
+;;;                 :approved)):
+;;;                   a trusted server (MCP-SERVER-TRUSTED-P: user, flag, sdk)
+;;;                   unless this is false;
+;;;                   a project or local server only when this is true AND the
+;;;                   server is approved (APPROVAL :APPROVED, MCP-SERVER-APPROVAL:
+;;;                   enabledMcpjsonServers / enableAllProjectMcpServers from the
+;;;                   user file or the flags). Unapproved and rejected servers
+;;;                   never (they do not run either). Decided by the user,
+;;;                   2026-11-23: the user's approval plus the server's explicit
+;;;                   opt-in, so lisp-workspace's lisp-mcp, approved and opted
+;;;                   in, reaches the prompt.
 ;;;     "alwaysLoad"  true | false (default; Claude Code's key): this server's
 ;;;                 tools are never deferred behind tool_search.
 ;;;     A wrong type → SETTINGS-ERROR with the key path, as every server key:
@@ -729,9 +736,10 @@ way round; :LATER → nothing. Other keys of the file are kept. → the file."
   (declare (ignore config))
   (%h3e2b-pending "mcp-sampling-settings"))
 
-(defun mcp-server-includes-instructions-p (config)
-  "True when CONFIG's server instructions may join the system prompt."
-  (declare (ignore config))
+(defun mcp-server-includes-instructions-p (config &key (approval :approved))
+  "True when CONFIG's server instructions may join the system prompt; APPROVAL
+is MCP-SERVER-APPROVAL's value for project and local servers (see the header)."
+  (declare (ignore config approval))
   (%h3e2b-pending "mcp-server-includes-instructions-p"))
 
 (defun mcp-tool-search-settings (settings)

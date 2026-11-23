@@ -120,16 +120,23 @@
     (ok (equal "mock:small" model))
     (ok (= 256 max))))
 
+;; Decided by the user, 2026-11-23: project and local servers when approved
+;; AND opted in with "includeInstructions": true.
 (deftest-parametrize h3e2b-includes-instructions
-    ((scope object expected)
-     (:user "{\"command\":\"x\"}" t)
-     (:user "{\"command\":\"x\",\"includeInstructions\":false}" nil)
-     (:flag "{\"command\":\"x\"}" t)
-     (:sdk "{\"command\":\"x\"}" t)
-     (:project "{\"command\":\"x\"}" nil)
-     (:project "{\"command\":\"x\",\"includeInstructions\":true}" nil)
-     (:local "{\"command\":\"x\",\"includeInstructions\":true}" nil))
-  (ok (eq expected (and (mcp-server-includes-instructions-p (%server2 object :scope scope)) t))))
+    ((scope object approval expected)
+     (:user "{\"command\":\"x\"}" :approved t)
+     (:user "{\"command\":\"x\",\"includeInstructions\":false}" :approved nil)
+     (:flag "{\"command\":\"x\"}" :approved t)
+     (:sdk "{\"command\":\"x\"}" :approved t)
+     (:project "{\"command\":\"x\"}" :approved nil)
+     (:project "{\"command\":\"x\",\"includeInstructions\":true}" :approved t)
+     (:project "{\"command\":\"x\",\"includeInstructions\":true}" :unapproved nil)
+     (:project "{\"command\":\"x\",\"includeInstructions\":true}" :rejected nil)
+     (:local "{\"command\":\"x\",\"includeInstructions\":true}" :approved t)
+     (:local "{\"command\":\"x\",\"includeInstructions\":false}" :approved nil))
+  (ok (eq expected (and (mcp-server-includes-instructions-p (%server2 object :scope scope)
+                                                            :approval approval)
+                        t))))
 
 (deftest h3e2b-config-hash-stable
   (let ((plain (%server2 "{\"command\":\"x\",\"args\":[\"a\"]}"))

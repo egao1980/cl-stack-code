@@ -57,16 +57,40 @@ and \"mcpToolSearch\" MODE / \"mcpToolSearchThreshold\" THRESHOLD when given."
       (ok (not (search "<mcp-instructions" (or (%first-system backend) ""))))
       (ok (eq nil (jget (server-object (mcp-init-servers out) "f2") "instructions"))))))
 
-(deftest h3e2b-instructions-not-from-project-servers
+;; Decided by the user, 2026-11-23: an approved project server that opts in
+;; reaches the prompt; without the key, or unapproved, it does not.
+(deftest h3e2b-instructions-approved-project-server-opted-in
   (with-project (project config :base base) '()
     (write-mcp-json project "f2" (fake2-server base :instructions +fake2-instructions+
                                                     :include-instructions t))
     (approve-all config)
     (multiple-value-bind (exit out err backend) (pj2 project config '("done"))
       (ok (eql 0 exit) err)
+      (ok (equal "connected" (jget (server-object (mcp-init-servers out) "f2") "status")))
+      (ok (uiop:string-suffix-p (or (%first-system backend) "") (%f2-block))
+          "approved and opted in: its block ends the system prompt")
+      (ok (eq t (jget (server-object (mcp-init-servers out) "f2") "instructions"))))))
+
+(deftest h3e2b-instructions-approved-project-server-without-the-key
+  (with-project (project config :base base) '()
+    (write-mcp-json project "f2" (fake2-server base :instructions +fake2-instructions+))
+    (approve-all config)
+    (multiple-value-bind (exit out err backend) (pj2 project config '("done"))
+      (ok (eql 0 exit) err)
       (ok (equal "connected" (jget (server-object (mcp-init-servers out) "f2") "status")) "it runs")
       (ok (not (search +fake2-instructions+ (or (%first-system backend) "")))
-          "a repository's server does not write the system prompt")
+          "a project server needs \"includeInstructions\": true")
+      (ok (eq nil (jget (server-object (mcp-init-servers out) "f2") "instructions"))))))
+
+(deftest h3e2b-instructions-unapproved-project-server
+  (with-project (project config :base base) '()
+    (write-mcp-json project "f2" (fake2-server base :instructions +fake2-instructions+
+                                                    :include-instructions t))
+    (multiple-value-bind (exit out err backend) (pj2 project config '("done"))
+      (ok (eql 0 exit) err)
+      (ok (equal "unapproved" (jget (server-object (mcp-init-servers out) "f2") "status")))
+      (ok (not (search +fake2-instructions+ (or (%first-system backend) "")))
+          "an unapproved server never writes the prompt")
       (ok (eq nil (jget (server-object (mcp-init-servers out) "f2") "instructions"))))))
 
 (deftest h3e2b-instructions-capped
@@ -146,16 +170,32 @@ and \"mcpToolSearch\" MODE / \"mcpToolSearchThreshold\" THRESHOLD when given."
       (ok (same-set '("mcp__f2__echo" "mcp__f2__tool_07") (%f2-offered (second (scripted-requests backend))))
           "exactly those"))))
 
-(deftest h3e2b-tool-search-unloaded-call
+;; Decided by the user, 2026-11-23: a deferred tool called by name is loaded
+;; and run (a skill or instructions may name it), through the permission path.
+(deftest h3e2b-tool-search-call-loads
   (with-project (project config :base base) '()
     (%search-settings config base :threshold 5)
-    (multiple-value-bind (exit out err)
+    (multiple-value-bind (exit out err backend)
         (pj2 project config (list (f2-call "tool_03") "done") "--allowed-tools" "mcp__f2__tool_03")
       (ok (eql 0 exit) err)
-      (let ((r (tool-result-of out "mcp__f2__tool_03")))
-        (ok (eq t (jget r "is_error")) "a tool error the model reads")
-        (ok (has "tool_search" (or (jget r "content") "")))
-        (ok (not (has "tool_03 ran" (or (jget r "content") ""))))))))
+      (ok (equal "tool_03 ran" (f2-result out "tool_03")) "called before any search: it runs")
+      (ok (null (%f2-offered (first (scripted-requests backend)))) "it was deferred")
+      (ok (equal '("mcp__f2__tool_03") (%f2-offered (second (scripted-requests backend))))
+          "and is offered from the next step on")
+      (ok (null (denial-of out "mcp__f2__tool_03"))))))
+
+(deftest h3e2b-tool-search-denied-call-and-unknown-name
+  (with-project (project config :base base) '()
+    (%search-settings config base :threshold 5)
+    (multiple-value-bind (exit out err backend)
+        (pj2 project config (list (f2-call "tool_03") (f2-call "nope") "done"))
+      (ok (eql 0 exit) err)
+      (ok (equal "denied" (jget (tool-result-of out "mcp__f2__tool_03") "status"))
+          "the normal permission path: the default ask, denied headless")
+      (ok (null (%f2-offered (third (scripted-requests backend)))) "a denied call loads nothing")
+      (let ((r (tool-result-of out "mcp__f2__nope")))
+        (ok (eq t (jget r "is_error")) "a name no server offers stays an unknown tool")
+        (ok (has "nope" (or (jget r "content") "")))))))
 
 (deftest-parametrize h3e2b-tool-search-modes
     ((mode threshold extra active offered)
@@ -201,7 +241,9 @@ and \"mcpToolSearch\" MODE / \"mcpToolSearchThreshold\" THRESHOLD when given."
   (with-project (project config :base base) '()
     (%search-settings config base :threshold 5)
     (with-test-client (client backend events project config
-                       :steps (list "one" (%search-step "select:mcp__f2__tool_03") "two" "three" "four"))
+                       :steps (list "one" (%search-step "select:mcp__f2__tool_03") "two"
+                                    (f2-call "tool_07") "three" "four")
+                       :settings (make-settings :allow (list (parse-permission-rule "mcp__f2__tool_07" :allow))))
       (let* ((s (client-new-session client))
              (id (code-session-id s))
              (store (%session-iset-store s)))
@@ -212,19 +254,24 @@ and \"mcpToolSearch\" MODE / \"mcpToolSearchThreshold\" THRESHOLD when given."
                (records (session-dir-records project config id))
                (r1 (record-instructions (first records)))
                (r2 (record-instructions (second records)))
+               (r3 (record-instructions (third records)))
                (f2-1 (%snapshot-server (%mcp-snapshot store r1) "f2"))
-               (f2-2 (%snapshot-server (%mcp-snapshot store r2) "f2")))
+               (f2-2 (%snapshot-server (%mcp-snapshot store r2) "f2"))
+               (f2-3 (%snapshot-server (%mcp-snapshot store r3) "f2")))
           (ok (null (%f2-offered (first requests))))
           (ok (equal '("mcp__f2__tool_03") (%f2-offered (third requests))) "loaded in turn 2")
           (ok (equal '("mcp__f2__tool_03") (%f2-offered (fourth requests))) "and still in turn 3")
+          (ok (same-set '("mcp__f2__tool_03" "mcp__f2__tool_07") (%f2-offered (fifth requests)))
+              "tool_07 loaded by its call in turn 3")
           (ok (eq t (getf f2-1 :deferred)))
           (ok (null (getf f2-1 :loaded)))
           (ok (not (equal r1 r2)) "the load committed a revision")
           (ok (equal '("tool_03") (getf f2-2 :loaded)) "the server's own name")
+          (ok (same-set '("tool_03" "tool_07") (getf f2-3 :loaded)) "a call's load is recorded too")
           (client-rewind s 1 :mode :conversation)
           (client-query s "fourth" :timeout 60)
-          (ok (null (%f2-offered (fifth (scripted-requests backend))))
-              "after a rewind to turn 1, tool_03 is deferred again"))))))
+          (ok (null (%f2-offered (sixth (scripted-requests backend))))
+              "after a rewind to turn 1, both are deferred again"))))))
 
 (deftest h3e2b-mcp-list-objects
   (with-project (project config :base base) '()
