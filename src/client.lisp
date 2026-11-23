@@ -303,7 +303,9 @@
   "Every event \"type\" the SDK, -p's stream-json and --rpc can deliver.")
 
 (defparameter +approval-decision-names+
-  '(("once" . :once) ("always" . :always) ("reject" . :reject) ("reject_all" . :reject-all))
+  '(("once" . :once) ("always" . :always) ("reject" . :reject) ("reject_all" . :reject-all)
+    ;; H3e-2b: an MCP elicitation's answers (src/mcp-requests.lisp)
+    ("accept" . :accept) ("decline" . :decline) ("cancel" . :cancel))
   "Wire names of the approval decisions (approval/respond, approval_resolved).")
 
 (defun event-type (event)
@@ -1874,9 +1876,13 @@ on the loop thread. The watcher only reads the session's state."
   (%on-client-loop ((code-session-client session))
     (mapcar #'cdr (%s-pending (%live session)))))
 
-(defun client-respond-approval (session id decision &key feedback)
-  (%on-client-loop ((code-session-client session))
-    (%respond session (%live session) id decision feedback)))
+(defun client-respond-approval (session id decision &key feedback content)
+  ;; H3e-2b: an MCP request id (src/mcp-requests.lisp) is answered there;
+  ;; CONTENT is an elicitation's accepted content.
+  (if (mcp-request-id-p id)
+      (%respond-mcp-request session id decision :feedback feedback :content content)
+      (%on-client-loop ((code-session-client session))
+        (%respond session (%live session) id decision feedback))))
 
 ;;; The end of a turn.
 

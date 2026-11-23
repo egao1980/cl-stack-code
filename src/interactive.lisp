@@ -455,7 +455,11 @@ asked about or run.")
    (retry :initform nil :accessor state-retry
           :documentation "NIL, or (PLIST . DEADLINE): the retry waiting, DEADLINE an internal real time.")
    (context :initform nil :accessor state-context
-            :documentation "NIL, or \"ctx P%\" of the last response."))
+            :documentation "NIL, or \"ctx P%\" of the last response.")
+   ;; H3e-2b (src/mcp-requests.lisp)
+   (mcp-requests :initform '() :accessor state-mcp-requests
+                 :documentation "The MCP servers' sampling and elicitation requests waiting for
+the dialog (their approval_request objects), oldest first."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
@@ -816,7 +820,10 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               ;; H8d
               ((:units :unit-failed) (%units-event state event))
               ;; H3e-2a
-              ((:mcp-status :mcp-approval :mcp-reply) (%mcp-event state event))))))
+              ((:mcp-status :mcp-approval :mcp-reply) (%mcp-event state event))
+              ;; H3e-2b
+              ((:mcp-request :mcp-request-reply :mcp-request-resolved)
+               (%mcp-request-event state event))))))
     (values state effects)))
 
 ;;; H3f: resilience events (src/resilience.lisp, "TUI").

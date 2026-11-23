@@ -302,11 +302,10 @@
 ;;; the product owns, debugger events in the inbox, restart rules); the
 ;;; brief says so.
 ;;;
-;;; Later (H3e-2b): sampling (make-mcp-sampling-handler behind an ask,
-;;; action mcp_sampling, samplingModel), elicitation through the approval
-;;; UI, server instructions in the prompt (includeInstructions, a tagged
-;;; <mcp-instructions server="x"> block), deferred tool loading, roots,
-;;; resources and prompts, deferred approvals for -p.
+;;; H3e-2b (0.16.0): sampling and elicitation (src/mcp-requests.lisp), server
+;;; instructions in the prompt and deferred tool loading (src/mcp-context.lisp,
+;;; which also amends this file's snapshot, objects and /mcp lines). Later:
+;;; roots, resources and prompts, deferred approvals for -p.
 
 ;;; Given: constants, classes, condition.
 
@@ -377,6 +376,9 @@ opinion answers."
    (cwd :initarg :cwd :initform nil :reader mcp-manager-cwd)
    (http-backend :initarg :http-backend :initform nil :reader mcp-manager-http-backend)
    (on-status :initarg :on-status :initform nil :reader mcp-manager-on-status)
+   ;; H3e-2b (src/mcp-requests.lisp): who answers the servers' requests
+   (broker :initarg :broker :initform nil :accessor mcp-manager-broker
+           :documentation "The session's MCP-REQUEST-BROKER, or NIL (requests answered as headless).")
    (closed :initform nil :accessor mcp-manager-closed-p)
    ;; The instruction set (see the header)
    (component :initform nil :accessor mcp-manager-component
@@ -470,17 +472,28 @@ opinion answers."
   "The snapshot's :CONFIG: sha256 of the config's data without env or header values."
   (p:octets-hash
    (p:utf8-encode
-    (%print-data (list :transport (mcp-server-config-transport config)
-                       :command (mcp-server-config-command config)
-                       :args (copy-list (mcp-server-config-args config))
-                       :env-names (mapcar #'car (mcp-server-config-env config))
-                       :url (mcp-server-config-url config)
-                       :header-names (mapcar #'car (mcp-server-config-headers config))
-                       :disabled (and (mcp-server-config-disabled-p config) t)
-                       :timeout (mcp-server-config-timeout config)
-                       :startup-timeout (mcp-server-config-startup-timeout config)
-                       :cache-tools (and (mcp-server-config-cache-tools config) t)
-                       :tool-error-behavior (mcp-server-config-tool-error-behavior config))))))
+    (%print-data (append
+                  (list :transport (mcp-server-config-transport config)
+                        :command (mcp-server-config-command config)
+                        :args (copy-list (mcp-server-config-args config))
+                        :env-names (mapcar #'car (mcp-server-config-env config))
+                        :url (mcp-server-config-url config)
+                        :header-names (mapcar #'car (mcp-server-config-headers config))
+                        :disabled (and (mcp-server-config-disabled-p config) t)
+                        :timeout (mcp-server-config-timeout config)
+                        :startup-timeout (mcp-server-config-startup-timeout config)
+                        :cache-tools (and (mcp-server-config-cache-tools config) t)
+                        :tool-error-behavior (mcp-server-config-tool-error-behavior config))
+                  ;; H3e-2b: only when not the default, so 0.13 configs hash as before
+                  (and (mcp-server-config-sampling config)
+                       (list :sampling (copy-list (mcp-server-config-sampling config))))
+                  (and (not (mcp-server-config-elicitation config))
+                       (list :elicitation nil))
+                  (and (not (eq :default (mcp-server-config-include-instructions config)))
+                       (list :include-instructions
+                             (and (mcp-server-config-include-instructions config) t)))
+                  (and (mcp-server-config-always-load config)
+                       (list :always-load t)))))))
 
 (defun %mcp-connection-hash (connection)
   (or (and (typep connection '%live-mcp-connection) (%mcp-pinned-hash connection))
@@ -521,9 +534,10 @@ opinion answers."
                   (bt:with-lock-held ((%mcp-manager-lock manager))
                     (copy-list (%mcp-held manager))))))
 
-(defun make-mcp-manager (configs &key supervisor settings env cwd http-backend on-status)
+(defun make-mcp-manager (configs &key supervisor settings env cwd http-backend on-status broker)
   (let ((manager (make-instance '%code-mcp-manager
                                 :supervisor supervisor
+                                :broker broker
                                 :settings (or settings (make-settings))
                                 :env (or env (constantly nil))
                                 :cwd cwd
