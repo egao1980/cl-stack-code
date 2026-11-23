@@ -199,3 +199,64 @@
      ((args "type" "steering" "subtype" "taken" "session_id" "s" "texts" #("x")))
      ((args "type" "session" "subtype" "forked" "from" "a" "session_id" "b")))
   (ok (null (event-updates event :cwd *cwd*))))
+
+;;; #41: what the session found, lazily loaded rules and image events reach
+;;; the editor.
+
+(deftest acp-event-instructions-rule
+  (let* ((path (native (merge-pathnames ".claude/rules/lisp.md" *cwd*)))
+         (u (one-update (args "type" "instructions" "session_id" "s"
+                              "files" (vector (args "path" path "kind" "rule"))))))
+    (ok (typep u 'acp:update-tool-call))
+    (ok (equal "Rule loaded: .claude/rules/lisp.md" (acp:title u)))
+    (ok (equal "read" (acp:kind u)))
+    (ok (equal "completed" (acp:status u)))
+    (ok (equal path (acp:path (elt (acp:locations u) 0))))
+    (ok (encodes-p u))))
+
+(deftest acp-event-instructions-agents
+  (let ((updates (event-updates
+                  (args "type" "instructions" "session_id" "s"
+                        "files" (vector (args "path" (native (merge-pathnames "sub/AGENTS.md" *cwd*))
+                                              "kind" "agents")
+                                        (args "path" "/elsewhere/r.md" "kind" "rule")))
+                  :cwd *cwd*)))
+    (ok (= 2 (length updates)))
+    (ok (equal "Instructions loaded: sub/AGENTS.md" (acp:title (first updates))))
+    (ok (equal "Rule loaded: /elsewhere/r.md" (acp:title (second updates))) "outside: absolute")
+    (ok (string/= (acp:tool-call-id (first updates)) (acp:tool-call-id (second updates))))))
+
+(deftest acp-event-image-event
+  (let ((u (one-update (args "type" "image_event" "session_id" "s" "kind" "debugger"
+                             "connection" "image" "thread" 1 "level" 1 "job" :null
+                             "text" "λ image entered the debugger (thread 1, level 1): boom"))))
+    (ok (typep u 'acp:update-agent-message-chunk))
+    (ok (search "λ image entered the debugger" (chunk-text u)))
+    (ok (encodes-p u)))
+  (ok (null (event-updates (args "type" "image_event" "session_id" "s" "text" :null) :cwd *cwd*))
+      "no text, no update"))
+
+(deftest acp-session-init-updates
+  (let* ((agents (native (merge-pathnames "AGENTS.md" *cwd*)))
+         (init (args "type" "system" "subtype" "init" "session_id" "s"
+                     "instructions" (vector agents)
+                     "skills" (vector (args "name" "duration-units" "description" "d"
+                                            "path" "x" "source" "claude"))
+                     "rules" (vector (args "path" (native (merge-pathnames ".claude/rules/lisp.md" *cwd*))
+                                           "paths" (vector "**/*.lisp") "loaded" nil))))
+         (updates (session-init-updates init :cwd *cwd*))
+         (u (first updates)))
+    (ok (= 1 (length updates)))
+    (ok (typep u 'acp:update-tool-call))
+    (ok (equal "session-context" (acp:tool-call-id u)))
+    (ok (equal "Context: AGENTS.md · skills: duration-units · rules: 1" (acp:title u)))
+    (ok (equal agents (acp:path (elt (acp:locations u) 0))))
+    (let ((text (acp:text (acp:content (elt (acp:content u) 0)))))
+      (ok (search "Instructions: AGENTS.md" text))
+      (ok (search "Skills: duration-units" text))
+      (ok (search "Rules: .claude/rules/lisp.md (**/*.lisp, on demand)" text)))
+    (ok (encodes-p u)))
+  (ok (null (session-init-updates nil)))
+  (ok (null (session-init-updates (args "type" "system" "subtype" "init" "session_id" "s"
+                                        "instructions" #() "skills" #() "rules" #())))
+      "nothing found, nothing shown"))

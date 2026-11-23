@@ -34,6 +34,7 @@ cl-stack-code SDK (src/client.lisp); SERVE-ACP serves one on stdio
    #:result-stop-reason
    #:tool-kind
    #:event-updates
+   #:session-init-updates
    ;; the contract stub condition
    #:acp2-pending))
 
