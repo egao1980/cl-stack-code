@@ -70,9 +70,25 @@
 ;;;                               "discarded": no entries. Other subtypes
 ;;;                               ("opened", "reopened", "drift", "rebased")
 ;;;                               → no update
+;;;     instructions {files: [{path, kind}]} (#41)
+;;;                             → per file an UPDATE-TOOL-CALL, id
+;;;                               "instructions:<path>", kind "read", status
+;;;                               "completed", title "Rule loaded: P" (kind
+;;;                               "rule") or "Instructions loaded: P" (P
+;;;                               relative to CWD when below it), the path
+;;;                               as its location
+;;;     image_event {text} (#41) → UPDATE-AGENT-MESSAGE-CHUNK with the
+;;;                               notice between blank lines; no text → none
 ;;;     anything else (system, assistant, approval_request,
-;;;     approval_resolved, steering, image_event, rewind, session, result,
+;;;     approval_resolved, steering, rewind, session, result,
 ;;;     unit)                   → no update
+;;;   SESSION-INIT-UPDATES init &key CWD (#41) → for the session's init
+;;;   object (CODE-SESSION-INIT): one finished "read" UPDATE-TOOL-CALL, id
+;;;   "session-context", title "Context: FILES · skills: NAMES · rules: N",
+;;;   its text content the full lists (path-scoped rules not loaded yet
+;;;   marked "(GLOBS, on demand)"), locations the instruction files; NIL
+;;;   when nothing was found. The agent sends it before the session's first
+;;;   turn.
 
 (defparameter +acp-mode-ids+ code:+permission-mode-names+
   "The ACP session mode ids: the permission mode names, in their order.")
@@ -201,4 +217,71 @@
                ((equal subtype "discarded")
                 (list (acp:make-acp 'acp:update-plan :entries (vector))))
                (t '()))))
+      ((equal type "instructions")
+       ;; #41: a lazily loaded AGENTS.md or path-scoped rule, as a finished
+       ;; read tool call the editor shows.
+       (map 'list (lambda (file)
+                    (let ((path (code:event-value file "path")))
+                      (acp:make-acp 'acp:update-tool-call
+                                    :tool-call-id (format nil "instructions:~a" path)
+                                    :title (format nil "~:[Instructions~;Rule~] loaded: ~a"
+                                                   (equal "rule" (code:event-value file "kind"))
+                                                   (%display-path path cwd))
+                                    :kind "read"
+                                    :status "completed"
+                                    :locations (vector (acp:make-acp 'acp:tool-call-location
+                                                                     :path path)))))
+            (or (code:event-value event "files") #())))
+      ((equal type "image_event")
+       ;; #41: the Lisp image entered the debugger or finished a job.
+       (let ((text (code:event-value event "text")))
+         (and (stringp text) (plusp (length text))
+              (list (acp:make-acp 'acp:update-agent-message-chunk
+                                  :content (%text-content
+                                            (format nil "~%~%~a~%~%" text)))))))
       (t '()))))
+
+(defun %display-path (path cwd)
+  "PATH relative to CWD when it is below it, else PATH."
+  (let ((p (uiop:parse-native-namestring path)))
+    (if (and cwd (uiop:subpathp p (uiop:ensure-directory-pathname cwd)))
+        (uiop:native-namestring (uiop:enough-pathname p (uiop:ensure-directory-pathname cwd)))
+        path)))
+
+(defun %names (seq key)
+  (remove nil (map 'list (lambda (x) (if key (code:event-value x key) x)) (or seq #()))))
+
+(defun session-init-updates (init &key cwd)
+  "#41: the session's init object (CODE:CODE-SESSION-INIT) as one finished
+read tool call, id \"session-context\", so the editor shows what the session
+found: its instruction files, skills and rules (path-scoped ones load on
+demand). NIL when there is nothing to show."
+  (when init
+    (let* ((files (map 'list (lambda (p) (%display-path p cwd))
+                       (%names (code:event-value init "instructions") nil)))
+           (skills (%names (code:event-value init "skills") "name"))
+           (rules (map 'list (lambda (r)
+                               (let ((paths (code:event-value r "paths")))
+                                 (format nil "~a~@[ (~{~a~^, ~}, on demand)~]"
+                                         (%display-path (code:event-value r "path") cwd)
+                                         (and (typep paths 'sequence) (not (stringp paths))
+                                              (plusp (length paths))
+                                              (not (code:event-value r "loaded"))
+                                              (coerce paths 'list)))))
+                       (or (code:event-value init "rules") #()))))
+      (when (or files skills rules)
+        (let ((text (format nil "~@[Instructions: ~{~a~^, ~}~]~@[~%Skills: ~{~a~^, ~}~]~@[~%Rules: ~{~a~^; ~}~]"
+                            files skills rules)))
+          (list (acp:make-acp 'acp:update-tool-call
+                              :tool-call-id "session-context"
+                              :title (format nil "Context: ~{~a~^ · ~}"
+                                             (remove nil
+                                                     (list (and files (format nil "~{~a~^, ~}" files))
+                                                           (and skills (format nil "skills: ~{~a~^, ~}" skills))
+                                                           (and rules (format nil "rules: ~d" (length rules))))))
+                              :kind "read"
+                              :status "completed"
+                              :content (%result-text-content text)
+                              :locations (map 'vector (lambda (p)
+                                                        (acp:make-acp 'acp:tool-call-location :path p))
+                                              (%names (code:event-value init "instructions") nil)))))))))

@@ -144,7 +144,8 @@
   (closed nil))
 
 (defstruct (%asess (:constructor %make-asess (courier caps)))
-  courier caps session (mcp-servers '()))
+  courier caps session (mcp-servers '())
+  (context-sent nil))  ; #41: the session-context update went out
 
 (defparameter +%mode-titles+
   '("Default" "Accept edits" "Bypass permissions" "Plan")
@@ -594,6 +595,14 @@ Calls a previous answer resolved already (:always, :reject-all) ask nothing."
            (courier (%asess-courier as)))
       (multiple-value-bind (text mentions) (%prompt-input session (%slot request 'acp:prompt))
         (courier-claim courier)
+        ;; #41: once per session, what it found (instructions, skills, rules)
+        (unless (%asess-context-sent as)
+          (setf (%asess-context-sent as) t)
+          (handler-case
+              (dolist (update (session-init-updates (code:code-session-init session)
+                                                    :cwd (code:code-session-cwd session)))
+                (acp:acp-send-update acp:*acp-remote* (courier-session-id courier) update))
+            (error () nil)))
         (let ((result nil) (started nil))
           (unwind-protect
                (progn

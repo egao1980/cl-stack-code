@@ -4,7 +4,7 @@ A coding agent CLI on [cl-stack](https://github.com/egao1980/cl-stack): an [`ai-
 
 Plan: [HARNESS-PLAN.md](https://github.com/egao1980/cl-workspace/blob/main/docs/HARNESS-PLAN.md), Track H, milestone H3. Brief: [`cl-stack-code.md`](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/cl-stack-code.md).
 
-Version **0.12.2** (live token streaming: http-backend-async 0.2.27): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), and `--acp` (**ACP-2**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
+Version **0.12.3** (live token streaming: http-backend-async 0.2.27; ACP context updates, #41): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), and `--acp` (**ACP-2**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
 
 ```
 cl-stack-code -p "fix the failing test" --output-format stream-json --permission-mode acceptEdits
@@ -33,6 +33,7 @@ Serves cl-stack-code as an [Agent Client Protocol](https://agentclientprotocol.c
 - Turns stream message and thought chunks (the SDK's `text_delta` and `thinking_delta` events), tool calls with their kind, locations and whole-file diffs, tool results, and plan-mode plans. Approvals are `session/request_permission` with allow once / always (saved to `settings.local.json`) and reject once / all; `session/cancel` interrupts the turn (and a running bash).
 - Prompts: text, `resource_link` to project files (attached as mentions) and embedded text resources; no images or audio.
 - When the client advertises them, file reads and writes go through `fs/read_text_file` / `fs/write_text_file` (the editor's buffers) and `bash` runs in the client's terminal (`terminal/*`).
+- What the session found shows as a finished read tool call "Context: …" before the first turn: its instruction files, skills and rules (path-scoped ones marked "on demand"). A rule or nested `AGENTS.md` loaded later shows as "Rule loaded: …" / "Instructions loaded: …", and a Lisp image event (the debugger entered, a job done) as a message line (#41).
 - `mcpServers` from the editor are accepted and kept, not connected yet (H3e-2).
 
 ## License
