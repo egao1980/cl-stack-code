@@ -106,6 +106,12 @@ compression-protocol.asd 0.2.0 beside the 0.4.0 one); it never wins."
              " (and entry (probe-file (uiop:parse-native-namestring (cdr entry))))))"
              " asdf:*system-definition-search-functions*)"))))
 
+(defun %child-dynamic-space-size ()
+  "This image's heap size as an SBCL --dynamic-space-size argument, so a child
+that compiles the systems has the room its parent was given (#18)."
+  #+sbcl (format nil "~dMB" (floor (sb-ext:dynamic-space-size) (* 1024 1024)))
+  #-sbcl (error "the child images are started with SBCL only"))
+
 (defun %child-asdf-forms ()
   "The --eval forms that give a child SBCL this image's ASDF and systems: load
 ASDF, a source registry of the loaded systems' directories (for anything not
@@ -122,6 +128,7 @@ loaded here), and the exact .asd files of the loaded ones, which come first."
   (append
    (list (uiop:native-namestring sb-ext:*runtime-pathname*)
          "--core" (uiop:native-namestring sb-ext:*core-pathname*) "--noinform"
+         "--dynamic-space-size" (%child-dynamic-space-size)
          "--non-interactive" "--no-sysinit" "--no-userinit")
    (loop for form in (append (%child-asdf-forms)
                            (list "(uiop:symbol-call :asdf :load-system \"cl-stack-code/tests\")"

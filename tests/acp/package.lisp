@@ -11,7 +11,7 @@
                 #:request-text #:last-request
                 #:write-args #:edit-args #:write-step #:bash-step
                 #:session-dir-records #:wait-until
-                #:%child-asdf-forms)
+                #:%child-asdf-forms #:%child-dynamic-space-size)
   (:local-nicknames (#:acp #:acp-protocol)
                     (#:stdio #:acp-backend-stdio)
                     (#:json #:json-protocol)
