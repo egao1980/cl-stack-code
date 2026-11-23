@@ -676,5 +676,5 @@
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.13.1"
+(defparameter +version+ "0.13.2"
   "The product version, as in the .asd.")
