@@ -181,6 +181,16 @@ Windows command-line limit (32767 characters)."
         (cond ((null chunk) (return (and (search needle (pty-screen-text term)) t)))
               ((plusp (length chunk)) (tp:terminal-feed term chunk)))))))
 
+(defun pty-wait-gone (pty term needle timeout)
+  "Feed the pty's output to TERM until NEEDLE is off its screen. → T or NIL."
+  (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
+    (loop
+      (unless (search needle (pty-screen-text term)) (return t))
+      (when (> (get-internal-real-time) deadline) (return nil))
+      (let ((chunk (pp:pty-read pty :timeout 0.1)))
+        (cond ((null chunk) (return (not (search needle (pty-screen-text term)))))
+              ((plusp (length chunk)) (tp:terminal-feed term chunk)))))))
+
 (defun pty-drain-until-exit (pty term timeout)
   (let ((deadline (+ (get-internal-real-time) (* timeout internal-time-units-per-second))))
     (loop
@@ -210,22 +220,27 @@ the write, so the test reports its assertions."
              (pty (pp:spawn-pty (pty-child-argv report project config) :cols 100 :rows 30))
              (term (tp:make-terminal :cols 100 :rows 30 :backend (emulator))))
         (unwind-protect
-             (progn
-               (ok (pty-wait pty term "Message, @file" 300)
-                   (format nil "the first frame (the child may compile):~%~a" (pty-screen-text term)))
-               (ok (search " mock · default · " (pty-screen-text term)) "the status line")
-               (pty-type pty (format nil "hi~c" #\Return))
-               (ok (pty-wait pty term "Hello from the pty" 60) "a turn on the mock model")
-               (pty-type pty (string (code-char 3)))   ; Ctrl-C, empty input: quit
-               (pty-drain-until-exit pty term 60)
-               (let* ((forms (read-forms report))
-                      (before (second (assoc :before forms)))
-                      (exit (assoc :exit forms)))
-                 (ok (null (assoc :error forms)) (format nil "~s" forms))
-                 (ok (eql 0 (second exit)) (format nil "run-cli returned 0: ~s" exit))
-                 (ok (eql 1 (third exit)) "one request")
-                 (ok (and before (plusp (length before)) (equal before (fourth exit)))
-                     (format nil "the terminal is restored: ~s vs ~s" before (fourth exit)))))
+            (progn
+              (ok (pty-wait pty term "Message, @file" 300)
+                  (format nil "the first frame (the child may compile):~%~a" (pty-screen-text term)))
+              (ok (search " mock · default · " (pty-screen-text term)) "the status line")
+              (pty-type pty (format nil "hi~c" #\Return))
+              (ok (pty-wait pty term "Hello from the pty" 60) "a turn on the mock model")
+              ;; The reply is on screen before the turn ends (its checkpoint
+              ;; is still being written), and Ctrl-C while busy interrupts
+              ;; instead of quitting (#13): wait for the spinner to go.
+              (ok (pty-wait-gone pty term "Working…" 120)
+                  (format nil "the turn ended:~%~a" (pty-screen-text term)))
+              (pty-type pty (string (code-char 3)))   ; Ctrl-C, empty input: quit
+              (pty-drain-until-exit pty term 60)
+              (let* ((forms (read-forms report))
+                     (before (second (assoc :before forms)))
+                     (exit (assoc :exit forms)))
+                (ok (null (assoc :error forms)) (format nil "~s" forms))
+                (ok (eql 0 (second exit)) (format nil "run-cli returned 0: ~s" exit))
+                (ok (eql 1 (third exit)) "one request")
+                (ok (and before (plusp (length before)) (equal before (fourth exit)))
+                    (format nil "the terminal is restored: ~s vs ~s" before (fourth exit)))))
           (ignore-errors (pp:pty-close pty))
           (ignore-errors (tp:terminal-close term))
           (uiop:delete-file-if-exists report))))))
