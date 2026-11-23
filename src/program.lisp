@@ -1206,6 +1206,13 @@ goes back to the input)."
     (when context
       (dolist (note (context-notes context))
         (%apply-event program (list :notice (format nil "note: ~a" note))))))
+  ;; #48: a cwd that is not a project gets no file checkpoints; say so once.
+  (let ((cp (%cp-checkpointer program)))
+    (when (and cp (checkpointer-no-project-p cp))
+      (%apply-event program
+                    (list :notice
+                          (format nil "note: checkpoints are off: ~a is not a project (no .git at or above it); set checkpoints.kind to \"copy\" to snapshot it"
+                                  (uiop:native-namestring (checkpointer-project-dir cp)))))))
   (let ((prompt (%cp-prompt program)))
     (when prompt
       (%apply-event program (list :submit prompt))))

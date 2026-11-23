@@ -63,6 +63,32 @@
       (ok (null (scripted-requests backend)) "the run did not start")
       (ok (equal "alpha" (read-file project "a.txt"))))))
 
+(deftest cli-no-project-no-checkpoints
+  ;; #48: a cwd that is not a project (no .git at or above it, like /tmp or
+  ;; the home directory) is not snapshotted before and after every turn;
+  ;; checkpoints.kind "copy" still asks for it.
+  (with-project (project config :git nil) '(("a.txt" "alpha"))
+    (with-checkpointer (cp project config)
+      (ok (checkpointer-no-project-p cp))
+      (ok (not (checkpointer-enabled-p cp)) "automatic checkpoints are off")
+      (ok (null (begin-checkpoint-turn cp (fresh-session project config))) "no files read"))
+    (let* ((id (edit-run-session project config (list (write-tool "a.txt" "beta") "Done.")))
+           (s (cli-session project config id)))
+      (ok (equal "beta" (read-file project "a.txt")) "the run works")
+      (ok (null (session-checkpoints s :all t)) "no checkpoint")
+      (ok (not (uiop:directory-exists-p (checkpoints-directory s))) "nothing snapshotted"))
+    (write-settings-file (local-settings config project) "{\"checkpoints\":{\"kind\":\"copy\"}}")
+    (with-checkpointer (cp project config :kind :copy)
+      (ok (not (checkpointer-no-project-p cp)) "an explicit kind")
+      (ok (checkpointer-enabled-p cp)))
+    (let ((id (edit-run-session project config (list (write-tool "a.txt" "gamma") "Done."))))
+      (ok (equal '(:before :turn) (reasons (session-checkpoints (cli-session project config id))))
+          "kind copy: snapshotted")))
+  (with-project (project config) '(("a.txt" "alpha"))
+    (with-checkpointer (cp project config)
+      (ok (not (checkpointer-no-project-p cp)) "a project")
+      (ok (checkpointer-enabled-p cp)))))
+
 ;;; Turns.
 
 (defun cli-turn-records-checkpoints-case (kind)

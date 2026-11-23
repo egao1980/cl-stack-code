@@ -337,6 +337,7 @@
    #:checkpointer-kind
    #:checkpointer-keep
    #:checkpointer-enabled-p
+   #:checkpointer-no-project-p
    #:checkpointer-data-dir
    #:close-checkpointer
    #:files-state

@@ -122,6 +122,12 @@
 ;;;   rewinds of existing checkpoints and listings still work. DATA-DIR (NIL:
 ;;;   USER-DATA-DIRECTORY) holds the rewind plans (PLANS-DIRECTORY).
 ;;;   CLOSE-CHECKPOINTER releases the git / jj store it opened (idempotent).
+;;;   No project (#48): when KIND is :AUTO, it resolves to :copy and
+;;;   PROJECT-DIR has no project root (FIND-PROJECT-ROOT: no .git at or above
+;;;   it), the checkpointer is made disabled and CHECKPOINTER-NO-PROJECT-P is
+;;;   true. A cwd like /tmp or the home directory is never snapshotted on its
+;;;   own (a :copy snapshot hashes and stores every file below it, before
+;;;   every turn); checkpoints.kind "copy" asks for it explicitly.
 ;;;
 ;;; Turns (BEGIN-CHECKPOINT-TURN cp store → PRE, END-CHECKPOINT-TURN cp store
 ;;;   PRE TURN → the checkpoints recorded, oldest first)
@@ -356,6 +362,10 @@ header). Get it with CHECKPOINT-STORE, not MAKE-INSTANCE."))
          :documentation "Checkpoints a session retains (an integer >= 1).")
    (enabled :initarg :enabled :reader checkpointer-enabled-p
             :documentation "NIL: no automatic checkpoints.")
+   (no-project :initarg :no-project :initform nil :reader checkpointer-no-project-p
+               :documentation "#48: T when kind :AUTO found no project (no .git at or above
+the directory, no jj workspace), so automatic checkpoints are off: no
+snapshot of a directory that may be /tmp or the home directory.")
    (data-dir :initarg :data-dir :initform nil :reader checkpointer-data-dir
              :documentation "The data directory (rewind plans), or NIL for USER-DATA-DIRECTORY.")
    (store :initform nil :accessor %checkpointer-store
@@ -690,8 +700,12 @@ CHECKPOINT-NOT-FOUND otherwise."
   (check-type keep (integer 1))
   (let ((project (%truename-directory project-dir)))
     (multiple-value-bind (resolved store) (%open-kind project kind)
-      (let ((cp (make-instance 'checkpointer :project-dir project :kind resolved :keep keep
-                                             :enabled (and enabled t) :data-dir data-dir)))
+      (let* ((no-project (and (eq kind :auto) (eq resolved :copy)
+                              (null (find-project-root project))))
+             (cp (make-instance 'checkpointer :project-dir project :kind resolved :keep keep
+                                              :enabled (and enabled (not no-project) t)
+                                              :no-project no-project
+                                              :data-dir data-dir)))
         (setf (%checkpointer-store cp) store)
         cp))))
 
