@@ -373,6 +373,9 @@ the MCP plan policy."
               :documentation "The manager's MCP-SERVERS-COMPONENT (MAKE-MCP-MANAGER makes it).")
    (instruction-set :initform nil :accessor mcp-manager-instruction-set
                     :documentation "The session's INSTRUCTION-SET, once it is open (NIL before).")
+   (connecting :initform 0 :accessor %mcp-connecting
+               :documentation "Connecting threads still running (CLOSE-MCP-MANAGER waits for them).")
+   (connecting-cv :initform (bt:make-condition-variable) :reader %mcp-connecting-cv)
    (lock :initform (bt:make-lock "mcp-manager") :reader %mcp-manager-lock)))
 
 (defclass mcp-servers-component ()
@@ -756,9 +759,14 @@ after N s\", its child stopped). Every wait is bounded."
                       (+ start (round (* seconds internal-time-units-per-second)))
                       seconds)
                 waits)
+          (bt:with-lock-held ((%mcp-manager-lock manager))
+            (incf (%mcp-connecting manager)))
           (bt:make-thread (lambda ()
                             (let ((http-protocol:*http-backend* http))
                               (unwind-protect (%mcp-connect manager c attempt scope)
+                                (bt:with-lock-held ((%mcp-manager-lock manager))
+                                  (decf (%mcp-connecting manager))
+                                  (bt:condition-notify (%mcp-connecting-cv manager)))
                                 (bt:with-lock-held (lock)
                                   (bt:condition-notify cv)))))
                           :name (format nil "cl-stack-code mcp ~a" (mcp-connection-name c)))))
@@ -940,12 +948,30 @@ the save): DECISION :APPROVED or :REJECTED; :REJECTED shows at once."
     (%commit-or-defer manager)
     (%mcp-connections manager)))
 
+(defparameter +mcp-close-wait-seconds+ 10
+  "How long CLOSE-MCP-MANAGER waits for connecting threads to finish.")
+
+(defun %mcp-wait-connecting (manager seconds)
+  "Wait (at most SECONDS) until no connecting thread of MANAGER runs. A thread
+that loses its attempt to the close stops the child it started, so after the
+wait no server child outlives the manager (Windows: its open handles and cwd
+keep the project directory busy)."
+  (let ((end (+ (get-internal-real-time) (round (* seconds internal-time-units-per-second))))
+        (lock (%mcp-manager-lock manager)))
+    (bt:with-lock-held (lock)
+      (loop while (plusp (%mcp-connecting manager))
+            do (let ((left (/ (- end (get-internal-real-time)) internal-time-units-per-second)))
+                 (when (<= left 0) (return))
+                 (bt:condition-wait (%mcp-connecting-cv manager) lock
+                                    :timeout (min left 1)))))))
+
 (defun close-mcp-manager (manager)
   (when (and manager
              (not (bt:with-lock-held ((%mcp-manager-lock manager))
                     (shiftf (mcp-manager-closed-p manager) t))))
     (dolist (c (%mcp-connections manager))
-      (%mcp-close-connection manager c)))
+      (%mcp-close-connection manager c))
+    (%mcp-wait-connecting manager +mcp-close-wait-seconds+))
   manager)
 
 ;;; The tool source (see the header, "Tools").
