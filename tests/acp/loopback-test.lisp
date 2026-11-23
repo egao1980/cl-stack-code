@@ -403,10 +403,61 @@
         (ok (equal "Still alpha." (message-text client)))))))
 
 (deftest acp-loopback-load-unknown-session
+  ;; #44: only ids of the form the agent hands out open a new session.
   (with-project (project config) '()
     (with-loopback (ra client project config)
-      (ok (typep (signalled (lambda () (load-session ra project "ffffffffffffffffffffffffffffffff")))
-                 'acp:acp-resource-not-found)))))
+      ;; a prefix, other spellings of a session id: -32002, as before
+      (dolist (id '("ffff" "FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"
+                    "ffffffff-ffff-ffff-ffff-ffffffffffff"))
+        (let ((c (signalled (lambda () (load-session ra project id)))))
+          (ok (typep c 'acp:acp-resource-not-found) (format nil "~a: ~a" id c))
+          (ok (and (typep c 'acp:acp-error) (equal id (jget (acp:acp-error-data c) "sessionId")))
+              "data {\"sessionId\"}")))
+      ;; not a session id at all: invalid params, as before
+      (let ((c (signalled (lambda () (load-session ra project "nope")))))
+        (ok (typep c 'acp:acp-invalid-params) (d c))))))
+
+;;; #44: Zed restores its last thread with session/load after the agent
+;;; restarts. A session that never had a turn has no record on disk (the
+;;; SDK's store writes nothing before the first commit), so it used to be
+;;; -32002 "No session" (Zed: "Failed to Launch").
+(deftest acp-loopback-load-session-without-turns
+  (with-project (project config) '()
+    (let ((sid (with-loopback (ra client project config)
+                 (let ((sid (req (new-session-id ra project))))
+                   (ok (hex-id-p sid))
+                   (ok (null (find sid (coerce (acp:sessions (req (session-list ra))) 'list)
+                                   :key #'acp:session-id :test #'equal))
+                       "not on disk: nothing was written")
+                   sid))))
+      ;; a new agent: the restarted process
+      (with-loopback (ra client project config :steps '("Fresh start." "Again."))
+        (let ((res (outcome-of (lambda () (load-session ra project sid)))))
+          (ok (typep res 'acp:load-session-response) (d res))
+          (ok (and (typep res 'acp:load-session-response)
+                   (equal "default" (acp:current-mode-id (acp:modes res))))))
+        (ok (null (client-updates client)) "nothing to replay")
+        (ok (equal "end_turn" (req (stop-reason ra sid "hello again"))) "the session takes turns")
+        (ok (equal "Fresh start." (message-text client)))
+        (ok (equal '("hello again") (mapcar #'record-prompt (session-dir-records project config sid)))
+            "its first turn is recorded under the id the editor knows")
+        ;; closed in this agent before any further turn: loads again, with its turn
+        (req (close-session ra sid))
+        (clear-client client)
+        (ok (typep (req (load-session ra project sid)) 'acp:load-session-response))
+        (ok (equal "hello again" (format nil "~{~a~}" (mapcar #'chunk-text
+                                                              (client-updates client 'acp:update-user-message-chunk))))
+            "now the record is replayed")))))
+
+(deftest acp-loopback-load-closed-session-without-turns
+  ;; The same agent: session/new, session/close, session/load, no turn between.
+  (with-project (project config) '()
+    (with-loopback (ra client project config :steps '("Back."))
+      (let ((sid (req (new-session-id ra project))))
+        (req (close-session ra sid))
+        (ok (typep (outcome-of (lambda () (load-session ra project sid)))
+                   'acp:load-session-response))
+        (ok (equal "end_turn" (req (stop-reason ra sid "hi"))))))))
 
 ;;; MCP servers from the editor: decoded, kept on the session and passed to
 ;;; the SDK (#40). The /usr/bin/true and example.invalid servers below fail to

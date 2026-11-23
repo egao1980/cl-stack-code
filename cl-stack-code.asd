@@ -65,7 +65,14 @@
                (:version "mcp-protocol" "0.4.1")
                (:version "mcp-backend-stdio" "0.3.0")
                (:version "mcp-backend-streamable-http" "0.4.0")
-               (:version "ai-agent-protocol/mcp" "0.2.0"))
+               (:version "ai-agent-protocol/mcp" "0.2.0")
+               ;; #38: install roots of cl-stack-code/acp, which --acp loads at
+               ;; flag time. Never loaded with the core ((:or) is false), but
+               ;; cl-repo's package metadata ignores feature expressions, so an
+               ;; OCI install of cl-stack-code brings them. Same versions as
+               ;; cl-stack-code/acp's (tests/acp-flag-test.lisp checks).
+               (:feature (:or) (:version "acp-protocol" "0.1.0"))
+               (:feature (:or) (:version "acp-backend-stdio" "0.1.1")))
   ;; H4b: --lisp-image spawn starts ros +Q run images that load swank / slynk
   ;; (install roots, as in lisp-mcp; never dependencies).
   :properties (:cl-repo (:ci (:with ("swank" "slynk"))))
@@ -255,7 +262,8 @@
   :license "MIT"
   :depends-on ("cl-stack-code"
                (:version "acp-protocol" "0.1.0")
-               (:version "acp-backend-stdio" "0.1.0")
+               ;; 0.1.1: requests pipelined after initialize wait for it (#45)
+               (:version "acp-backend-stdio" "0.1.1")
                "json-protocol"
                "bordeaux-threads"
                ;; the client-backed tool backends (fs/*, terminal/*)
