@@ -68,7 +68,7 @@
       (ok (on-screen tui "> hi"))
       (ok (not (on-screen tui "**")))
       (ok (has "hi" (request-text (first-request backend))))
-      (ok (wait-screen tui "10 in · 5 out") "usage on the status line")
+      (ok (wait-screen tui "13 in (2 cached) · 5 out") "usage on the status line, cache tokens included")
       (ok (equal '(:user :assistant) (kinds (code-program-state program))))
       (ok (equal "" (w:text-input-value (code-program-input program))) "the input is cleared"))))
 
@@ -100,7 +100,7 @@
                         :steps (list (list :tool "read" (json-args "file_path" "a.txt")) "ok"))
         (project config)
       (send-line tui "go")
-      (ok (wait-screen tui "20 in · 10 out"))
+      (ok (wait-screen tui "26 in (4 cached) · 10 out"))
       (ok (equal '(20 10 4 2) (state-usage (code-program-state program)))))))
 
 (deftest program-initial-prompt

@@ -802,11 +802,25 @@ head goes too (\"…/app/\"), and the status line cuts what remains."
   (let ((n (state-units-running state)))
     (and (plusp n) (format nil "~d running" n))))
 
+(defun %token-count (n)
+  "N tokens as the status line shows them: below 1000 as is, then 1.2k, 52k,
+1.3M (truncated, not rounded)."
+  (cond ((< n 1000) (format nil "~d" n))
+        ((< n 10000) (multiple-value-bind (k r) (floor n 1000)
+                       (format nil "~d.~dk" k (floor r 100))))
+        ((< n 1000000) (format nil "~dk" (floor n 1000)))
+        (t (multiple-value-bind (m r) (floor n 1000000)
+             (format nil "~d.~dM" m (floor r 100000))))))
+
 (defun status-line-text (state &optional width)
   "→ (values left right) of the status line:
 left  \" <model> · <permission mode name> · <cwd>\", the cwd as a native
       directory namestring with the user's home directory prefix shown as \"~/\";
-right \"<input> in · <output> out \", the summed input and output tokens;
+right \"<input> in[ (<cached> cached)] · <output> out \", the summed tokens:
+      input is the whole prompt, uncached input plus cache reads and cache
+      writes (LLM-USAGE-PROMPT-TOKENS; #50: Anthropic's input_tokens alone
+      leaves the cached prefix out), cached the cache reads when there are
+      any; counts from 1000 on as 1.2k, 52k, 1.3M (%TOKEN-COUNT);
       H8d: prefixed by \"N running · \" while N > 0 units are live.
 With WIDTH (the status line's columns) a cwd that does not fit loses its
 middle, not its end: the project directory name stays (#4)."
@@ -820,9 +834,13 @@ middle, not its end: the project directory name stays (#4)."
                   (%home-relative (uiop:native-namestring
                                    (uiop:ensure-directory-pathname cwd)))
                   ""))
-         (right (destructuring-bind (input output &rest more) (state-usage state)
-                  (declare (ignore more))
-                  (format nil "~@[~a · ~]~d in · ~d out " (%units-marker state) input output))))
+         (right (destructuring-bind (input output &optional (cache-read 0) (cache-write 0))
+                    (state-usage state)
+                  (format nil "~@[~a · ~]~a in~@[ (~a cached)~] · ~a out "
+                          (%units-marker state)
+                          (%token-count (+ input cache-read cache-write))
+                          (and (plusp cache-read) (%token-count cache-read))
+                          (%token-count output)))))
     ;; The widget gives the left side WIDTH - right - 1 columns (all of
     ;; WIDTH when the right side is dropped, at right + 2 > WIDTH).
     (when (and width (plusp (length dir)))
