@@ -19,7 +19,7 @@
               +rpc-methods+ :test #'equal))
   (ok (equal "unit" (car (last +event-types+))))
   (ok (has "/ps" +help-text+))
-  (ok (equal "0.13.1" +version+)))
+  (ok (equal "0.13.2" +version+)))
 
 (deftest units-directory-layout
   (with-project (project config) '()
