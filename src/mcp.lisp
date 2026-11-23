@@ -562,17 +562,19 @@ current) → true when set. DIRTY: a commit is owed."
 
 ;;; Resources.
 
-(defun %mcp-take (connection)
+(defun %mcp-take (connection &key attempt)
   "Bump CONNECTION's attempt and take its client → (values client unit). The
-unit stays readable (MCP-CONNECTION-UNIT) for the views."
+unit stays readable (MCP-CONNECTION-UNIT) for the views. With ATTEMPT, only
+while ATTEMPT is current (else NIL NIL)."
   (bt:with-lock-held ((%mcp-connection-lock connection))
-    (incf (%mcp-attempt connection))
-    (let ((client (mcp-connection-client connection))
-          (unit (mcp-connection-unit connection)))
-      (setf (mcp-connection-client connection) nil
-            (mcp-connection-source connection) nil
-            (%mcp-raw connection) nil)
-      (values client unit))))
+    (when (or (null attempt) (eql attempt (%mcp-attempt connection)))
+      (incf (%mcp-attempt connection))
+      (let ((client (mcp-connection-client connection))
+            (unit (mcp-connection-unit connection)))
+        (setf (mcp-connection-client connection) nil
+              (mcp-connection-source connection) nil
+              (%mcp-raw connection) nil)
+        (values client unit)))))
 
 (defun %mcp-stop-unit (unit)
   (when (and unit (not (sup:unit-finished-p unit)))
@@ -726,13 +728,13 @@ only closes what it opened)."
       (%mcp-set-status manager connection :connected :attempt attempt))))
 
 (defun %mcp-fail (manager connection attempt status text)
-  "ATTEMPT failed: its client and unit go, CONNECTION is STATUS with TEXT."
-  (let ((current (bt:with-lock-held ((%mcp-connection-lock connection))
-                   (eql attempt (%mcp-attempt connection)))))
-    (when current
-      (multiple-value-bind (client unit) (%mcp-take connection)
-        (%mcp-dispose client unit))
-      (%mcp-set-status manager connection status :error text))))
+  "ATTEMPT failed: CONNECTION is STATUS with TEXT, then its client and unit go.
+The status comes first: %MCP-TAKE bumps the attempt, and a waiter
+(%MCP-CONNECT-ALL) that saw the bump before the status would return while the
+connection still read :CONNECTING."
+  (when (%mcp-set-status manager connection status :error text :attempt attempt)
+    (multiple-value-bind (client unit) (%mcp-take connection :attempt attempt)
+      (%mcp-dispose client unit))))
 
 (defun %mcp-seconds-text (seconds)
   (if (integerp seconds) (princ-to-string seconds) (format nil "~a" (float seconds 1.0))))

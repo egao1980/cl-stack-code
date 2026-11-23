@@ -45,11 +45,26 @@
 ;;; Supervisors.
 
 (defun quiet-shutdown (sup)
-  (ignore-errors
-   (handler-bind ((sup:stop-failed (lambda (c)
-                                     (let ((r (find-restart 'sup:abandon c)))
-                                       (when r (invoke-restart r))))))
-     (sup:shutdown-supervisor sup :grace 0.5 :force-grace 1))))
+  (handler-case
+      (handler-bind ((sup:stop-failed (lambda (c)
+                                        (let ((r (find-restart 'sup:abandon c)))
+                                          (when r (invoke-restart r))))))
+        (sup:shutdown-supervisor sup :grace 0.5 :force-grace 1))
+    (error (e)
+      (format *error-output* "~&;; quiet-shutdown: ~a: ~a~%" (type-of e) e))))
+
+(defun delete-supervisor-base (base)
+  "DELETE-TEMP-BASE, retried for up to 5 s on Windows while a unit log file is
+still open there (supervisor-protocol#15: a stopped :rpc unit's segment
+sometimes outlives SHUTDOWN-SUPERVISOR for a moment). Elsewhere, once."
+  (if (uiop:os-windows-p)
+      (loop for try from 1
+            do (handler-case (return (delete-temp-base base))
+                 (file-error (e)
+                   (when (>= try 10) (error e))
+                   (format *error-output* "~&;; delete-supervisor-base: retry ~d: ~a~%" try e)
+                   (sleep 0.5))))
+      (delete-temp-base base)))
 
 (defun call-with-test-supervisor (fn &rest keys)
   (let ((base (temp-base)))
@@ -58,7 +73,7 @@
                            keys)))
            (unwind-protect (funcall fn sup base)
              (quiet-shutdown sup)))
-      (delete-temp-base base))))
+      (delete-supervisor-base base))))
 
 (defmacro with-test-supervisor ((sup &optional (base (gensym "BASE")) &rest keys) &body body)
   "BODY with SUP a fresh supervisor over a temp state directory under BASE;
