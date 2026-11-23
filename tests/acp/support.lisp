@@ -69,6 +69,11 @@ it signalled is signalled again here; no answer → CALL-TIMED-OUT."
   (handler-case (progn (within 60 thunk) nil)
     (error (c) c)))
 
+(defun outcome-of (thunk)
+  "THUNK's value (through WITHIN), or the ERROR it signalled."
+  (handler-case (within 60 thunk)
+    (error (c) c)))
+
 ;;; The recording client.
 
 (defclass recording-client (acp:acp-client)

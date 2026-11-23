@@ -576,7 +576,12 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
 ;;;   finds *ACP-SYSTEM*) ASDF:LOAD-SYSTEM of it with *STANDARD-OUTPUT* bound
 ;;;   to ERROR-OUTPUT (stdout is the protocol) and *ACP-SERVER* again, else
 ;;;   CODE-USAGE-ERROR "--acp needs the cl-stack-code/acp system: load it
-;;;   or build the binary from it" (exit 2). The server is called with
+;;;   or build the binary from it" (exit 2). #38: a dependency of it that is
+;;;   not installed (ASDF:MISSING-COMPONENT while it loads) → CODE-USAGE-
+;;;   ERROR naming that dependency and how to install it (exit 2). An OCI
+;;;   install of cl-stack-code brings them: they are install roots of the
+;;;   core's .asd, never loaded with it (cl-stack-code.asd, "#38").
+;;;   The server is called with
 ;;;   :INPUT and :OUTPUT (RUN-CLI's), :CWD, :SETTINGS (the flag layer),
 ;;;   :PLAN-AREA, :PROVIDERS, :USER-CONFIG-DIR, :DATA-DIR and :GETENV, with
 ;;;   *STANDARD-OUTPUT* bound to ERROR-OUTPUT while it runs; its value is
@@ -589,12 +594,31 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
 (defvar *acp-system* "cl-stack-code/acp"
   "The ASDF system --acp loads when *ACP-SERVER* is NIL.")
 
+(defun %acp-missing-dependency (asdf condition)
+  "#38: the CODE-USAGE-ERROR for CONDITION, an ASDF:MISSING-COMPONENT
+signalled while *ACP-SYSTEM* loads (a dependency of it is not installed)."
+  (let ((missing (uiop:symbol-call asdf "MISSING-REQUIRES" condition)))
+    (make-condition
+     'code-usage-error
+     :message (format nil "--acp needs the ~a system, and ~a, which it depends on, ~
+                           is not installed: ~a. Install its dependencies (cl-repo: ~
+                           (cl-repo:ensure-system-dependencies \"cl-stack-code\" :with ~
+                           '(\"~a\") :also-tests nil)) or build the binary from it"
+                      *acp-system* missing condition *acp-system*))))
+
 (defun %acp-server (error-output)
   (or *acp-server*
       (let ((asdf (find-package "ASDF")))
         (when (and asdf (uiop:symbol-call asdf "FIND-SYSTEM" *acp-system* nil))
-          (let ((*standard-output* error-output))
-            (uiop:symbol-call asdf "LOAD-SYSTEM" *acp-system*)))
+          (let ((*standard-output* error-output)
+                (missing (find-symbol "MISSING-COMPONENT" asdf)))
+            ;; #38: an install of the core alone may lack the server's own
+            ;; dependencies (acp-protocol, acp-backend-stdio): say so, and how
+            ;; to get them, instead of ASDF's bare "Component … not found".
+            (handler-bind ((error (lambda (c)
+                                    (when (and missing (typep c missing))
+                                      (error (%acp-missing-dependency asdf c))))))
+              (uiop:symbol-call asdf "LOAD-SYSTEM" *acp-system*))))
         *acp-server*)
       (error 'code-usage-error
              :message (format nil "--acp needs the ~a system: load it or build the binary from it"

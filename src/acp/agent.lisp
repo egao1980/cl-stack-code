@@ -66,8 +66,14 @@
 ;;;     session/new, replacing what the session had; passed to
 ;;;     CLIENT-RESUME-SESSION :MCP-SERVERS, or, for a session still open,
 ;;;     CLIENT-ADD-MCP-SERVERS) → CLIENT-RESUME-SESSION of
-;;;     sessionId (no such session → ACP-RESOURCE-NOT-FOUND, -32002, data
-;;;     {"sessionId"}). Before the response, the session's record (the turns
+;;;     sessionId. #44: no such session on disk, and sessionId has the form
+;;;     this agent hands out (32 lowercase hex digits) → CLIENT-NEW-SESSION
+;;;     :SESSION-ID sessionId, an empty session under that id: the SDK's
+;;;     session store writes nothing before a session's first turn (src/
+;;;     sessions.lisp, "Laziness"), so a session/new that never had a turn
+;;;     (an editor restoring its last thread after a restart) has no record.
+;;;     Any other id → ACP-RESOURCE-NOT-FOUND, -32002, data {"sessionId"}.
+;;;     Before the response, the session's record (the turns
 ;;;     of its head line, oldest first) is replayed as session/update
 ;;;     notifications: per turn a user_message_chunk with the prompt as the
 ;;;     record has it, then per assistant step its agent_thought_chunk
@@ -337,6 +343,11 @@
                     :session-id (courier-session-id (%asess-courier as))
                     :modes (%modes (%asess-session as))))))
 
+(defun %handed-out-id-p (id)
+  "#44: ID has the form of the session ids this agent hands out (32 lowercase
+hex digits: NORMALIZE-SESSION-ID leaves it as it is)."
+  (and (stringp id) (equal id (code:normalize-session-id id))))
+
 (defmethod acp:acp-load-session ((agent code-acp-agent) request)
   (with-sdk-errors ()
     (let* ((client (code-acp-agent-client agent))
@@ -351,7 +362,18 @@
                                        client id :cwd (acp:cwd request)
                                                  :tool-sources hook
                                                  :mcp-servers (%mcp-server-configs servers))
-                                    (code:session-not-found () (%session-not-found id))))))))
+                                    (code:session-not-found ()
+                                      ;; #44: a session without turns has no
+                                      ;; record (the store writes nothing before
+                                      ;; the first commit): open it again, empty,
+                                      ;; under its id.
+                                      (if (%handed-out-id-p id)
+                                          (code:client-new-session
+                                           client :cwd (acp:cwd request)
+                                                  :session-id id
+                                                  :tool-sources hook
+                                                  :mcp-servers (%mcp-server-configs servers))
+                                          (%session-not-found id)))))))))
       (when (and open servers)
         (code:client-add-mcp-servers (%asess-session as) (%mcp-server-configs servers)))
       (setf (%asess-mcp-servers as) servers)

@@ -259,3 +259,82 @@ broken pipe) is the missing answer's failure, not this one's."
                      "the updates went to stdout too")))
           (when (uiop:process-alive-p (raw-child-process raw))
             (uiop:terminate-process (raw-child-process raw) :urgent t)))))))
+
+;;; #44 and #45 over the real stdio, as an editor or a replay harness writes.
+
+(defun raw-request (raw id method params)
+  (raw-send raw (args "jsonrpc" "2.0" "id" id "method" method "params" params)))
+
+(defun raw-initialize (raw id)
+  (raw-request raw id "initialize" (args "protocolVersion" 1 "clientCapabilities" (args))))
+
+(defun raw-response-ids (raw)
+  "The ids of the responses the child wrote, in order."
+  (loop for line in (raw-lines raw)
+        for m = (ignore-errors (json:decode line))
+        when (and (hash-table-p m) (null (gethash "method" m)))
+          collect (gethash "id" m)))
+
+(defun raw-error-code (response)
+  (and (hash-table-p response) (jget response "error" "code")))
+
+(defun end-raw-child (raw)
+  "EOF on the child's stdin. → its exit code (NIL when it did not exit in 30 s)."
+  (ignore-errors (close (uiop:process-info-input (raw-child-process raw))))
+  (and (wait-until (lambda () (not (uiop:process-alive-p (raw-child-process raw)))) :timeout 30)
+       (uiop:wait-process (raw-child-process raw))))
+
+(defmacro with-raw-child ((raw project config steps) &body body)
+  `(let ((,raw (start-raw-child ,project ,config ,steps)))
+     (unwind-protect (progn ,@body)
+       (when (uiop:process-alive-p (raw-child-process ,raw))
+         (uiop:terminate-process (raw-child-process ,raw) :urgent t)))))
+
+(deftest acp-process-pipelined-after-initialize
+  ;; #45: written back to back, before the child has even loaded its systems.
+  (sbcl-only
+    (with-project (project config) '()
+      (with-raw-child (raw project config '())
+        (raw-initialize raw 1)
+        (raw-request raw 2 "session/new" (args "cwd" (native project) "mcpServers" #()))
+        (raw-request raw 3 "session/load" (args "sessionId" "0123456789abcdef0123456789abcdef"
+                                                "cwd" (native project) "mcpServers" #()))
+        (raw-request raw 4 "session/list" (args))
+        (let ((responses (loop for id from 1 to 4
+                               collect (raw-response raw id :timeout *child-start-seconds*))))
+          (ok (every #'identity responses) "every request answered")
+          (ok (notany #'raw-error-code responses)
+              (format nil "none refused: ~s" (mapcar #'raw-error-code responses)))
+          (ok (eql 1 (first (raw-response-ids raw)))
+              (format nil "the initialize answer first: ~s" (raw-response-ids raw)))
+          (ok (hex-id-p (jget (second responses) "result" "sessionId")) "session/new"))
+        (ok (eql 0 (end-raw-child raw)) "exit 0 at EOF")))))
+
+(deftest acp-process-load-session-without-turns
+  ;; #44: an editor restores its thread after the agent restarted. The
+  ;; session never had a turn, so nothing was on disk.
+  (sbcl-only
+    (with-project (project config) '()
+      (let ((sid nil))
+        (with-raw-child (raw project config '())
+          (raw-initialize raw 1)
+          (ok (raw-response raw 1 :timeout *child-start-seconds*))
+          (raw-request raw 2 "session/new" (args "cwd" (native project) "mcpServers" #()))
+          (setf sid (jget (raw-response raw 2) "result" "sessionId"))
+          (ok (hex-id-p sid) "session/new")
+          (ok (eql 0 (end-raw-child raw)) "the first process exits, no turn taken"))
+        (with-raw-child (raw project config (list "After the restart."))
+          (raw-initialize raw 1)
+          (ok (raw-response raw 1 :timeout *child-start-seconds*))
+          (raw-request raw 2 "session/load" (args "sessionId" sid "cwd" (native project)
+                                                  "mcpServers" #()))
+          (let ((load (raw-response raw 2)))
+            (ok (and load (null (raw-error-code load)))
+                (format nil "session/load answers: ~a" (and load (jget load "error" "message"))))
+            (ok (equal "default" (jget load "result" "modes" "currentModeId"))))
+          (raw-request raw 3 "session/prompt" (args "sessionId" sid
+                                                    "prompt" (vector (args "type" "text" "text" "hi"))))
+          (ok (equal "end_turn" (jget (raw-response raw 3) "result" "stopReason")) "and takes turns")
+          (ok (eql 0 (end-raw-child raw))))
+        (ok (equal '("hi") (mapcar #'record-prompt (session-dir-records project config sid)))
+            "the turn is recorded under the id the editor knows")))))

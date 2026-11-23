@@ -86,3 +86,59 @@
         (ok (eql 2 exit))
         (ok (equal "" out) "nothing on stdout")
         (ok (has "--acp needs the cl-stack-code-no-such-acp-system system" err) err)))))
+
+;;; #38: cl-stack-code installed from OCI had no acp-protocol /
+;;; acp-backend-stdio (only cl-stack-code/acp depends on them), so --acp
+;;; failed with ASDF's 'Component "acp-protocol" not found'.
+
+(deftest acp-run-cli-missing-server-dependency
+  ;; A stand-in for cl-stack-code/acp whose dependency is not installed.
+  (with-project (project config :base base) '()
+    (let* ((name "cl-stack-code-acp-missing-dependency-fixture")
+           (asd (merge-pathnames (format nil "fixture/~a.asd" name) base)))
+      (write-file base (format nil "fixture/~a.asd" name)
+                  (format nil "(defsystem ~s :depends-on (\"cl-stack-code-no-such-dependency\"))~%"
+                          name))
+      (asdf:load-asd asd)
+      (unwind-protect
+           (let ((*acp-server* nil)
+                 (*acp-system* name))
+             (multiple-value-bind (exit out err) (code project config '("--acp"))
+               (ok (eql 2 exit) "a usage error, exit 2")
+               (ok (equal "" out) "nothing on stdout")
+               (ok (has "--acp needs the cl-stack-code-acp-missing-dependency-fixture system" err) err)
+               (ok (has "cl-stack-code-no-such-dependency" err) "names what is missing")
+               (ok (has "ensure-system-dependencies" err) "and how to install it")))
+        (asdf:clear-system name)))))
+
+(defun %dep-name (dep)
+  "The system name of an ASDF dependency spec (string, (:version …), (:feature …))."
+  (cond ((stringp dep) dep)
+        ((symbolp dep) (string-downcase (symbol-name dep)))
+        ((eq :version (first dep)) (%dep-name (second dep)))
+        ((eq :feature (first dep)) (%dep-name (third dep)))
+        (t nil)))
+
+(defun %dep-version (dep)
+  (cond ((atom dep) nil)
+        ((eq :version (first dep)) (third dep))
+        ((eq :feature (first dep)) (%dep-version (third dep)))
+        (t nil)))
+
+(deftest acp-install-roots-in-the-core
+  ;; cl-repo publishes a package's :depends-on (feature expressions ignored)
+  ;; as its install closure; ASDF loads only what holds.
+  (let ((core (asdf:system-depends-on (asdf:find-system "cl-stack-code")))
+        (acp (asdf:system-depends-on (asdf:find-system "cl-stack-code/acp"))))
+    (dolist (dep acp)
+      (let ((name (%dep-name dep)))
+        (unless (equal name "cl-stack-code")
+          (let ((root (find name core :key #'%dep-name :test #'equal)))
+            (ok root (format nil "~a (cl-stack-code/acp's) is in cl-stack-code's install closure" name))
+            (when (and root (%dep-version dep))
+              (ok (equal (%dep-version dep) (%dep-version root))
+                  (format nil "~a: the same minimum version (~a)" name (%dep-version dep))))))))
+    (dolist (name '("acp-protocol" "acp-backend-stdio"))
+      (let ((root (find name core :key #'%dep-name :test #'equal)))
+        (ok (and (consp root) (eq :feature (first root)) (not (uiop:featurep (second root))))
+            (format nil "~a: an install root, never loaded with the core" name))))))
