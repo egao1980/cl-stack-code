@@ -34,7 +34,7 @@ Serves cl-stack-code as an [Agent Client Protocol](https://agentclientprotocol.c
 - Prompts: text, `resource_link` to project files (attached as mentions) and embedded text resources; no images or audio.
 - When the client advertises them, file reads and writes go through `fs/read_text_file` / `fs/write_text_file` (the editor's buffers) and `bash` runs in the client's terminal (`terminal/*`).
 - What the session found shows as a finished read tool call "Context: …" before the first turn: its instruction files, skills and rules (path-scoped ones marked "on demand"). A rule or nested `AGENTS.md` loaded later shows as "Rule loaded: …" / "Instructions loaded: …", and a Lisp image event (the debugger entered, a job done) as a message line (#41).
-- `mcpServers` from the editor are accepted and kept, not connected yet (H3e-2).
+- `mcpServers` from the editor connect as the session's MCP servers (scope `sdk`, trusted; stdio and HTTP, `mcpCapabilities.http: true`; legacy SSE is reported unsupported) (#40).
 
 ## License
 

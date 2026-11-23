@@ -15,9 +15,9 @@
         (ok (typep res 'acp:initialize-response))
         (ok (eql 1 (acp:protocol-version res)))
         (ok caps "agentCapabilities")
-        (dolist (feature '(:load-session :embedded-context :session-list :session-close))
+        (dolist (feature '(:load-session :embedded-context :session-list :session-close :mcp-http))
           (ok (acp:agent-supports-p caps feature) (format nil "advertises ~(~a~)" feature)))
-        (dolist (feature '(:image :audio :session-delete :session-resume :logout :mcp-http :mcp-sse
+        (dolist (feature '(:image :audio :session-delete :session-resume :logout :mcp-sse
                            :additional-directories :system-prompt))
           (ok (not (acp:agent-supports-p caps feature)) (format nil "does not advertise ~(~a~)" feature)))
         (ok (zerop (length (or (slot res 'acp:auth-methods) #()))) "no auth methods")
@@ -27,8 +27,8 @@
         (ok (search "\"authMethods\":[]" (cdr (second (wire-log ra))))
             "authMethods is on the wire, empty")
         (let ((mcp (jget (wire-result ra "initialize") "agentCapabilities" "mcpCapabilities")))
-          (ok (present-false-p mcp "http") "mcpCapabilities.http: false until H3e-2")
-          (ok (present-false-p mcp "sse") "mcpCapabilities.sse: false until H3e-2"))))))
+          (ok (and (hash-table-p mcp) (member (gethash "http" mcp) '(t :true))) "mcpCapabilities.http: true (#40)")
+          (ok (present-false-p mcp "sse") "mcpCapabilities.sse: false (legacy SSE unsupported)"))))))
 
 (deftest acp-loopback-new-session
   (with-project (project config) '()
@@ -408,8 +408,9 @@
       (ok (typep (signalled (lambda () (load-session ra project "ffffffffffffffffffffffffffffffff")))
                  'acp:acp-resource-not-found)))))
 
-;;; MCP servers from the editor: decoded and kept on the session; connecting
-;;; them is H3e-2's (task.md TODO).
+;;; MCP servers from the editor: decoded, kept on the session and passed to
+;;; the SDK (#40). The /usr/bin/true and example.invalid servers below fail to
+;;; start, which does not fail the session.
 
 (deftest acp-loopback-mcp-servers-kept
   (with-project (project config) '()
@@ -428,6 +429,35 @@
         (ok (equal "end_turn" (req (stop-reason ra sid "hi"))) "and turns run")
         (ok (null (code-acp-agent-mcp-servers agent "ffffffffffffffffffffffffffffffff"))
             "unknown session: NIL")))))
+
+;;; #40: a stdio MCP server the editor gives in session/new connects; its
+;;; tools are the session's mcp__<name>__* tools.
+(deftest acp-loopback-mcp-servers-connect
+  (with-project (project config :base base) '()
+    (with-loopback (ra client project config :agent agent :steps '("Fine."))
+      (let* ((fake (cl-stack-code/tests::fake-stdio-server base))
+             (env (jget fake "env"))
+             (server (acp:make-acp 'acp:mcp-server-stdio
+                                   :name "ed" :command (jget fake "command")
+                                   :args (coerce (jget fake "args") 'vector)
+                                   :env (coerce (loop for k being the hash-keys of env
+                                                        using (hash-value v)
+                                                      collect (acp:make-acp 'acp:env-variable
+                                                                            :name k :value v))
+                                                'vector)))
+             (sid (req (acp:session-id (new-session ra project :mcp-servers (vector server)))))
+             (session (client-find-session (code-acp-agent-client agent) sid))
+             (ed (find "ed" (client-mcp-servers session)
+                       :key (lambda (s) (jget s "name")) :test #'equal)))
+        (ok ed "the editor's server is the session's")
+        (ok (equal "sdk" (jget ed "scope")))
+        (ok (equal "connected" (jget ed "status")))
+        (ok (cl-stack-code/tests::same-set
+             (cl-stack-code/tests::mcp-names "ed")
+             (remove-if-not (lambda (n) (uiop:string-prefix-p "mcp__" n))
+                            (mapcar (lambda (tool) (jget tool "name")) (client-tools session))))
+            "its tools are listed as mcp__ed__*")
+        (ok (equal "end_turn" (req (stop-reason ra sid "hi"))) "and turns run")))))
 
 (deftest acp-loopback-mcp-servers-none
   (with-project (project config) '()
