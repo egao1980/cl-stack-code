@@ -1235,7 +1235,9 @@ USER-DATA-DIRECTORY: sessions live under it."
         (condition-exit-code c)))))
 
 (defun main ()
-  "Binary entry point: quit with RUN-CLI's exit code."
+  "Binary entry point: clear the Mach exception ports inherited from the parent
+(macOS; platform.lisp), then quit with RUN-CLI's exit code."
+  (reset-inherited-exception-ports)
   (uiop:quit (run-cli (uiop:command-line-arguments))))
 
 ;;; H5b: --rewind and --list-checkpoints (see the "H5b" part of the file

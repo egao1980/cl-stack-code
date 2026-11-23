@@ -4,7 +4,7 @@ A coding agent CLI on [cl-stack](https://github.com/egao1980/cl-stack): an [`ai-
 
 Plan: [HARNESS-PLAN.md](https://github.com/egao1980/cl-workspace/blob/main/docs/HARNESS-PLAN.md), Track H, milestone H3. Brief: [`cl-stack-code.md`](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/cl-stack-code.md).
 
-Version **0.13.0** (live token streaming: http-backend-async 0.2.27; ACP context updates, #41): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), `--acp` (**ACP-2**), instruction files, skills and rules as a revisioned instruction set (**H3e-1**), and MCP servers (**H3e-2a**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
+Version **0.13.1** (macOS: clears Mach exception ports inherited from the editor, so the agent no longer spins when Zed launches it): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), `--acp` (**ACP-2**), instruction files, skills and rules as a revisioned instruction set (**H3e-1**), and MCP servers (**H3e-2a**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
 
 ```
 cl-stack-code -p "fix the failing test" --output-format stream-json --permission-mode acceptEdits
@@ -26,7 +26,7 @@ cl-stack-code -p "fix the failing test" --output-format stream-json --permission
 cl-stack-code --acp [--cwd DIR] [--model M] [--permission-mode MODE] …
 ```
 
-Serves cl-stack-code as an [Agent Client Protocol](https://agentclientprotocol.com) agent on stdin / stdout, as editors launch one (Zed, JetBrains, Emacs agent-shell). Only JSON-RPC goes to stdout. The server is the system `cl-stack-code/acp` (an adapter over the SDK on `acp-protocol` and `acp-backend-stdio`); the core never depends on it and loads it when `--acp` is given (or build `bin/cl-stack-code-acp` from it).
+Serves cl-stack-code as an [Agent Client Protocol](https://agentclientprotocol.com) agent on stdin / stdout, as editors launch one (Zed, JetBrains, Emacs agent-shell). Only JSON-RPC goes to stdout. The server is the system `cl-stack-code/acp` (an adapter over the SDK on `acp-protocol` and `acp-backend-stdio`); the core never depends on it and loads it when `--acp` is given (or build `bin/cl-stack-code-acp` from it). On macOS the binary first clears the Mach exception ports it inherits for the traps SBCL handles as signals: Zed passes its crash reporter's port to the agents it launches, and an SBCL image that inherits it spins on its first trap.
 
 - Sessions: `session/new`, `session/load` (the record replayed as updates, then the conversation goes on), `session/list`, `session/close`; the ACP session id is the cl-stack-code session id.
 - Modes are the permission modes (`default`, `acceptEdits`, `bypassPermissions`, `plan`), switched with `session/set_mode` from the next turn.
