@@ -56,6 +56,25 @@
       (ok (wait-for* tui (lambda () (search " in · " (nth 13 (screen tui)))))
           "the status line is still last"))))
 
+(deftest program-layout-follows-a-resize-burst
+  ;; #49: two resizes in quick succession (a font size change twice) with a
+  ;; transcript on screen: the layout is for the last size.
+  (with-project (project config) '()
+    (with-code-tui (tui program backend :cols 100 :rows 20
+                        :steps (list (format nil "~{word~d ~}" (loop for i below 400 collect i))))
+        (project config)
+      (send-line tui "hi")
+      (ok (wait-screen tui "word399"))
+      (ok (wait-idle tui program))
+      (h:tui-resize tui 90 14)
+      (h:tui-resize tui 64 10)
+      (ok (wait-for* tui (lambda () (search " out" (nth 9 (screen tui)))))
+          "the status line is the last row")
+      (ok (wait-for* tui (lambda () (uiop:string-prefix-p ">" (nth 8 (screen tui)))))
+          "the input is above it")
+      (ok (wait-for* tui (lambda () (search "word399" (screen-text tui))))
+          "the transcript's end is shown"))))
+
 ;;; Turns.
 
 (deftest program-runs-a-turn
@@ -68,7 +87,7 @@
       (ok (on-screen tui "> hi"))
       (ok (not (on-screen tui "**")))
       (ok (has "hi" (request-text (first-request backend))))
-      (ok (wait-screen tui "10 in · 5 out") "usage on the status line")
+      (ok (wait-screen tui "13 in (2 cached) · 5 out") "usage on the status line, cache tokens included")
       (ok (equal '(:user :assistant) (kinds (code-program-state program))))
       (ok (equal "" (w:text-input-value (code-program-input program))) "the input is cleared"))))
 
@@ -100,7 +119,7 @@
                         :steps (list (list :tool "read" (json-args "file_path" "a.txt")) "ok"))
         (project config)
       (send-line tui "go")
-      (ok (wait-screen tui "20 in · 10 out"))
+      (ok (wait-screen tui "26 in (4 cached) · 10 out"))
       (ok (equal '(20 10 4 2) (state-usage (code-program-state program)))))))
 
 (deftest program-initial-prompt

@@ -913,18 +913,20 @@ revision new-store). SESSION-LOCKED and file errors propagate."
   (and (stringp string) (plusp (length string)) (every #'digit-char-p string)))
 
 (defun resolve-turn (store at)
-  "→ the revision AT names: a decimal number N ≥ 1 is the Nth revision of the
-head's line (1 = its root); otherwise a revision id or a unique id prefix of
-at least 4 characters anywhere in the session (REV:RESOLVE-REVISION). Anything
-else, out of range, ambiguous or unknown → SESSION-TURN-NOT-FOUND (AT as
-given)."
+  "→ the revision AT names: a number N ≥ 1, an integer or a string of decimal
+digits, is the Nth revision of the head's line (1 = its root); otherwise a
+revision id or a unique id prefix of at least 4 characters anywhere in the
+session (REV:RESOLVE-REVISION). Anything else, out of range, ambiguous or
+unknown → SESSION-TURN-NOT-FOUND (AT as given)."
   (flet ((fail () (error 'session-turn-not-found :session (session-id store) :designator at)))
-    (unless (stringp at) (fail))
-    (let ((line (session-line store)))
-      (or (and (%line-number-p at)
-               (let ((n (parse-integer at)))
-                 (and (<= 1 n (length line)) (nth (1- n) line))))
-          (and (>= (length at) rev:+minimum-id-prefix+)
+    (unless (or (stringp at) (integerp at)) (fail))
+    (let ((line (session-line store))
+          (n (cond ((integerp at) at)
+                   ((%line-number-p at) (parse-integer at)))))
+      (or (and n (<= 1 n (length line)) (nth (1- n) line))
+          ;; A digit string out of range may still be an id prefix.
+          (and (stringp at)
+               (>= (length at) rev:+minimum-id-prefix+)
                (handler-case (rev:resolve-revision store at)
                  (rev:revision-error () nil)))
           (fail)))))

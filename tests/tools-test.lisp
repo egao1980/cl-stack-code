@@ -97,6 +97,28 @@
       (ok (equal "made" (read-file project "new.txt")))
       (ok (equal "done" (jget (result-named out "write") "status"))))))
 
+(deftest tools-two-edits-of-one-file-in-one-step
+  ;; #30: the tool calls of one step run at once. Two edits of one file must
+  ;; both land, the second applied to what the first wrote (agent-tools 0.4.1
+  ;; serializes writes per path). A large file keeps both calls' reads and
+  ;; hashes in flight together.
+  (let ((middle (format nil "~{line ~d of the middle~%~}" (loop for i below 50000 collect i))))
+    (with-project (project config) `(("big.txt" ,(format nil "head~%~aend~%" middle)))
+      (multiple-value-bind (exit out)
+          (streamed project config
+                    (list (list :tools
+                                (list "edit" (json-args "file_path" "big.txt"
+                                                        "old_string" "head" "new_string" "HEAD"))
+                                (list "edit" (json-args "file_path" "big.txt"
+                                                        "old_string" "end" "new_string" "END")))
+                          "ok")
+                    "--permission-mode" "acceptEdits")
+        (ok (eql 0 exit))
+        (ok (equal '("done" "done") (mapcar (lambda (e) (jget e "status")) (events out "tool_result")))
+            "both edits report done")
+        (ok (equal (format nil "HEAD~%~aEND~%" middle) (read-file project "big.txt"))
+            "both changes are on disk")))))
+
 (deftest tools-allowed-tools-flag
   (with-project (project config) '()
     (streamed project config (list (write-step "new.txt" "made") "ok") "--allowed-tools" "write")

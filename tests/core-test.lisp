@@ -298,7 +298,19 @@
     (feed s '(:usage (10 5 2 1)) '(:usage (10 5 2 1)))
     (multiple-value-bind (left right) (status-line-text s)
       (ok (equal (format nil " mock · acceptEdits · ~a" (native #p"/srv/project/")) left))
-      (ok (equal "20 in · 10 out " right))))
+      (ok (equal "26 in (4 cached) · 10 out " right) "input includes the cached prompt")))
+  (testing "#50: a turn on a cached prompt"
+    ;; Anthropic: input_tokens 14 over ten calls, the rest of each prompt
+    ;; read from (or written to) the cache.
+    (let ((s (fresh-state)))
+      (feed s '(:usage (14 1255 52000 3000)))
+      (ok (equal "55k in (52k cached) · 1.2k out " (nth-value 1 (status-line-text s))))
+      (feed s '(:usage (0 0 2000000 0)))
+      (ok (equal "2.0M in (2.0M cached) · 1.2k out " (nth-value 1 (status-line-text s))))))
+  (testing "cache writes only: no cached part"
+    (let ((s (fresh-state)))
+      (feed s '(:usage (100 7 0 900)))
+      (ok (equal "1.0k in · 7 out " (nth-value 1 (status-line-text s))))))
   (testing "the home directory is ~/"
     (let* ((home (native (user-homedir-pathname)))
            (dir (merge-pathnames "work/app/" (user-homedir-pathname)))
