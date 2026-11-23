@@ -77,6 +77,44 @@
     `(:source-registry ,@(mapcar (lambda (d) (list :directory d)) dirs)
                        :ignore-inherited-configuration)))
 
+(defun %loaded-asd-table ()
+  "(system name . native .asd namestring) for every system this image loaded
+from an .asd: the exact file each one came from. Not the subsystems of a
+package-inferred system (rove/main): ASDF makes those from their .lisp file."
+  (let ((table '()))
+    (dolist (name (asdf:already-loaded-systems) (nreverse table))
+      (let* ((system (asdf:registered-system name))
+             (file (and system (ignore-errors (asdf:system-source-file system)))))
+        (when (and file
+                   (or (string= name (asdf:primary-system-name name))
+                       (not (typep system 'asdf:package-inferred-system))))
+          (push (cons name (uiop:native-namestring file)) table))))))
+
+(defun %pin-loaded-systems-form ()
+  "A form for a child image: ASDF finds every system this image loaded at the
+.asd it was loaded from, ahead of the source registry. A registry directory
+can hold a stale sibling .asd of another system (compression-protocol#5: a
+compression-protocol.asd 0.2.0 beside the 0.4.0 one); it never wins."
+  (with-standard-io-syntax
+    (format nil "(let ((table '~s)) ~a)"
+            (%loaded-asd-table)
+            (concatenate
+             'string
+             "(push (lambda (name)"
+             " (let ((entry (assoc (asdf:coerce-name name) table"
+             " :test (function string=))))"
+             " (and entry (probe-file (uiop:parse-native-namestring (cdr entry))))))"
+             " asdf:*system-definition-search-functions*)"))))
+
+(defun %child-asdf-forms ()
+  "The --eval forms that give a child SBCL this image's ASDF and systems: load
+ASDF, a source registry of the loaded systems' directories (for anything not
+loaded here), and the exact .asd files of the loaded ones, which come first."
+  (list (%asdf-load-form)
+        (format nil "(uiop:symbol-call :asdf :initialize-source-registry '~s)"
+                (%registry-form))
+        (%pin-loaded-systems-form)))
+
 (defun pty-child-argv (report project config)
   #-sbcl (declare (ignore report project config))
   #-sbcl (error "the pty smoke test starts its child with SBCL only")
@@ -85,13 +123,24 @@
    (list (uiop:native-namestring sb-ext:*runtime-pathname*)
          "--core" (uiop:native-namestring sb-ext:*core-pathname*) "--noinform"
          "--non-interactive" "--no-sysinit" "--no-userinit")
-   (loop for form in (list (%asdf-load-form)
-                           (format nil "(uiop:symbol-call :asdf :initialize-source-registry '~s)"
-                                   (%registry-form))
-                           "(uiop:symbol-call :asdf :load-system \"cl-stack-code/tests\")"
-                           (format nil "(uiop:symbol-call :cl-stack-code/tests :pty-child-main ~s ~s ~s)"
-                                   report (native project) (native config)))
+   (loop for form in (append (%child-asdf-forms)
+                           (list "(uiop:symbol-call :asdf :load-system \"cl-stack-code/tests\")"
+                                 (format nil "(uiop:symbol-call :cl-stack-code/tests :pty-child-main ~s ~s ~s)"
+                                         report (native project) (native config))))
          append (list "--eval" form))))
+
+(deftest child-finds-the-loaded-asd-files
+  ;; The pin form a child evaluates: every loaded system resolves to the .asd
+  ;; this image loaded it from, whatever the registry directories hold.
+  (let ((asdf:*system-definition-search-functions*
+          (copy-list asdf:*system-definition-search-functions*)))
+    (let ((*package* (find-package :cl-user)))
+      (eval (read-from-string (%pin-loaded-systems-form))))
+    (let ((search (first asdf:*system-definition-search-functions*)))
+      (dolist (name '("cl-stack-code" "cl-stack-code/tests"))
+        (ok (uiop:pathname-equal (truename (asdf:system-source-file name)) (funcall search name))
+            name))
+      (ok (null (funcall search "no-such-system-anywhere"))))))
 
 (defun read-forms (path)
   (when (probe-file path)
