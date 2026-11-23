@@ -8,7 +8,8 @@
                "cffi"
                ;; TLS in the built binary: 3.5.9.4 drops the build image's SSL_CTX on save
                (:version "cl-stack-ssl" "3.5.9.4")
-               (:version "agent-tools" "0.4.0")
+               ;; 0.4.1: writes to one path serialized across concurrent tool calls (#30)
+               (:version "agent-tools" "0.4.1")
                (:version "llm-protocol" "0.6.0")
                (:version "llm-protocol-anthropic" "0.5.0")
                (:version "llm-protocol-openai" "0.7.0")
