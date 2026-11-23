@@ -112,14 +112,26 @@ that compiles the systems has the room its parent was given (#18)."
   #+sbcl (format nil "~dMB" (floor (sb-ext:dynamic-space-size) (* 1024 1024)))
   #-sbcl (error "the child images are started with SBCL only"))
 
-(defun %child-asdf-forms ()
+(defun %child-asdf-forms (config)
   "The --eval forms that give a child SBCL this image's ASDF and systems: load
-ASDF, a source registry of the loaded systems' directories (for anything not
-loaded here), and the exact .asd files of the loaded ones, which come first."
-  (list (%asdf-load-form)
-        (format nil "(uiop:symbol-call :asdf :initialize-source-registry '~s)"
-                (%registry-form))
-        (%pin-loaded-systems-form)))
+ASDF, then load a setup file written beside CONFIG (a test project's config
+directory) with a source registry of the loaded systems' directories (for
+anything not loaded here) and the exact .asd files of the loaded ones, which
+come first. A file, not --eval: the forms run to tens of kilobytes, past the
+Windows command-line limit (32767 characters)."
+  (let ((file (uiop:merge-pathnames*
+               "child-asdf.lisp"
+               (uiop:pathname-parent-directory-pathname
+                (uiop:ensure-directory-pathname config)))))
+    (with-open-file (s file :direction :output :if-exists :supersede
+                            :if-does-not-exist :create :external-format :utf-8)
+      (write-line (format nil "(uiop:symbol-call :asdf :initialize-source-registry '~s)"
+                          (%registry-form))
+                  s)
+      (write-line (%pin-loaded-systems-form) s))
+    (list (%asdf-load-form)
+          (format nil "(load (uiop:parse-native-namestring ~s) :external-format :utf-8)"
+                  (uiop:native-namestring file)))))
 
 (defun pty-child-argv (report project config)
   #-sbcl (declare (ignore report project config))
@@ -130,7 +142,7 @@ loaded here), and the exact .asd files of the loaded ones, which come first."
          "--core" (uiop:native-namestring sb-ext:*core-pathname*) "--noinform"
          "--dynamic-space-size" (%child-dynamic-space-size)
          "--non-interactive" "--no-sysinit" "--no-userinit")
-   (loop for form in (append (%child-asdf-forms)
+   (loop for form in (append (%child-asdf-forms config)
                            (list "(uiop:symbol-call :asdf :load-system \"cl-stack-code/tests\")"
                                  (format nil "(uiop:symbol-call :cl-stack-code/tests :pty-child-main ~s ~s ~s)"
                                          report (native project) (native config))))

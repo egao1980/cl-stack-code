@@ -28,7 +28,7 @@ scripted with the steps READ from STEPS-TEXT. Quits with RUN-CLI's code."
          "--core" (uiop:native-namestring sb-ext:*core-pathname*) "--noinform"
          "--dynamic-space-size" (%child-dynamic-space-size)
          "--non-interactive" "--no-sysinit" "--no-userinit")
-   (loop for form in (append (%child-asdf-forms)
+   (loop for form in (append (%child-asdf-forms config)
                            (list ;; stdout is the protocol: compiler output must not reach it.
                                  "(let ((*standard-output* (make-broadcast-stream))) (uiop:symbol-call :asdf :load-system \"cl-stack-code/tests\"))"
                                  (format nil "(uiop:symbol-call :cl-stack-code/tests :rpc-child-main ~s ~s ~s)"
