@@ -559,7 +559,15 @@
       (dolist (bad '("0" "3" "abc" "zzzz" "-1" ""))
         (ok (typep (failure (resolve-turn s bad)) 'session-turn-not-found) bad))
       (let ((c (failure (resolve-turn s "9"))))
-        (ok (equal "9" (and (typep c 'session-turn-not-found) (session-turn-not-found-designator c))))))))
+        (ok (equal "9" (and (typep c 'session-turn-not-found) (session-turn-not-found-designator c)))))
+      (testing "#13: a turn number as an integer"
+        (ok (equal (rev:revision-id r1) (rev:revision-id (resolve-turn s 1))))
+        (ok (equal (rev:revision-id r2) (rev:revision-id (resolve-turn s 2))))
+        (dolist (bad '(0 3 -1 1.0 :one))
+          (ok (typep (failure (resolve-turn s bad)) 'session-turn-not-found) (princ-to-string bad)))
+        (let ((c (failure (resolve-turn s 9))))
+          (ok (eql 9 (and (typep c 'session-turn-not-found) (session-turn-not-found-designator c)))
+              "the designator as given"))))))
 
 (deftest fork-turn-branches-before-a-turn
   (with-sessions-dir (dir)

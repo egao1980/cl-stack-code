@@ -169,10 +169,11 @@
 ;;;   messages and recorded times (unix seconds).
 ;;;
 ;;; The files at a turn (TURN-CHECKPOINT store at → CHECKPOINT or NIL)
-;;;   AT is "0" (the session's start) or a RESOLVE-TURN designator (a number
-;;;   on the head's line, an id or id prefix); anything else →
-;;;   SESSION-TURN-NOT-FOUND. L = AT's first-parent line (root … AT; empty
-;;;   for "0"). Among ALL checkpoints, the candidates are those whose
+;;;   AT is 0 or "0" (the session's start) or a RESOLVE-TURN designator (a
+;;;   number on the head's line, as an integer or a string of digits, an id
+;;;   or id prefix); anything else → SESSION-TURN-NOT-FOUND (#13: integers
+;;;   are turn numbers here as in --rewind's string). L = AT's first-parent
+;;;   line (root … AT; empty for 0). Among ALL checkpoints, the candidates are those whose
 ;;;   conversation revision is on L, and those with no conversation part.
 ;;;   The answer is the candidate whose conversation revision is deepest on L
 ;;;   (no conversation part counts as depth 0), the most recently recorded
@@ -187,7 +188,7 @@
 ;;;   dependency order: files first, then the conversation (it depends on
 ;;;   the files, so a files rewind that restores nothing leaves the
 ;;;   conversation alone too).
-;;;   1. AT resolved as for TURN-CHECKPOINT; T = its line number (0 for "0").
+;;;   1. AT resolved as for TURN-CHECKPOINT; T = its line number (0 for 0).
 ;;;   2. :conversation in PARTS: SYNC-SESSION, and a head on disk that is not
 ;;;      SESSION-BASE → SESSION-CONFLICT before anything is restored.
 ;;;   3. :files in PARTS: TARGET = TURN-CHECKPOINT AT (NIL →
@@ -222,7 +223,7 @@
 ;;;      :EMPTY (the working copy already had TARGET's files at those paths)
 ;;;      or :ABORTED.
 ;;;   4. :conversation in PARTS (and files not :ABORTED): the head moves to
-;;;      AT (deleted for "0") by CAS from SESSION-BASE (MOVE-SESSION-HEAD);
+;;;      AT (deleted for 0) by CAS from SESSION-BASE (MOVE-SESSION-HEAD);
 ;;;      :MOVED, or :UNCHANGED when it was there already (or the files were
 ;;;      :ABORTED).
 ;;;   5. Files :APPLIED or :MERGED and the checkpointer enabled: a :rewind
@@ -958,13 +959,15 @@ newly expired (see \"Retention\")."
 ;;; The files at a turn.
 
 (defun %resolve-at (store at)
-  "→ the revision id AT names, NIL for \"0\" (see \"The files at a turn\")."
-  (if (equal at "0")
+  "→ the revision id AT names, NIL for 0 or \"0\" (see \"The files at a
+turn\")."
+  (if (or (eql at 0) (equal at "0"))
       nil
       (rev:revision-id (resolve-turn store at))))
 
 (defun turn-checkpoint (store at)
-  "→ the CHECKPOINT holding the files at turn AT, or NIL (see \"The files at a
+  "→ the CHECKPOINT holding the files at turn AT (0 or \"0\", a turn number as
+an integer or a string, an id or id prefix), or NIL (see \"The files at a
 turn\")."
   (let* ((at-id (%resolve-at store at))
          (depth (make-hash-table :test 'equal))
@@ -1111,8 +1114,10 @@ the rewind plan changes."
             (reject-plan plan)))))))
 
 (defun rewind-to (checkpointer store at &key (parts +rewind-parts+))
-  "Rewind the SESSION-STORE STORE to turn AT, per part. → the RESULT plist
-(see \"Rewind\")."
+  "Rewind the SESSION-STORE STORE to turn AT, per part. AT: 0 (the session's
+start), a turn number N ≥ 1 (an integer, or a string of digits) or a turn id
+or id prefix, as TURN-CHECKPOINT takes it. → the RESULT plist (see
+\"Rewind\")."
   (unless (and (consp parts)
                (every (lambda (part) (member part '(:conversation :files))) parts))
     (error 'type-error :datum parts :expected-type '(cons (member :conversation :files) list)))

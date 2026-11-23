@@ -509,6 +509,28 @@
           (ok (typep c 'session-conflict) "another process moved the head")
           (ok (equal "beta" (read-file project "a.txt")) "nothing restored"))))))
 
+(deftest checkpoint-rewind-integer-turns
+  ;; #13: REWIND-TO and TURN-CHECKPOINT take a turn number as an integer, 0
+  ;; for the session's start, as they take the strings --rewind passes.
+  (with-project (project config) '(("a.txt" "alpha"))
+    (with-checkpointer (cp project config)
+      (let ((s (fresh-session project config)))
+        (edit-turn cp s "one" '("a.txt" "beta"))
+        (edit-turn cp s "two" '("a.txt" "gamma"))
+        (ok (equal (checkpoint-id (turn-checkpoint s "1")) (checkpoint-id (turn-checkpoint s 1))))
+        (ok (equal (checkpoint-id (turn-checkpoint s "0")) (checkpoint-id (turn-checkpoint s 0))))
+        (let ((result (rewind-to cp s 1 :parts '(:files))))
+          (ok (eql 1 (getf result :turn)))
+          (ok (eq :applied (getf result :files)))
+          (ok (equal "beta" (read-file project "a.txt"))))
+        (let ((result (rewind-to cp s 0)))
+          (ok (eql 0 (getf result :turn)))
+          (ok (eq :moved (getf result :conversation)))
+          (ok (equal "alpha" (read-file project "a.txt")))
+          (ok (null (session-head s)) "turn 0: the head is deleted"))
+        (ok (typep (failure (rewind-to cp s 7)) 'session-turn-not-found))
+        (ok (typep (failure (rewind-to cp s -1)) 'session-turn-not-found))))))
+
 ;;; Retention.
 
 (defun checkpoint-retention-case (kind)
