@@ -3,7 +3,7 @@
   :description "Coding agent CLI on cl-stack: a supervisor per session (shell jobs, servers and subagents as units with capped rotated logs; a TUI process panel (/ps, Ctrl-P) to follow, search, stop, restart and feed them, the same model over --rpc units/* methods, both behind the agent's unit_control permission rules), an SDK and a JSON-RPC 2.0 server over stdio (--rpc) on one core: sessions, turns with streamed events, approvals answered by the caller, steering, interrupts, plans, checkpoints and rewinds, the same event shapes as stream-JSON; a live Lisp image for the agent (lisp-mcp/agent tools, debugger entries in other threads delivered to the agent's inbox, restarts gated by permission rules), checkpoints (every turn that changes files records a composite revision of the conversation and the files: a pathlib snapshot, a git commit on a private ref, or a jj working-copy commit) and per-part rewinds (conversation, files or both, drift-checked), plan mode (edits and shell commands in a copy of the project, the shell confined to it by a kernel sandbox: Seatbelt on macOS, Landlock on Linux, network off; asking before each command where there is none; a projected diff, approve / reject / continue, drift detection and rebase; git worktrees or folder copies), an interactive terminal mode (streamed markdown transcript, @ mentions, approval dialogs, queued follow-ups and steering), sessions kept as a revision-protocol store per conversation (--continue, --resume, /tree, /fork, /rewind, /clone, /export) and headless -p runs with text, JSON or stream-JSON output, layered settings, AGENTS.md discovery and permission rules over ai-agent-protocol and agent-tools"
   :author "egao1980"
   :license "MIT"
-  :depends-on ((:version "ai-agent-protocol" "0.14.0")
+  :depends-on ((:version "ai-agent-protocol" "0.15.0")
                (:version "agent-tools" "0.4.0")
                (:version "llm-protocol" "0.6.0")
                (:version "llm-protocol-anthropic" "0.5.0")
@@ -45,22 +45,23 @@
                ;; (egao1980/supervisor-protocol#9); 0.3.4: cmd.exe command lines verbatim
                (:version "process-backend-uiop" "0.3.4")
                ;; H8d; 0.4.1: shutdown closes finished units' logs (Windows could not
-               ;; delete an open .idx, egao1980/supervisor-protocol#11)
-               (:version "supervisor-protocol" "0.4.1")
-               (:version "supervisor-protocol/search" "0.4.1")
+               ;; delete an open .idx, egao1980/supervisor-protocol#11); 0.5.0
+               ;; (H3e-2a): channel units for stdio MCP servers (#13)
+               (:version "supervisor-protocol" "0.5.0")
+               (:version "supervisor-protocol/search" "0.5.0")
                (:version "process-protocol" "0.4.1")
                ;; R4d-4b: plan mode's shell runs confined (Windows: none until R4e-1)
                (:version "compute-protocol" "0.3.2")
                (:feature :darwin (:version "compute-backend-seatbelt" "0.1.1"))
                (:feature :linux (:version "compute-backend-landlock" "0.1.0"))
-               ;; H3e-2a. The implementation raises these to the releases of
-               ;; mcp-protocol#14 (0.4.0), ai-agent-protocol#37 (0.15.0, /mcp 0.2.0),
-               ;; mcp-backend-stdio#7 (0.3.0), mcp-backend-streamable-http#9 (0.4.0)
-               ;; and supervisor-protocol#13 (0.5.0).
-               (:version "mcp-protocol" "0.3.1")
-               (:version "mcp-backend-stdio" "0.2.0")
-               (:version "mcp-backend-streamable-http" "0.3.0")
-               (:version "ai-agent-protocol/mcp" "0.1.0"))
+               ;; H3e-2a: the client side (mcp-protocol#14; 0.4.1 exports the log and
+               ;; progress readers), the client's handlers on the stdio and HTTP
+               ;; transports (mcp-backend-stdio#7, mcp-backend-streamable-http#9: headers,
+               ;; legacy HTTP+SSE reported), the MCP tool source (ai-agent-protocol#37)
+               (:version "mcp-protocol" "0.4.1")
+               (:version "mcp-backend-stdio" "0.3.0")
+               (:version "mcp-backend-streamable-http" "0.4.0")
+               (:version "ai-agent-protocol/mcp" "0.2.0"))
   ;; H4b: --lisp-image spawn starts ros +Q run images that load swank / slynk
   ;; (install roots, as in lisp-mcp; never dependencies).
   :properties (:cl-repo (:ci (:with ("swank" "slynk"))))
@@ -232,7 +233,8 @@
                (:file "mcp-config-test")
                (:file "mcp-cli-test")
                (:file "mcp-client-test")
-               (:file "mcp-program-test"))
+               (:file "mcp-program-test")
+               (:file "mcp-iset-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))

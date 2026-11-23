@@ -30,10 +30,12 @@
 ;;; INSTRUCTION-SET-COMPONENTS set → the components, in registration order
 ;;; (ADD-INSTRUCTION-COMPONENT; a second component with a role already
 ;;; present → INSTRUCTION-SET-ERROR). A later slice adds a component with
-;;; one ADD-INSTRUCTION-COMPONENT call where it makes its live object (H3e-2:
-;;; :MCP-SERVERS, when the servers are connected) and calls
-;;; COMMIT-INSTRUCTION-SET when its state changes; nothing in this file or in
-;;; the built-in components changes.
+;;; one ADD-INSTRUCTION-COMPONENT call where it makes its live object and
+;;; calls COMMIT-INSTRUCTION-SET when its state changes; nothing in the
+;;; built-in components changes. H3e-2a's :MCP-SERVERS (src/mcp.lisp, "The
+;;; instruction set") is registered in every session through
+;;; %OPEN-SESSION-INSTRUCTIONS :COMPONENTS, before the :start / :resume
+;;; commit, so the start revision has it too.
 ;;;
 ;;; Built-in components (+INSTRUCTION-SET-ROLES+), registered in this order
 ;;; by MAKE-INSTRUCTION-SET with a :CONTEXT (an INSTRUCTION-CONTEXT):
@@ -679,10 +681,11 @@ header."
 
 ;;; The process (src/headless.lisp, src/client.lisp, src/program.lisp).
 
-(defun %open-session-instructions (cwd settings session &key user-config-dir)
+(defun %open-session-instructions (cwd settings session &key user-config-dir components)
   "One context, discovery and set per session per process: :RESUME when
-SESSION has a head or a start revision, else :START. → (values context
-discovery set)."
+SESSION has a head or a start revision, else :START. COMPONENTS (H3e-2a: the
+MCP manager's) are registered after the built-in ones, before that commit.
+→ (values context discovery set)."
   (let* ((store (session-instruction-store session))
          (head (session-instruction-set session))
          (context (load-instruction-context
@@ -694,6 +697,8 @@ discovery set)."
                          :project-dir (context-project-dir context)
                          :loaded (context-loaded-rules context)))
          (set (make-instruction-set store :context context :discovery discovery)))
+    (dolist (c components)
+      (add-instruction-component set c))
     (commit-instruction-set set (if (or (session-head session) head) :resume :start))
     (values context discovery set)))
 

@@ -4,7 +4,7 @@ A coding agent CLI on [cl-stack](https://github.com/egao1980/cl-stack): an [`ai-
 
 Plan: [HARNESS-PLAN.md](https://github.com/egao1980/cl-workspace/blob/main/docs/HARNESS-PLAN.md), Track H, milestone H3. Brief: [`cl-stack-code.md`](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/cl-stack-code.md).
 
-Version **0.12.3** (live token streaming: http-backend-async 0.2.27; ACP context updates, #41): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), and `--acp` (**ACP-2**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
+Version **0.13.0** (live token streaming: http-backend-async 0.2.27; ACP context updates, #41): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), `--acp` (**ACP-2**), instruction files, skills and rules as a revisioned instruction set (**H3e-1**), and MCP servers (**H3e-2a**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
 
 ```
 cl-stack-code -p "fix the failing test" --output-format stream-json --permission-mode acceptEdits

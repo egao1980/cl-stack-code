@@ -2,13 +2,36 @@
 
 ;;; H3e-2a: MCP servers in the harness (brief: cl-stack
 ;;; docs/capabilities/cl-stack-code.md, "H3e-2 — locked"). Configuration and
-;;; trust are src/mcp-config.lisp. Building blocks, none reimplemented here:
-;;; mcp-protocol 0.4.0 (client, every tool field, list_changed, timeouts),
-;;; mcp-backend-stdio 0.3.0 (the client over a child's pipes),
-;;; mcp-backend-streamable-http 0.4.0 (headers), ai-agent-protocol 0.15.0
-;;; (MAKE-PREFIXED-TOOL-SOURCE, AGENT-TOOL-OUTPUT) and ai-agent-protocol/mcp
-;;; 0.2.0 (MAKE-MCP-TOOL-SOURCE), supervisor-protocol 0.5.0 (channel units,
-;;; egao1980/supervisor-protocol#13).
+;;; trust are src/mcp-config.lisp. Building blocks, none reimplemented here
+;;; (the names below are theirs, as published):
+;;;   mcp-protocol 0.4.1      MCP-CONNECT / BACKEND-MCP-CONNECT, MCP-INITIALIZE,
+;;;                           LIST-ALL-TOOLS, CALL-TOOL :TIMEOUT, the client's
+;;;                           handlers (:LOG-HANDLER gets an MCP-LOG-MESSAGE:
+;;;                           MCP-LOG-MESSAGE-LEVEL / -DATA; :ON-TOOLS-CHANGED
+;;;                           a function of the client, after
+;;;                           MCP-CLIENT-TOOLS-GENERATION is bumped),
+;;;                           MCP-CLIENT-INSTRUCTIONS, MCP-TIMEOUT, MCP-ERROR
+;;;   mcp-backend-stdio 0.3.0 BACKEND-MCP-CONNECT keys :INPUT :OUTPUT (streams)
+;;;                           or :COMMAND (argv) :ENV (alist) :ENV-MODE
+;;;                           (:MERGE) :DIRECTORY :ERROR-OUTPUT, plus the
+;;;                           handlers; CLOSE-STDIO-MCP-CLIENT (EOF to the
+;;;                           server; a :COMMAND child reaped),
+;;;                           STDIO-MCP-CLIENT-PROCESS
+;;;   mcp-backend-streamable-http 0.4.0  BACKEND-MCP-CONNECT keys :URL :HEADERS
+;;;                           (alist or hash table of strings), plus the
+;;;                           handlers; MCP-TRANSPORT-UNSUPPORTED (a legacy
+;;;                           HTTP+SSE server answered; readers -URL,
+;;;                           -TRANSPORT, -STATUS)
+;;;   ai-agent-protocol 0.15.0  MAKE-PREFIXED-TOOL-SOURCE inner prefix,
+;;;                           AGENT-TOOL-OUTPUT (-TEXT -PARTS -STRUCTURED),
+;;;                           AGENT-UNKNOWN-TOOL-ERROR
+;;;   ai-agent-protocol/mcp 0.2.0  MAKE-MCP-TOOL-SOURCE peer &key CACHE-TOOLS
+;;;                           TOOL-ERROR-BEHAVIOR PROCESS-TOOL-CALL TIMEOUT
+;;;                           LIST-TIMEOUT (+TOOL-ERROR-BEHAVIORS+ :retry
+;;;                           :failed :error), MCP-TOOL-SOURCE-TOOLS,
+;;;                           MCP-TOOL-SOURCE-READ-ONLY-P
+;;;   supervisor-protocol 0.5.0  START-UNIT … :STDIO :CHANNEL,
+;;;                           UNIT-CHANNEL-STREAMS unit → (values input output)
 ;;;
 ;;; The manager (one per session: -p run, TUI program, SDK / --rpc session)
 ;;;   MAKE-MCP-MANAGER configs &key supervisor settings env cwd http-backend
@@ -41,23 +64,41 @@
 ;;;   go here (or CLIENT-NEW-SESSION :MCP-SERVERS before the first turn).
 ;;;
 ;;; Transports
-;;;   :stdio  a supervised unit of the session's supervisor: kind :MCP-SERVER,
-;;;           owner scope "mcp" under the root, labels (:server NAME), the
-;;;           command and args as argv, the config's env over the process's,
-;;;           cwd the session's working directory, :RESTART :NEVER (a
-;;;           restarted child would have lost its MCP session; /mcp reconnect
-;;;           starts a new unit instead), a channel unit (stdin/stdout are the
-;;;           JSON-RPC pipes for mcp-backend-stdio, stderr goes to the unit
-;;;           log). It shows in /ps and units/*. The server's
-;;;           notifications/message (log) lines go to the same unit log as
-;;;           stderr records "[mcp LEVEL] DATA" (the client's log handler).
-;;;           Without a supervisor (none in the SDK? there is always one; a
-;;;           test may pass NIL) the child runs through mcp-backend-stdio's
-;;;           :COMMAND and its stderr is dropped.
-;;;   :http   mcp-backend-streamable-http, the config's headers on every
-;;;           request, with HTTP-BACKEND (the run's http-protocol backend,
-;;;           bound in the connecting thread).
-;;;   :sse    :UNSUPPORTED (above).
+;;;   :stdio  a supervised channel unit of the session's supervisor:
+;;;             (sup:start-unit supervisor :mcp-server :command argv
+;;;                             :owner <scope "mcp" under the root>
+;;;                             :labels (list :server NAME) :cwd <cwd>
+;;;                             :env <the config's env over the process's>
+;;;                             :restart :never :stdio :channel)
+;;;           (argv: the command, then the args). :RESTART :NEVER (a channel
+;;;           unit's default; a restarted child would have lost its MCP
+;;;           session; /mcp reconnect starts a new unit instead). Then
+;;;           (sup:unit-channel-streams unit) → (values input output), and
+;;;             (mcp-protocol:mcp-connect :backend <a stdio-mcp-backend>
+;;;                                       :input input :output output
+;;;                                       :log-handler … :on-tools-changed …)
+;;;           and MCP-INITIALIZE under the startup timeout. Stderr goes to
+;;;           the unit log. It shows in /ps and units/*. The server's
+;;;           notifications/message lines go to the same unit log as stderr
+;;;           records "[mcp LEVEL] DATA" (the :LOG-HANDLER, from
+;;;           MCP-LOG-MESSAGE-LEVEL and MCP-LOG-MESSAGE-DATA). Closing:
+;;;           MCP-BACKEND-STDIO:CLOSE-STDIO-MCP-CLIENT (EOF), then the unit is
+;;;           stopped and reaped by the supervisor (SUP:STOP-UNIT).
+;;;           Without a supervisor (a test may pass NIL) the child runs
+;;;           through the backend's :COMMAND argv :ENV alist :ENV-MODE :MERGE
+;;;           :DIRECTORY cwd :ERROR-OUTPUT NIL (stderr dropped);
+;;;           CLOSE-STDIO-MCP-CLIENT reaps it (STDIO-MCP-CLIENT-PROCESS is the
+;;;           handle).
+;;;   :http   (mcp-protocol:mcp-connect :backend <a streamable-http-mcp-backend>
+;;;                                     :url URL :headers <the config's alist>
+;;;                                     :log-handler … :on-tools-changed …),
+;;;           with HTTP-BACKEND (the run's http-protocol backend) bound as
+;;;           HTTP-PROTOCOL:*HTTP-BACKEND* in the connecting thread and in
+;;;           tool calls. A server that answers as a legacy HTTP+SSE one
+;;;           (MCP-BACKEND-STREAMABLE-HTTP:MCP-TRANSPORT-UNSUPPORTED from the
+;;;           initialize) is :UNSUPPORTED, error "transport sse is not
+;;;           supported yet", as an :sse config.
+;;;   :sse    :UNSUPPORTED (above), never connected.
 ;;;
 ;;; Tools (MCP-MANAGER-TOOL-SOURCE manager → one tool source)
 ;;;   The source the agent gets, after the unit tools: (file shell [lisp]
@@ -65,9 +106,17 @@
 ;;;   positions do not move. Its tools are the connected servers' tools in
 ;;;   config order, each server's through
 ;;;   (ai-agent-protocol:make-prefixed-tool-source
-;;;     (ai-agent-protocol/mcp:make-mcp-tool-source client :cache-tools …
-;;;      :tool-error-behavior … :timeout <tool timeout>) "mcp__<server>__"),
-;;;   so a reconnect or a list_changed changes the next step's tools.
+;;;     (ai-agent-protocol/mcp:make-mcp-tool-source
+;;;       client :cache-tools (mcp-server-config-cache-tools c)
+;;;              :tool-error-behavior (mcp-server-config-tool-error-behavior c)
+;;;              :timeout <tool timeout> :list-timeout <startup timeout>)
+;;;     "mcp__<server>__"),
+;;;   so a reconnect or a list_changed changes the next step's tools. A call
+;;;   whose name no connected server offers (a server closed between the
+;;;   listing and the call, or dropped by a restore) → the source's error
+;;;   callback gets an AI-AGENT-PROTOCOL:AGENT-UNKNOWN-TOOL-ERROR, as
+;;;   ai-agent-protocol's combined source does: a tool error the model reads,
+;;;   never a failed run.
 ;;;   MCP-TOOL-NAME server tool → "mcp__<server>__<tool>" (Claude Code's
 ;;;   convention); every character of SERVER or TOOL outside [A-Za-z0-9_-]
 ;;;   becomes "_". A name two servers produce: the later server's tool is
@@ -137,6 +186,115 @@
 ;;;   session/new takes "mcp_servers" (an mcpServers object). Unknown server →
 ;;;   MCP-SERVER-NOT-FOUND, RPC error -32020 with data "server".
 ;;;
+;;; The instruction set (H3e-1's protocol, src/instruction-sets.lisp)
+;;;   The MCP servers are part of the session's instruction set, like the
+;;;   instruction files, skills and rules: what the model is offered besides
+;;;   the conversation. Each manager has one MCP-SERVERS-COMPONENT
+;;;   (MCP-MANAGER-COMPONENT, made by MAKE-MCP-MANAGER), role :MCP-SERVERS.
+;;;   Every session registers it, servers or not: -p, the program and the SDK
+;;;   (so --rpc and ACP) make the supervisor and the manager before the
+;;;   session's instruction set opens, and pass the component to
+;;;   %OPEN-SESSION-INSTRUCTIONS :COMPONENTS, which registers it after the
+;;;   built-in ones and before the :start / :resume commit. So every revision
+;;;   this version writes has the role, last, and a rewind to before the
+;;;   first turn ("0", the start revision) restores it too. The wiring then
+;;;   sets (MCP-MANAGER-INSTRUCTION-SET manager) to the set.
+;;;
+;;;   Snapshot (COMPONENT-SNAPSHOT), data only, one entry per connection in
+;;;   MCP-MANAGER-CONNECTIONS order (NIL with no server configured):
+;;;     (:name "fake" :scope :user :transport :stdio :config "sha256:…"
+;;;      :status :connected
+;;;      :tools ((:name "echo" :description "sha256:…" :schema "sha256:…"
+;;;               :read-only t) …)
+;;;      :instructions nil)
+;;;   :NAME, :SCOPE, :TRANSPORT and :STATUS as MCP-CONNECTION-OBJECT's (as
+;;;   keywords). :CONFIG is the sha256 ("sha256:<64 hex>", P:OCTETS-HASH of
+;;;   the UTF-8 of the data printed as H3c prints files, not interned) of
+;;;     (:transport T :command C :args (A …) :env-names (K …) :url U
+;;;      :header-names (K …) :disabled B :timeout MS :startup-timeout MS
+;;;      :cache-tools B :tool-error-behavior KW)
+;;;   of the config as connected (after ${VAR}). Env and header VALUES are
+;;;   never in a snapshot or its hash input: revisions are written to the
+;;;   session directory, and tokens must not be. :TOOLS (NIL unless
+;;;   :CONNECTED): the tools the server's source offers (MCP-TOOL-SOURCE-TOOLS,
+;;;   app-only ones left out), server order; :NAME the server's own name (the
+;;;   offered name is MCP-TOOL-NAME of it); :DESCRIPTION the
+;;;   INTERN-INSTRUCTION-TEXT hash of the text the model reads (the
+;;;   description, else the title, else ""); :SCHEMA that of JSON-PROTOCOL:ENCODE
+;;;   of the input schema as decoded ({"type": "object"} when absent; the
+;;;   server's key order, so one server's schema hashes the same in every
+;;;   process); :READ-ONLY the readOnlyHint (T or NIL). :INSTRUCTIONS stays NIL
+;;;   in H3e-2a; H3e-2b puts the INTERN-INSTRUCTION-TEXT hash of the server's
+;;;   instructions there when includeInstructions puts them in the prompt.
+;;;   No unit id, error text, pid or time: two processes with the same
+;;;   servers in the same state write the same revision.
+;;;
+;;;   Commits (COMMIT-MCP-SERVERS manager → (values id new-p), or NIL without
+;;;   a set: COMMIT-INSTRUCTION-SET set :COMPONENT). After START-MCP-SERVERS
+;;;   (once, when every startable server settled), ADD-MCP-SERVERS (a server
+;;;   added, or replaced), RECONNECT-MCP-SERVER, and when a server's offered
+;;;   list changed (a list_changed, or a fetch with cacheTools false, that
+;;;   gives a different list). Commits run on the thread that owns the set
+;;;   (H3e-1): the three functions commit when they return there; a change
+;;;   that happens elsewhere (a list_changed, the TUI's background start) is
+;;;   committed before the next model call. An unchanged snapshot commits
+;;;   nothing new (content-addressed ids). The init event's "instruction_set"
+;;;   (-p stream-json, the SDK's CODE-SESSION-INIT, so session/new) is
+;;;   INSTRUCTION-SET-CURRENT after START-MCP-SERVERS, so it covers the
+;;;   servers as "mcp_servers" shows them.
+;;;
+;;;   Restore (COMPONENT-RESTORE; decided). A rewind or a /fork in the same
+;;;   process (H3e-1's %FOLLOW-HEAD: the SDK's rewind, /rewind, REWIND-TO's
+;;;   conversation part) restores the component to the revision of the new
+;;;   head:
+;;;   1. The configured set becomes the revision's, in its order. A live
+;;;      server the revision lacks is closed (CLOSE-STDIO-MCP-CLIENT, its unit
+;;;      stopped) and removed from MCP-MANAGER-CONNECTIONS: its tools are gone
+;;;      from the next model call, /mcp, mcp/list and CLIENT-MCP-SERVERS. A
+;;;      live server with the revision's name and :CONFIG hash is kept as it
+;;;      is (not restarted). A revision server the manager does not have (or
+;;;      has with another hash) is added again :PENDING from the config the
+;;;      manager held with that name and hash (it remembers every config it
+;;;      held), and connected lazily: before the next model call, in
+;;;      parallel, under its startup timeout, with the approval rules of
+;;;      START-MCP-SERVERS (approvals are the user's settings, never
+;;;      restored). One it never held → :FAILED, error "not configured in
+;;;      this process".
+;;;   2. The tools offered for a server the revision recorded :CONNECTED are
+;;;      the revision's (:TOOLS: names, descriptions and schemas from its
+;;;      texts, :READ-ONLY for the permission default) while that server is
+;;;      connected, until its list is next refreshed (a list_changed, a
+;;;      reconnect, every fetch with cacheTools false); then the server's
+;;;      list again, and a commit. Calls always go to the live server: a
+;;;      revision tool the server dropped answers with its own error, a tool
+;;;      error the model reads. For any other server the live list is offered.
+;;;   3. Nothing is committed by the restore (H3e-1); the next commit is the
+;;;      next change, and a lazily reconnected server that comes back as it
+;;;      was commits the same id.
+;;;   Why: the set must follow the conversation, as rules do. A server added
+;;;   after the rewind point is the conversation's future: its tools must not
+;;;   be offered, and its process must not keep running. Keeping a live
+;;;   connection that the revision also has costs nothing and loses no server
+;;;   state; reconnecting lazily keeps /rewind instant. The revision's tool
+;;;   list, not the live one, because a revision is what the model was told
+;;;   (H3e-1 renders old revisions from their stored texts the same way): a
+;;;   rewind or a fork replays the same request, byte for byte, so the model
+;;;   sees what it saw and the provider's prompt cache still hits. This is not
+;;;   new staleness: a cached list (cacheTools, the default) already lives
+;;;   until list_changed; the restore only seeds that cache from the revision,
+;;;   and the same signals refresh it.
+;;;   A fork into a new session in this process (the SDK's CLIENT-FORK-SESSION,
+;;;   /clone, a conflict fork): CLONE-SESSION copies the revisions with their
+;;;   :MCP-SERVERS snapshots (H3e-1). The fork's session has its own
+;;;   supervisor and manager, whose servers are the fork point's revision's
+;;;   (configs from the parent's manager, so SDK servers carry over; servers
+;;;   added after the fork point do not). They connect at its start; its
+;;;   :resume / :component commits then give the fork point's id back when
+;;;   the servers come back as they were, and the fork's init event names it.
+;;;   A new process (--resume, --continue, --fork-session in a new process):
+;;;   the servers are the configuration's (files, flags, SDK), as for any
+;;;   resume: H3e-1's :resume reads the set from the process.
+;;;
 ;;; Overlap with the built-in Lisp tools (H4b): a server named, say, "lisp"
 ;;; running lisp-mcp offers mcp__lisp__repl-eval next to the built-in
 ;;; repl-eval. Both stay, under their distinct names; nothing is merged or
@@ -192,7 +350,20 @@
    (http-backend :initarg :http-backend :initform nil :reader mcp-manager-http-backend)
    (on-status :initarg :on-status :initform nil :reader mcp-manager-on-status)
    (closed :initform nil :accessor mcp-manager-closed-p)
+   ;; The instruction set (see the header)
+   (component :initform nil :accessor mcp-manager-component
+              :documentation "The manager's MCP-SERVERS-COMPONENT (MAKE-MCP-MANAGER makes it).")
+   (instruction-set :initform nil :accessor mcp-manager-instruction-set
+                    :documentation "The session's INSTRUCTION-SET, once it is open (NIL before).")
    (lock :initform (bt:make-lock "mcp-manager") :reader %mcp-manager-lock)))
+
+(defclass mcp-servers-component ()
+  ((manager :initarg :manager :reader mcp-servers-component-manager))
+  (:documentation "The instruction set's :MCP-SERVERS component of one MCP-MANAGER
+(see the header, \"The instruction set\")."))
+
+(defmethod component-role ((c mcp-servers-component))
+  :mcp-servers)
 
 (define-condition mcp-server-not-found (code-error)
   ((server :initarg :server :reader mcp-server-not-found-server))
@@ -259,6 +430,22 @@
   (declare (ignore state event))
   (%h3e2-pending "MCP core events"))
 
+;;; The instruction set (see the header).
+
+(defmethod component-snapshot ((c mcp-servers-component) store)
+  (declare (ignore store))
+  (%h3e2-pending "the :mcp-servers snapshot"))
+
+(defmethod component-restore ((c mcp-servers-component) snapshot store)
+  (declare (ignore snapshot store))
+  (%h3e2-pending "the :mcp-servers restore"))
+
+(defun commit-mcp-servers (manager)
+  "COMMIT-INSTRUCTION-SET of MANAGER's set, reason :COMPONENT → (values id
+new-p), or NIL when MANAGER has no set."
+  (declare (ignore manager))
+  (%h3e2-pending "commit-mcp-servers"))
+
 ;;; SDK (src/client.lisp wires sessions; these are the entry points).
 
 (defun client-mcp-servers (session)
@@ -294,6 +481,8 @@
           mcp-connection mcp-connection-config mcp-connection-status mcp-connection-error
           mcp-connection-client mcp-connection-unit mcp-connection-source mcp-connection-name
           mcp-manager mcp-manager-connections mcp-manager-supervisor mcp-manager-closed-p
+          mcp-manager-component mcp-manager-instruction-set
+          mcp-servers-component mcp-servers-component-manager commit-mcp-servers
           mcp-server-not-found mcp-server-not-found-server
           mcp-tool-name make-mcp-manager start-mcp-servers reconnect-mcp-server add-mcp-servers
           close-mcp-manager mcp-manager-tool-source mcp-connection-tools mcp-connection-object
