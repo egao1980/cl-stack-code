@@ -4,7 +4,7 @@ A coding agent CLI on [cl-stack](https://github.com/egao1980/cl-stack): an [`ai-
 
 Plan: [HARNESS-PLAN.md](https://github.com/egao1980/cl-workspace/blob/main/docs/HARNESS-PLAN.md), Track H, milestone H3. Brief: [`cl-stack-code.md`](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/cl-stack-code.md).
 
-Version **0.13.2** (the built binary does TLS: cl-stack-ssl 3.5.9.4; macOS: clears Mach exception ports inherited from the editor): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), `--acp` (**ACP-2**), instruction files, skills and rules as a revisioned instruction set (**H3e-1**), and MCP servers (**H3e-2a**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
+Version **0.13.3** (the built binary does TLS: cl-stack-ssl 3.5.9.4; macOS: clears Mach exception ports inherited from the editor; HTTP error bodies and long-idle connections fixed: http-protocol 0.4.3, http-backend-async 0.2.28): **H3a** headless `-p`, **H3b** the interactive TUI, **H3c** sessions, **H5a** plan mode, with its shell confined (**R4d-4b**), the SDK and `--rpc` (**H3d**), `--acp` (**ACP-2**), instruction files, skills and rules as a revisioned instruction set (**H3e-1**), and MCP servers (**H3e-2a**). Its contract is `cl-stack-code/tests` (and `cl-stack-code/acp/tests` for `--acp`).
 
 ```
 cl-stack-code -p "fix the failing test" --output-format stream-json --permission-mode acceptEdits
