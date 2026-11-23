@@ -374,15 +374,14 @@ scripted with the steps READ from STEPS-TEXT. Quits with RUN-CLI's code."
   (append
    (list (uiop:native-namestring sb-ext:*runtime-pathname*)
          "--core" (uiop:native-namestring sb-ext:*core-pathname*) "--noinform"
+         "--dynamic-space-size" (%child-dynamic-space-size)
          "--non-interactive" "--no-sysinit" "--no-userinit")
-   (loop for form in (list (%asdf-load-form)
-                           (format nil "(uiop:symbol-call :asdf :initialize-source-registry '~s)"
-                                   (%registry-form))
-                           ;; stdout is the protocol: compiler output must not reach it.
-                           "(let ((*standard-output* (make-broadcast-stream))) (uiop:symbol-call :asdf :load-system \"cl-stack-code/acp/tests\"))"
-                           (format nil "(uiop:symbol-call :cl-stack-code/acp/tests :acp-child-main ~s ~s ~s)"
-                                   (native project) (native config)
-                                   (let ((*print-readably* t)) (prin1-to-string steps))))
+   (loop for form in (append (%child-asdf-forms config)
+                           (list ;; stdout is the protocol: compiler output must not reach it.
+                                 "(let ((*standard-output* (make-broadcast-stream))) (uiop:symbol-call :asdf :load-system \"cl-stack-code/acp/tests\"))"
+                                 (format nil "(uiop:symbol-call :cl-stack-code/acp/tests :acp-child-main ~s ~s ~s)"
+                                         (native project) (native config)
+                                         (let ((*print-readably* t)) (prin1-to-string steps)))))
          append (list "--eval" form))))
 
 (defparameter *child-start-seconds* 300
