@@ -76,12 +76,13 @@ is a hash table's in mcp-protocol 0.3; the tests compare as sets).")
          when dir collect (uiop:native-namestring dir))
    :test #'string=))
 
-(defun %child-load-forms ()
-  "Forms (strings) that make a bare SBCL load mcp-backend-stdio from this
-image's sources and fasls."
+(defun %child-setup-forms ()
+  "Forms (strings) that make a bare SBCL (ASDF loaded) find and load
+mcp-backend-stdio from this image's sources and fasls: the loaded systems'
+directories, their output translations, and the exact .asd of every loaded
+system (%PIN-LOADED-SYSTEMS-FORM)."
   (let ((dirs (%loaded-system-dirs)))
-    (list "(require :asdf)"
-          (let ((*print-readably* nil))
+    (list (let ((*print-readably* nil))
             (format nil "(asdf:initialize-source-registry '(:source-registry ~{(:directory ~s) ~}:ignore-inherited-configuration))"
                     dirs))
           (format nil "(asdf:initialize-output-translations '(:output-translations ~{(~s ~s) ~}:ignore-inherited-configuration))"
@@ -89,11 +90,29 @@ image's sources and fasls."
                         append (list d (uiop:native-namestring
                                         (asdf:apply-output-translations
                                          (uiop:parse-native-namestring d :ensure-directory t))))))
+          (%pin-loaded-systems-form)
           "(let ((*standard-output* *error-output*)) (asdf:load-system \"mcp-backend-stdio\"))")))
+
+(defun fake-mcp-setup (base)
+  "Write the child's ASDF setup file under BASE (once) → its native namestring.
+A file, not --eval forms: the registry runs to tens of kilobytes, past the
+Windows command-line limit (32767 characters; \"The filename or extension is
+too long\")."
+  (let ((path (merge-pathnames "fake-mcp-asdf.lisp" (uiop:ensure-directory-pathname base))))
+    (unless (probe-file path)
+      (with-open-file (o path :direction :output :if-exists :supersede :external-format :utf-8)
+        (dolist (form (%child-setup-forms)) (write-line form o))))
+    (native path)))
+
+(defun %child-load-forms (base)
+  "--eval forms (strings) for the fake server child: ASDF, then the setup file."
+  (list (%asdf-load-form)
+        (format nil "(load (uiop:parse-native-namestring ~s) :external-format :utf-8)"
+                (fake-mcp-setup base))))
 
 (defun fake-mcp-script (base)
   "Write the fake server script under BASE (once) → its native namestring."
-  (let ((path (subdir base "fake-mcp-server.lisp")))
+  (let ((path (merge-pathnames "fake-mcp-server.lisp" (uiop:ensure-directory-pathname base))))
     (unless (probe-file path)
       (with-open-file (o path :direction :output :if-exists :supersede :external-format :utf-8)
         (write-string +fake-mcp-script+ o)))
@@ -102,8 +121,9 @@ image's sources and fasls."
 (defun fake-stdio-server (base &key (mode "serve") env pid-file)
   "A .mcp.json server object (hash table) running the fake stdio server."
   (let ((argv (apply #'child-argv
-                     (append (%child-load-forms)
-                             (list (format nil "(load ~s)" (fake-mcp-script base))))))
+                     (append (%child-load-forms base)
+                             (list (format nil "(load (uiop:parse-native-namestring ~s) :external-format :utf-8)"
+                                           (fake-mcp-script base))))))
         (env-object (make-hash-table :test 'equal)))
     (setf (gethash "FAKE_MCP_MODE" env-object) mode)
     (when pid-file (setf (gethash "FAKE_MCP_PID_FILE" env-object) (native pid-file)))
