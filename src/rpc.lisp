@@ -253,6 +253,8 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
     (unit-control-failed (list "unit" (%null (unit-control-failed-unit condition))
                                "action" (%null (unit-control-failed-action condition))))
     (subscription-not-found (list "subscription" (%null (subscription-not-found-id condition))))
+    ;; H3e-2a
+    (mcp-server-not-found (list "server" (%null (mcp-server-not-found-server condition))))
     (t '())))
 
 (defun rpc-error-for (condition)
@@ -349,7 +351,19 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
                                 :cwd (%param method params "cwd" :string)
                                 :model (%param method params "model" :string)
                                 :permission-mode (%mode-param method params)
-                                :session-id (%param method params "session_id" :string)))))
+                                :session-id (%param method params "session_id" :string)
+                                ;; H3e-2a: an mcpServers object (scope :sdk)
+                                :mcp-servers (%param method params "mcp_servers" :object)))))
+   ;; H3e-2a
+   (cons "mcp/list"
+         (lambda (client method params)
+           (%json-object "servers" (coerce (client-mcp-servers (%session-param client method params))
+                                           'vector))))
+   (cons "mcp/reconnect"
+         (lambda (client method params)
+           (let ((session (%session-param client method params))
+                 (server (%param method params "server" :string)))
+             (%json-object "servers" (coerce (client-reconnect-mcp session server) 'vector)))))
    (cons "session/resume"
          (lambda (client method params)
            (let* ((last (%param method params "last" :boolean))

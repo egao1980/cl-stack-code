@@ -93,10 +93,6 @@
 
 ;;; Given: constants, the config object, the layer hooks.
 
-(defun %h3e2-pending (what)
-  "H3e-2a contract stub. The implementation removes it and every call."
-  (error 'code-error :message (format nil "not implemented yet (H3e-2a contract): ~a" what)))
-
 (defparameter +default-mcp-timeout-ms+ 30000
   "Startup timeout of one MCP server (ms).")
 
@@ -226,57 +222,385 @@ config-files strict) of SETTINGS's MCP plist (servers: alist name . config)."
   "True for :USER, :FLAG and :SDK servers."
   (and (member (mcp-server-config-scope config) '(:user :flag :sdk)) t))
 
-;;; Stubbed (the header's rules).
+
+;;; Parsing (the header's rules).
+
+(defun %mcp-server-key (name &optional sub)
+  (format nil "mcpServers.~a~@[.~a~]" name sub))
+
+(defun %url-sse-p (url)
+  "True when URL's path (without query and fragment) ends in \"/sse\"."
+  (let* ((end (or (position-if (lambda (c) (member c '(#\? #\#))) url) (length url)))
+         (n (- end 4)))
+    (and (>= n 0) (string= "/sse" url :start2 n :end2 end))))
+
+(defun %mcp-string-array (file key value)
+  "VALUE (a JSON array of strings) as a list; else SETTINGS-ERROR KEY / KEY[i]."
+  (unless (%json-array-p value)
+    (%settings-fail file key "must be an array of strings"))
+  (loop for item across value
+        for i from 0
+        do (unless (stringp item)
+             (%settings-fail file (format nil "~a[~d]" key i) "must be a string"))
+        collect item))
+
+(defun %mcp-string-object (file key value)
+  "VALUE (a JSON object of strings) as an alist in its order; else SETTINGS-ERROR."
+  (unless (hash-table-p value)
+    (%settings-fail file key "must be an object of strings"))
+  (loop for name being the hash-keys of value using (hash-value v)
+        do (unless (stringp v)
+             (%settings-fail file (format nil "~a.~a" key name) "must be a string"))
+        collect (cons name v)))
+
+(defun %mcp-ms-p (value)
+  (and (integerp value) (>= value 1)))
+
+(defun %mcp-boolean-p (value)
+  (member value '(t nil)))
+
+(defun %parse-mcp-server (name object file scope)
+  "One mcpServers entry → an MCP-SERVER-CONFIG (see the header)."
+  (when (zerop (length name))
+    (%settings-fail file "mcpServers." "a server name must not be empty"))
+  (let ((key (%mcp-server-key name)))
+    (unless (hash-table-p object)
+      (%settings-fail file key "must be an object"))
+    (flet ((field (sub test what)
+             (multiple-value-bind (value present) (%json-present object sub)
+               (when (and present (not (funcall test value)))
+                 (%settings-fail file (%mcp-server-key name sub) "must be ~a" what))
+               (values value present))))
+      (let* ((type (field "type" #'stringp "a string"))
+             (command (field "command" #'stringp "a string"))
+             (url (field "url" #'stringp "a string"))
+             (args (multiple-value-bind (value present) (%json-present object "args")
+                     (and present (%mcp-string-array file (%mcp-server-key name "args") value))))
+             (env (multiple-value-bind (value present) (%json-present object "env")
+                    (and present (%mcp-string-object file (%mcp-server-key name "env") value))))
+             (headers (multiple-value-bind (value present) (%json-present object "headers")
+                        (and present
+                             (%mcp-string-object file (%mcp-server-key name "headers") value))))
+             (disabled (field "disabled" #'%mcp-boolean-p "true or false"))
+             (timeout (field "timeout" #'%mcp-ms-p "an integer >= 1 (ms)"))
+             (startup (field "startupTimeout" #'%mcp-ms-p "an integer >= 1 (ms)"))
+             (cache-tools (multiple-value-bind (value present)
+                              (field "cacheTools" #'%mcp-boolean-p "true or false")
+                            (if present value t)))
+             (behavior (let ((text (field "toolErrorBehavior" #'stringp "a string")))
+                         (if text
+                             (or (find text ai-agent-protocol/mcp:+tool-error-behaviors+
+                                       :key #'symbol-name :test #'string-equal)
+                                 (%settings-fail file (%mcp-server-key name "toolErrorBehavior")
+                                                 "must be one of ~{~(~a~)~^, ~}"
+                                                 ai-agent-protocol/mcp:+tool-error-behaviors+))
+                             :retry)))
+             (transport
+               (cond ((null type)
+                      (cond (command :stdio)
+                            (url (if (%url-sse-p url) :sse :http))
+                            (t (%settings-fail file key "needs \"command\" or \"url\""))))
+                     ((string= type "stdio") :stdio)
+                     ((member type '("http" "streamable-http") :test #'string=) :http)
+                     ((string= type "sse") :sse)
+                     (t (%settings-fail file (%mcp-server-key name "type")
+                                        "unknown type ~s (stdio, http, streamable-http or sse)"
+                                        type)))))
+        (when (and (eq transport :stdio) (null command))
+          (%settings-fail file (%mcp-server-key name "command") "a stdio server needs a command"))
+        (when (and (member transport '(:http :sse)) (null url))
+          (%settings-fail file (%mcp-server-key name "url") "an ~(~a~) server needs a url" transport))
+        (make-mcp-server-config name :scope scope :transport transport
+                                     :command (and (eq transport :stdio) command)
+                                     :args (and (eq transport :stdio) args)
+                                     :env (and (eq transport :stdio) env)
+                                     :url (and (not (eq transport :stdio)) url)
+                                     :headers (and (not (eq transport :stdio)) headers)
+                                     :disabled (and disabled t)
+                                     :timeout timeout :startup-timeout startup
+                                     :cache-tools (and cache-tools t)
+                                     :tool-error-behavior behavior
+                                     :file file)))))
 
 (defun %parse-mcp-keys (file object)
-  (declare (ignore file object))
-  (%h3e2-pending "parse the MCP settings keys"))
+  "The MCP plist of the settings OBJECT: only the keys present are set (the
+merge looks at presence)."
+  (let ((out '()))
+    (flet ((scalar (key test what)
+             (multiple-value-bind (value present) (%json-present object key)
+               (when (and present (not (funcall test value)))
+                 (%settings-fail file key "must be ~a" what))
+               (values value present))))
+      (multiple-value-bind (value present) (%json-present object "mcpServers")
+        (when present
+          (setf (getf out :servers)
+                (mapcar (lambda (c) (cons (mcp-server-config-name c) c))
+                        (parse-mcp-servers value :file file)))))
+      (multiple-value-bind (value present)
+          (scalar "enableAllProjectMcpServers" #'%mcp-boolean-p "true or false")
+        (when present (setf (getf out :enable-all-project) (and value t))))
+      (loop for (key indicator) in '(("enabledMcpjsonServers" :enabled)
+                                     ("disabledMcpjsonServers" :disabled))
+            do (multiple-value-bind (value present) (%json-present object key)
+                 (when present
+                   (setf (getf out indicator) (%mcp-string-array file key value)))))
+      (loop for (key indicator) in '(("mcpTimeout" :timeout) ("mcpToolTimeout" :tool-timeout))
+            do (multiple-value-bind (value present) (scalar key #'%mcp-ms-p "an integer >= 1 (ms)")
+                 (when present (setf (getf out indicator) value)))))
+    out))
 
 (defun parse-mcp-servers (object &key file scope)
   "OBJECT: the decoded \"mcpServers\" value → list of MCP-SERVER-CONFIG (SCOPE,
 FILE set), in the object's order; SETTINGS-ERROR as the header says."
-  (declare (ignore object file scope))
-  (%h3e2-pending "parse-mcp-servers"))
+  (unless (hash-table-p object)
+    (%settings-fail file "mcpServers" "must be an object of servers"))
+  (loop for name being the hash-keys of object using (hash-value value)
+        collect (%parse-mcp-server name value file scope)))
 
 (defun mcp-json-path (cwd)
   "<project root of CWD, else CWD>/.mcp.json."
-  (declare (ignore cwd))
-  (%h3e2-pending "mcp-json-path"))
+  (let ((dir (uiop:ensure-directory-pathname cwd)))
+    (merge-pathnames +mcp-json-file-name+
+                     (uiop:ensure-directory-pathname (or (find-project-root dir) dir)))))
+
+(defun %parse-mcp-json-text (text file scope)
+  "The servers of TEXT, a .mcp.json-shaped JSON object (FILE for messages)."
+  (let ((object (handler-case (json:decode text)
+                  (error (e) (%settings-fail file nil "not valid JSON (~a)" e)))))
+    (unless (hash-table-p object)
+      (%settings-fail file nil "must be a JSON object with \"mcpServers\""))
+    (multiple-value-bind (value present) (%json-present object "mcpServers")
+      (and present (parse-mcp-servers value :file file :scope scope)))))
 
 (defun read-mcp-json (pathname &key (scope :project))
   "→ the servers of the .mcp.json-shaped file PATHNAME, or NIL when it does
 not exist. SETTINGS-ERROR (bad JSON, not an object, bad server) with restarts
 CONTINUE (→ NIL) and USE-VALUE, as READ-SETTINGS-FILE."
-  (declare (ignore pathname scope))
-  (%h3e2-pending "read-mcp-json"))
+  (let ((path (probe-file pathname)))
+    (when (and path (pathname-name path))
+      (restart-case
+          (%parse-mcp-json-text
+           (handler-case (uiop:read-file-string path :external-format :utf-8)
+             (error (e) (%settings-fail path nil "cannot read the file (~a)" e)))
+           path scope)
+        (continue ()
+          :report "Skip this MCP server file."
+          nil)
+        (use-value (servers)
+          :report "Use these servers instead."
+          servers)))))
+
+;;; ${VAR} expansion.
+
+(defun %expand-mcp-text (text env name file key)
+  "TEXT with ${VAR} and ${VAR:-default} expanded through ENV."
+  (if (not (search "${" text))
+      text
+      (with-output-to-string (out)
+        (let ((i 0))
+          (loop
+            (let* ((start (search "${" text :start2 i))
+                   (end (and start (position #\} text :start (+ start 2)))))
+              (unless end
+                (write-string text out :start i)
+                (return))
+              (write-string text out :start i :end start)
+              (let* ((body (subseq text (+ start 2) end))
+                     (sep (search ":-" body))
+                     (var (if sep (subseq body 0 sep) body))
+                     (value (funcall env var)))
+                (cond (value (write-string value out))
+                      (sep (write-string body out :start (+ sep 2)))
+                      (t (%settings-fail file key "${~a} is not set (MCP server ~a)" var name))))
+              (setf i (1+ end))))))))
 
 (defun expand-mcp-variables (config env)
   "→ a copy of CONFIG with ${VAR} / ${VAR:-default} expanded through ENV (a
 function name → value or NIL)."
-  (declare (ignore config env))
-  (%h3e2-pending "expand-mcp-variables"))
+  (let* ((name (mcp-server-config-name config))
+         (file (mcp-server-config-file config)))
+    (flet ((one (text sub)
+             (and text (%expand-mcp-text text env name file (%mcp-server-key name sub))))
+           (alist (entries sub)
+             (loop for (k . v) in entries
+                   collect (cons k (%expand-mcp-text v env name file
+                                                     (%mcp-server-key name (format nil "~a.~a" sub k)))))))
+      (%copy-mcp-config config
+                        :command (one (mcp-server-config-command config) "command")
+                        :args (loop for arg in (mcp-server-config-args config)
+                                    for i from 0
+                                    collect (one arg (format nil "args[~d]" i)))
+                        :env (alist (mcp-server-config-env config) "env")
+                        :url (one (mcp-server-config-url config) "url")
+                        :headers (alist (mcp-server-config-headers config) "headers")))))
+
+;;; The layers.
+
+(defun %mcp-env-lookup (settings env)
+  "The effective lookup: SETTINGS's env first, then ENV (else the process)."
+  (let ((entries (and settings (settings-env settings)))
+        (base (or env #'uiop:getenv)))
+    (lambda (name)
+      (let ((entry (assoc name entries :test #'string=)))
+        (if entry (cdr entry) (funcall base name))))))
+
+(defun %sdk-mcp-servers (servers)
+  "SERVERS (MCP-SERVER-CONFIGs or a decoded mcpServers object) as configs, scope
+:SDK unless set."
+  (cond ((null servers) '())
+        ((hash-table-p servers) (parse-mcp-servers servers :scope :sdk))
+        (t (mapcar (lambda (config)
+                     (if (mcp-server-config-scope config)
+                         config
+                         (%copy-mcp-config config :scope :sdk)))
+                   servers))))
+
+(defun %sdk-mcp-configs (servers env)
+  "SERVERS as %SDK-MCP-SERVERS, expanded through ENV."
+  (mapcar (lambda (config) (expand-mcp-variables config env)) (%sdk-mcp-servers servers)))
+
+(defun %mcp-flag-servers (cwd value)
+  "One --mcp-config VALUE: JSON text (first non-blank character \"{\") or a file."
+  (let ((trimmed (string-left-trim '(#\Space #\Tab #\Newline #\Return) value)))
+    (if (and (plusp (length trimmed)) (char= #\{ (char trimmed 0)))
+        (%parse-mcp-json-text value nil :flag)
+        (let ((path (and (plusp (length value))
+                         (probe-file (uiop:merge-pathnames* (uiop:parse-native-namestring value)
+                                                            (uiop:ensure-directory-pathname cwd))))))
+          (unless (and path (pathname-name path))
+            (error 'code-usage-error :message (format nil "--mcp-config: no such file ~a" value)))
+          (read-mcp-json path :scope :flag)))))
+
+(defun %mcp-file-layers (cwd merged user-config-dir)
+  "The servers of user settings, .mcp.json, project settings and local
+settings, one list each in that order (as the files hold them), then the
+merged settings' servers none of the files has."
+  (destructuring-bind (user project local)
+      (settings-file-paths cwd :user-config-dir user-config-dir)
+    (flet ((servers (path scope)
+             (let ((layer (%mcp-layer (handler-case (read-settings-file path)
+                                        (settings-error () nil))
+                                      scope)))
+               (mapcar #'cdr (getf (and layer (settings-mcp layer)) :servers)))))
+      (let ((layers (list (servers user :user)
+                          (read-mcp-json (mcp-json-path cwd) :scope :project)
+                          (servers project :project)
+                          (servers local :local))))
+        (append layers
+                (list (loop for (name . config) in merged
+                            unless (some (lambda (layer)
+                                           (find name layer :key #'mcp-server-config-name
+                                                            :test #'string=))
+                                         layers)
+                              collect config)))))))
 
 (defun effective-mcp-servers (cwd settings &key user-config-dir sdk-servers env)
   "→ the session's MCP-SERVER-CONFIGs, expanded, in first-seen order (see the
 header). SETTINGS: the merged settings (LOAD-SETTINGS). SDK-SERVERS: configs or
 a decoded mcpServers object (scope :sdk). ENV: the effective lookup. A missing
 --mcp-config file → CODE-USAGE-ERROR \"--mcp-config: no such file X\"."
-  (declare (ignore cwd settings user-config-dir sdk-servers env))
-  (%h3e2-pending "effective-mcp-servers"))
+  (multiple-value-bind (merged all enabled disabled timeout tool-timeout config-files strict)
+      (mcp-settings settings)
+    (declare (ignore all enabled disabled timeout tool-timeout))
+    (let ((layers (append (unless strict (%mcp-file-layers cwd merged user-config-dir))
+                          (mapcar (lambda (value) (%mcp-flag-servers cwd value)) config-files)
+                          (list (%sdk-mcp-servers sdk-servers))))
+          (winners '())
+          (lookup (%mcp-env-lookup settings env)))
+      (dolist (layer layers)
+        (dolist (config layer)
+          (let ((cell (assoc (mcp-server-config-name config) winners :test #'string=)))
+            (if cell
+                (setf (cdr cell) config)
+                (push (cons (mcp-server-config-name config) config) winners)))))
+      (mapcar (lambda (cell) (expand-mcp-variables (cdr cell) lookup))
+              (nreverse winners)))))
+
+;;; Trust: the approval keys as permission-rule data (the rules-and-logic rule).
+
+(defun %dir-key (dir)
+  "DIR (a pathname or native namestring) as a native namestring with a trailing separator."
+  (uiop:native-namestring
+   (uiop:ensure-directory-pathname (if (stringp dir) (uiop:parse-native-namestring dir) dir))))
+
+(defun %approval-rule (entry effect)
+  "An enabledMcpjsonServers / disabledMcpjsonServers ENTRY (\"NAME\" or
+\"NAME@<dir>\") as a rule: action the server name, resource the project directory."
+  (let ((at (position #\@ entry)))
+    (agent:make-permission-rule (if at (subseq entry 0 at) entry)
+                                (if at (%dir-key (subseq entry (1+ at))) "*")
+                                effect)))
+
+(defun %approval-rules (settings)
+  "No match asks (:UNAPPROVED); enableAllProjectMcpServers and enabled entries
+allow; disabled entries deny, last, so they win."
+  (multiple-value-bind (servers all enabled disabled) (mcp-settings settings)
+    (declare (ignore servers))
+    (append (list (agent:make-permission-rule "*" "*" :ask))
+            (and all (list (agent:make-permission-rule "*" "*" :allow)))
+            (mapcar (lambda (entry) (%approval-rule entry :allow)) enabled)
+            (mapcar (lambda (entry) (%approval-rule entry :deny)) disabled))))
 
 (defun mcp-server-approval (config settings &key project-dir)
   "→ :APPROVED, :REJECTED or :UNAPPROVED (trusted servers → :APPROVED)."
-  (declare (ignore config settings project-dir))
-  (%h3e2-pending "mcp-server-approval"))
+  (if (mcp-server-trusted-p config)
+      :approved
+      (ecase (agent:permission-rules-effect (%approval-rules settings)
+                                            (mcp-server-config-name config)
+                                            (list (%dir-key (or project-dir (uiop:getcwd)))))
+        (:allow :approved)
+        (:ask :unapproved)
+        (:deny :rejected))))
 
 (defun save-mcp-approval (name project-dir decision &key user-config-dir)
   "DECISION :YES → NAME@<project-dir> added to enabledMcpjsonServers of the
 user settings file (and removed from disabledMcpjsonServers); :NO → the other
 way round; :LATER → nothing. Other keys of the file are kept. → the file."
-  (declare (ignore name project-dir decision user-config-dir))
-  (%h3e2-pending "save-mcp-approval"))
+  (check-type decision (member :yes :no :later))
+  (let ((file (merge-pathnames "settings.json"
+                               (uiop:ensure-directory-pathname
+                                (or user-config-dir (user-config-directory))))))
+    (unless (eq decision :later)
+      (let* ((entry (format nil "~a@~a" name (%dir-key project-dir)))
+             (object (if (probe-file file)
+                         (handler-case (json:decode (uiop:read-file-string file :external-format :utf-8))
+                           (error (e) (%settings-fail file nil "not valid JSON (~a)" e)))
+                         (make-hash-table :test 'equal)))
+             (add (if (eq decision :yes) "enabledMcpjsonServers" "disabledMcpjsonServers"))
+             (drop (if (eq decision :yes) "disabledMcpjsonServers" "enabledMcpjsonServers")))
+        (unless (hash-table-p object)
+          (%settings-fail file nil "settings must be a JSON object"))
+        (flet ((without (key)
+                 (let ((value (gethash key object)))
+                   (remove entry (if (%json-array-p value) (coerce value 'list) '())
+                           :test #'equal))))
+          (setf (gethash add object) (coerce (append (without add) (list entry)) 'vector))
+          (when (nth-value 1 (gethash drop object))
+            (setf (gethash drop object) (coerce (without drop) 'vector))))
+        (ensure-directories-exist file)
+        (p:write-text file (json:encode object) :atomic t)))
+    file))
+
+;;; Timeouts.
+
+(defun %env-ms (env name)
+  "ENV's NAME as a positive integer (ms), or NIL."
+  (let ((text (and env (funcall env name))))
+    (and (stringp text) (plusp (length text)) (every #'digit-char-p text)
+         (let ((ms (parse-integer text)))
+           (and (plusp ms) ms)))))
 
 (defun mcp-timeouts (config settings env)
   "→ (values startup-seconds tool-seconds) for CONFIG (see the header)."
-  (declare (ignore config settings env))
-  (%h3e2-pending "mcp-timeouts"))
+  (multiple-value-bind (servers all enabled disabled timeout tool-timeout) (mcp-settings settings)
+    (declare (ignore servers all enabled disabled))
+    (let ((startup (or (mcp-server-config-startup-timeout config)
+                       timeout
+                       (%env-ms env "MCP_TIMEOUT")
+                       +default-mcp-timeout-ms+))
+          (tool (or (let ((ms (mcp-server-config-timeout config)))
+                      (and ms (>= ms 1000) ms))
+                    tool-timeout
+                    (%env-ms env "MCP_TOOL_TIMEOUT")
+                    +default-mcp-tool-timeout-ms+)))
+      (values (/ startup 1000) (/ tool 1000)))))

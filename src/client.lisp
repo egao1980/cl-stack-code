@@ -422,6 +422,8 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
   ;; session's discovery and instruction set, and the closure that renders
   ;; the working directory's system prompt from the set's current revision.
   context discovery instruction-set render
+  ;; H3e-2a (set once by %OPEN-CODE-SESSION): the session's MCP-MANAGER.
+  mcp
   (unit-subs '())                       ; ("sub-N" SUP:SUBSCRIPTION), loop thread
   (unit-sub-counter 0)                  ; loop thread
   (units-lock (bt:make-lock "cl-stack-code session units"))
@@ -617,7 +619,13 @@ events when TURN is given)."
                           (lambda (object) (%deliver session object nil)))
                 :denial-reason #'%sdk-denial-reason
                 :image-tools (%sources-lisp-tools (%s-sources (%session-state session)))
-                :instruction-set (%s-instruction-set (%session-state session))))
+                :instruction-set (%s-instruction-set (%session-state session))
+                :mcp (%s-mcp (%session-state session))))
+
+(defun %with-session-mcp (session fn)
+  "H3e-2a: FN of SESSION's MCP-MANAGER, on the client's loop thread (the set's)."
+  (%on-client-loop ((code-session-client session))
+    (funcall fn (%s-mcp (%live session)))))
 
 ;;; Sessions.
 
@@ -674,14 +682,20 @@ overrides."
         (%usage-fail "session ~a already exists: use --resume ~a" normal normal)))))
 
 (defun %open-code-session (client dir settings designator store-fn
-                           &key turns forked-from tool-sources)
+                           &key turns forked-from tool-sources mcp-servers
+                             (mcp-configs nil mcp-configs-p))
   "Set SESSION up as MAKE-CODE-PROGRAM sets up the interactive mode; STORE-FN
 makes its store once the configuration passed. → the CODE-SESSION, its init
-event delivered."
+event delivered. H3e-2a: MCP-SERVERS are the SDK's (CLIENT-NEW-SESSION);
+MCP-CONFIGS, when given, are the servers exactly (a fork's)."
   (let* ((getenv (%client-getenv client))
          (config (%client-config client))
          (data-dir (%client-data-dir client))
          (env (%env-lookup settings getenv))
+         (mcp-configs (if mcp-configs-p
+                          mcp-configs
+                          (effective-mcp-servers dir settings :user-config-dir config
+                                                              :sdk-servers mcp-servers :env env)))
          (resolved (multiple-value-list
                     (resolve-model designator :providers (%client-providers client) :env env)))
          (backend (first resolved))
@@ -693,6 +707,7 @@ event delivered."
          (store nil)
          (checkpointer nil)
          (supervisor nil)
+         (mcp nil)
          (sources nil)
          (context nil)
          (discovery nil)
@@ -702,13 +717,28 @@ event delivered."
          (progn
            (setf store (funcall store-fn project-dir)
                  checkpointer (%make-run-checkpointer settings dir data-dir getenv))
+           ;; H8d: the session's supervisor, before the tools; H3e-2a: then the
+           ;; MCP manager, before the instruction set opens.
+           (setf supervisor (make-code-supervisor dir :data-dir (%client-data-root client)
+                                                      :getenv getenv)
+                 mcp (make-mcp-manager mcp-configs :supervisor supervisor :settings settings
+                                                   :env env :cwd dir
+                                                   :http-backend http-protocol:*http-backend*))
+           ;; The set is this (the loop) thread's; a change elsewhere is posted here.
+           (let ((eb (%client-event-backend client))
+                 (el (%client-event-loop client)))
+             (%set-mcp-owner mcp (bt:current-thread)
+                             (lambda (fn)
+                               (event:wake-call eb el (lambda ()
+                                                        (handler-case (funcall fn)
+                                                          (error () nil)))))))
            ;; H3e-1: the session's instruction set (:start or :resume).
            (multiple-value-setq (context discovery instruction-set)
-             (%open-session-instructions dir settings store :user-config-dir config))
-           (setf ;; H8d: the session's supervisor, before the tools.
-                 supervisor (make-code-supervisor dir :data-dir (%client-data-root client)
-                                                      :getenv getenv)
-                 sources (make-code-tools dir :settings settings
+             (%open-session-instructions dir settings store
+                                         :user-config-dir config
+                                         :components (list (mcp-manager-component mcp))))
+           (setf (mcp-manager-instruction-set mcp) instruction-set)
+           (setf sources (make-code-tools dir :settings settings
                                               :on-image-event (and link (%link-callback link))
                                               :supervisor supervisor
                                               :skills (context-skills context)))
@@ -716,9 +746,13 @@ event delivered."
            ;; ACP-2: the caller's tool backends (TOOL-SOURCES, header).
            (when tool-sources
              (setf sources (%hooked-sources tool-sources sources)))
+           ;; H3e-2a: the MCP source, last.
+           (setf sources (append sources (list (mcp-manager-tool-source mcp))))
            (when link
              (setf (%link-tools link) (third sources))
              (start-lisp-image (third sources) settings))
+           ;; H3e-2a: the servers, before the init event (headless: never asks).
+           (start-mcp-servers mcp)
            (let ((offered (loop for source in sources
                                 append (mapcar #'llm:llm-tool-name
                                                (agent:list-agent-tools source)))))
@@ -763,7 +797,8 @@ event delivered."
                                    :supervisor supervisor
                                    :unit-tools (code-unit-tools sources)
                                    :context context :discovery discovery
-                                   :instruction-set instruction-set :render render))
+                                   :instruction-set instruction-set :render render
+                                   :mcp mcp))
                  (push session (%client-sessions client))
                  (setf done t)
                  (when link
@@ -779,12 +814,15 @@ event delivered."
                                                          mode offered files
                                                          (and link settings)
                                                          :context context :discovery discovery
-                                                         :instruction-set instruction-set)
+                                                         :instruction-set instruction-set
+                                                         :mcp-servers (mcp-manager-connections mcp))
                                       (and turns (list "turns" turns))
                                       (and forked-from (list "forked_from" forked-from)))))
                  session))))
       (unless done
         (%link-close link)
+        ;; H3e-2a: the MCP clients and units, before the supervisor.
+        (close-mcp-manager mcp)
         ;; H8d: unit tools, shell tools, then the supervisor.
         (%close-code-units supervisor :unit-tools (list (code-unit-tools sources))
                                       :shell-tools (list (second sources)))
@@ -807,7 +845,8 @@ list of the same shape whose shell, lisp and unit tools are the given objects
   (let ((head (and store (session-head store))))
     (and head (record-model (revision-record head)))))
 
-(defun client-new-session (client &key cwd model permission-mode session-id tool-sources)
+(defun client-new-session (client &key cwd model permission-mode session-id tool-sources
+                                       mcp-servers)
   (%on-client-loop (client)
     (let* ((dir (%session-dir client cwd))
            (settings (%merged-settings client dir :model model :permission-mode permission-mode))
@@ -819,10 +858,11 @@ list of the same shape whose shell, lisp and unit tools are the given objects
                           (or model (settings-model settings) +default-model+)
                           (lambda (project-dir)
                             (%session-for-run inv nil sessions-dir project-dir))
-                          :tool-sources tool-sources))))
+                          :tool-sources tool-sources
+                          :mcp-servers mcp-servers))))
 
 (defun client-resume-session (client designator &key cwd model permission-mode fork session-id
-                                                      tool-sources)
+                                                      tool-sources mcp-servers)
   (%on-client-loop (client)
     (let* ((dir (%session-dir client cwd))
            (sessions-dir (%sessions-dir-of-client client dir))
@@ -848,7 +888,8 @@ list of the same shape whose shell, lisp and unit tools are the given objects
                                   (%session-for-run inv source sessions-dir project-dir))
                                 :turns (length (session-line source))
                                 :forked-from (and fork (session-id source))
-                                :tool-sources tool-sources))))))
+                                :tool-sources tool-sources
+                                :mcp-servers mcp-servers))))))
 
 (defun client-fork-session (session &key at session-id)
   (let ((client (code-session-client session)))
@@ -868,13 +909,30 @@ list of the same shape whose shell, lisp and unit tools are the given objects
                             :turns (if revision
                                        (length (session-line store (rev:revision-id revision)))
                                        0)
-                            :forked-from (session-id store))))))
+                            :forked-from (session-id store)
+                            ;; H3e-2a: the fork point's servers, from this manager.
+                            :mcp-configs (%fork-mcp-configs (%s-mcp st) store revision))))))
+
+(defun %fork-mcp-configs (manager store revision)
+  "H3e-2a: the configs MANAGER held for the servers of STORE's instruction-set
+revision at REVISION (the head when NIL), in its order (a server it never held
+is left out)."
+  (let* ((iset (session-instruction-store store))
+         (id (session-instruction-set store (if revision (rev:revision-id revision) +head-ref+)))
+         (entries (and id (%find-set-revision iset id)
+                       (cdr (assoc :mcp-servers (read-instruction-set iset id))))))
+    (loop for entry in entries
+          for config = (and manager (%mcp-held-config manager (getf entry :name)
+                                                      (getf entry :config)))
+          when config collect config)))
 
 (defun %close-session-resources (st)
   ;; H8d: the subscriptions end first (no event is delivered after this).
   (dolist (entry (shiftf (%s-unit-subs st) '()))
     (sup:unsubscribe (second entry)))
   (%link-close (%s-link st))
+  ;; H3e-2a: the MCP clients and units, before the supervisor.
+  (close-mcp-manager (%s-mcp st))
   ;; H8d: unit tools (the working directory's and the plan area's), shell
   ;; tools, then the supervisor (every unit stopped, logs kept).
   (%close-code-units (%s-supervisor st)
@@ -1001,12 +1059,14 @@ instructions. → (values sources instructions). H8d: on the session's
 supervisor, under an :agent scope \"plan-<id8>\"."
   (let* ((agent (%s-agent st))
          (sup (%s-supervisor st))
-         (sources (apply #'make-code-tools (plan-tool-root plan (%s-cwd st))
-                         :settings settings
-                         :supervisor sup
-                         :scope (%plan-unit-scope sup plan)
-                         :skills (and (%s-context st) (context-skills (%s-context st)))
-                         (plan-sandbox-tool-keys sandbox))))
+         (sources (append (apply #'make-code-tools (plan-tool-root plan (%s-cwd st))
+                                 :settings settings
+                                 :supervisor sup
+                                 :scope (%plan-unit-scope sup plan)
+                                 :skills (and (%s-context st) (context-skills (%s-context st)))
+                                 (plan-sandbox-tool-keys sandbox))
+                          ;; H3e-2a: the session's MCP source, last.
+                          (and (%s-mcp st) (list (mcp-manager-tool-source (%s-mcp st)))))))
     (%link-skill-tools (%s-instruction-set st) (code-skill-tools sources))
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
