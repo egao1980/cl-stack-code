@@ -56,6 +56,25 @@
       (ok (wait-for* tui (lambda () (search " in · " (nth 13 (screen tui)))))
           "the status line is still last"))))
 
+(deftest program-layout-follows-a-resize-burst
+  ;; #49: two resizes in quick succession (a font size change twice) with a
+  ;; transcript on screen: the layout is for the last size.
+  (with-project (project config) '()
+    (with-code-tui (tui program backend :cols 100 :rows 20
+                        :steps (list (format nil "~{word~d ~}" (loop for i below 400 collect i))))
+        (project config)
+      (send-line tui "hi")
+      (ok (wait-screen tui "word399"))
+      (ok (wait-idle tui program))
+      (h:tui-resize tui 90 14)
+      (h:tui-resize tui 64 10)
+      (ok (wait-for* tui (lambda () (search " out" (nth 9 (screen tui)))))
+          "the status line is the last row")
+      (ok (wait-for* tui (lambda () (uiop:string-prefix-p ">" (nth 8 (screen tui)))))
+          "the input is above it")
+      (ok (wait-for* tui (lambda () (search "word399" (screen-text tui))))
+          "the transcript's end is shown"))))
+
 ;;; Turns.
 
 (deftest program-runs-a-turn
