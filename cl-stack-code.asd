@@ -5,9 +5,9 @@
   :license "MIT"
   :depends-on ((:version "ai-agent-protocol" "0.14.0")
                (:version "agent-tools" "0.4.0")
-               (:version "llm-protocol" "0.5.0")
-               (:version "llm-protocol-anthropic" "0.3.0")
-               (:version "llm-protocol-openai" "0.4.0")
+               (:version "llm-protocol" "0.6.0")
+               (:version "llm-protocol-anthropic" "0.5.0")
+               (:version "llm-protocol-openai" "0.7.0")
                (:version "steer-protocol" "0.4.0")
                (:version "cli-protocol" "0.2.1")
                (:version "cli-backend-clingon" "0.2.0")
@@ -29,7 +29,7 @@
                "event-protocol"
                "event-backend-libuv"
                "http-protocol"
-               (:version "http-backend-async" "0.2.20")
+               (:version "http-backend-async" "0.2.25")
                ;; Content-Encoding backends the async client advertises (cl-stack-code#29)
                (:version "http-encoding-zstd" "0.1.1") (:version "http-encoding-brotli" "0.1.1")
                (:version "http-encoding-snappy" "0.1.1")
