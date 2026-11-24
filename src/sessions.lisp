@@ -161,7 +161,8 @@ dashes are dropped)."
 (defstruct (turn-record (:constructor make-turn-record
                             (&key prompt turns replace-p (finish :stop) model
                                   (permission-mode :default) (usage (list 0 0 0 0))
-                                  steering plan instructions (version +version+)))
+                                  steering plan instructions compactions retry-of
+                                  (version +version+)))
                         (:conc-name record-))
   "One turn of a session. PROMPT is the user's message as typed (before @
 mentions were expanded). TURNS are the LLM-TURNs the turn added to the
@@ -176,7 +177,10 @@ cache-write) summed over the turn's responses, STEERING the steering
 messages delivered into the turn, as typed, in order. PLAN (H5a) is the
 PLAN-RECORD of the plan the turn ran in (plan mode), or NIL. INSTRUCTIONS
 (H3e-1) is the id of the instruction-set revision current at the turn's end
-(src/instruction-sets.lisp: 64 lowercase hex characters), or NIL."
+(src/instruction-sets.lisp: 64 lowercase hex characters), or NIL. H3f:
+COMPACTIONS are the compaction markers of the turn, oldest first (plists,
+see MAKE-COMPACTION-MARKER in src/resilience.lisp); RETRY-OF is the id of the
+failed revision this turn re-sent (--retry, /retry, turn/retry), or NIL."
   (prompt "" :type string)
   (turns '() :type list)
   (replace-p nil)
@@ -187,6 +191,8 @@ PLAN-RECORD of the plan the turn ran in (plan mode), or NIL. INSTRUCTIONS
   (steering '() :type list)
   (plan nil :type list)
   (instructions nil :type (or null string))
+  (compactions '() :type list)
+  (retry-of nil)
   (version +version+))
 
 (defparameter +record-finishes+ '(:stop :max-steps :canceled :failed))
@@ -202,19 +208,24 @@ The :PLAN key (H5a) is present only when the record has a plan; :INSTRUCTIONS S
   (check-type record turn-record)
   (append
    (list :format +session-format+
-        :prompt (record-prompt record)
-        :turns (mapcar #'llm:turn-state (record-turns record))
-        :replace (and (record-replace-p record) t)
-        :finish (record-finish record)
-        :model (record-model record)
-        :permission-mode (record-permission-mode record)
-        :usage (copy-list (record-usage record))
-        :steering (copy-list (record-steering record))
-        :version (record-version record))
+         :prompt (record-prompt record)
+         :turns (mapcar #'llm:turn-state (record-turns record))
+         :replace (and (record-replace-p record) t)
+         :finish (record-finish record)
+         :model (record-model record)
+         :permission-mode (record-permission-mode record)
+         :usage (copy-list (record-usage record))
+         :steering (copy-list (record-steering record))
+         :version (record-version record))
    (when (record-plan record)
      (list :plan (copy-list (record-plan record))))
    (when (record-instructions record)
-     (list :instructions (record-instructions record)))))
+     (list :instructions (record-instructions record)))
+   ;; H3f: present only when set, so older records read unchanged.
+   (when (record-compactions record)
+     (list :compactions (mapcar #'%compaction-marker-content (record-compactions record))))
+   (when (record-retry-of record)
+     (list :retry-of (record-retry-of record)))))
 
 (defun %malformed-record (content &optional cause)
   (error 'session-error
@@ -227,7 +238,8 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                (handler-case (progn (getf content :format) t) (error () nil)))
     (%malformed-record content "not a plist"))
   (destructuring-bind (&key format prompt turns replace finish model permission-mode
-                            usage steering version plan instructions &allow-other-keys)
+                            usage steering version plan instructions compactions retry-of
+                            &allow-other-keys)
       content
     (unless (eql format +session-format+) (%malformed-record content ":format"))
     (unless (stringp prompt) (%malformed-record content ":prompt"))
@@ -245,6 +257,10 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                 (and (stringp instructions) (= 64 (length instructions))
                      (%hex-string-p instructions)))
       (%malformed-record content ":instructions"))
+    (unless (and (listp compactions) (every #'listp compactions))
+      (%malformed-record content ":compactions"))
+    (unless (or (null retry-of) (stringp retry-of))
+      (%malformed-record content ":retry-of"))
     (make-turn-record :prompt prompt
                       :turns (mapcar #'llm:state-turn turns)
                       :replace-p (and replace t)
@@ -255,6 +271,8 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
                       :steering (copy-list steering)
                       :plan (copy-list plan)
                       :instructions (and instructions (copy-seq instructions))
+                      :compactions (mapcar #'%content-compaction-marker compactions)
+                      :retry-of retry-of
                       :version version)))
 
 (defun revision-record (revision)
@@ -840,8 +858,12 @@ means the head ref (REV:REV-REF), and with no head the line is NIL."
 SESSION-RECORDS root first (a record appends its TURNS; a REPLACE-P record's
 TURNS replace everything before). No head → NIL. Never :SYSTEM turns: the
 system prompt is assembled again by every process that runs the session."
-  (let ((turns '()))
-    (dolist (record (session-records store designator))
+  (let ((records (session-records store designator))
+        (turns '()))
+    ;; H3f: a line with compaction markers sends the compacted context.
+    (when (some #'record-compactions records)
+      (return-from session-turns (compacted-session-turns records)))
+    (dolist (record records)
       (setf turns (if (record-replace-p record)
                       (copy-list (record-turns record))
                       (append turns (record-turns record)))))

@@ -353,6 +353,8 @@
             "  /reject               discard the open plan"
             "  /ps                   the session's units (shell jobs, servers, subagents): logs, search, stop (also Ctrl-P)"
             "  /mcp [reconnect [N]]  MCP servers, their status and tools; reconnect one or all"
+            "  /compact [TEXT]       summarize the conversation now (TEXT: what the summary must keep)"
+            "  /retry                re-send the last turn after it failed"
             "  /exit                 quit (also Ctrl-D, or Ctrl-C on an empty input)"
             "Keys:"
             "  Enter send · Alt+Enter, Shift+Enter or Ctrl+J newline · Up/Down history"

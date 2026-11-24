@@ -175,7 +175,9 @@
     "units/list" "units/subscribe" "units/unsubscribe" "units/read" "units/search"
     "units/control"
     ;; H3e-2a
-    "mcp/list" "mcp/reconnect")
+    "mcp/list" "mcp/reconnect"
+    ;; H3f
+    "session/compact" "turn/retry")
   "Every --rpc method, in this order (initialize's \"methods\").")
 
 (defparameter +rpc-error-codes+
@@ -201,6 +203,10 @@
     (unit-control-failed . -32019)
     ;; H3e-2a
     (mcp-server-not-found . -32020)
+    ;; H3f
+    (nothing-to-retry . -32031)
+    (model-error . -32030)
+    (turn-timeout . -32032)
     (code-usage-error . -32602)
     (code-error . -32000)
     (error . -32603))
