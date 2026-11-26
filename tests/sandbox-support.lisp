@@ -126,8 +126,8 @@ truename, or of X itself when it does not exist."
   (write-file project ".cl-stack-code/settings.json" json))
 
 (defun plan-settings (&rest keys)
-  "Merged settings in plan mode with the flag layer's sandbox plist KEYS."
-  (merge-settings (make-settings :permission-mode :plan :sandbox keys)))
+  "Merged settings in preview mode with the flag layer's sandbox plist KEYS."
+  (merge-settings (make-settings :permission-mode :preview :sandbox keys)))
 
 ;;; Runs.
 

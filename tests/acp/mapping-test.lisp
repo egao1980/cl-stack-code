@@ -17,15 +17,18 @@
 ;;; Modes.
 
 (deftest acp-mode-ids
-  (ok (equal '("default" "acceptEdits" "bypassPermissions" "plan") +acp-mode-ids+)))
+  ;; H5c-0: five modes, "plan" (plan documents) and "preview" (H5a) apart.
+  (ok (equal '("default" "acceptEdits" "bypassPermissions" "plan" "preview") +acp-mode-ids+))
+  (ok (equal +permission-mode-names+ +acp-mode-ids+) "in +permission-mode-names+ order"))
 
 (deftest-parametrize acp-mode-mapping
     ((id mode)
-     :ids ("default" "acceptEdits" "bypassPermissions" "plan")
+     :ids ("default" "acceptEdits" "bypassPermissions" "plan" "preview")
      ("default" :default)
      ("acceptEdits" :accept-edits)
      ("bypassPermissions" :bypass-permissions)
-     ("plan" :plan))
+     ("plan" :plan)
+     ("preview" :preview))
   (ok (eq mode (mode-id-permission-mode id)))
   (ok (equal id (permission-mode-mode-id mode))))
 

@@ -159,10 +159,11 @@ dashes are dropped)."
 ;;; Turn records: a revision's content.
 
 (defstruct (turn-record (:constructor make-turn-record
-                            (&key prompt turns replace-p (finish :stop) model
-                                  (permission-mode :default) (usage (list 0 0 0 0))
-                                  steering plan instructions compactions retry-of
-                                  (version +version+)))
+                                      (&key prompt turns replace-p (finish :stop) model
+                                            (permission-mode :default) (usage (list 0 0 0 0))
+                                            steering plan instructions compactions retry-of
+                                            plan-document
+                                            (version +version+)))
                         (:conc-name record-))
   "One turn of a session. PROMPT is the user's message as typed (before @
 mentions were expanded). TURNS are the LLM-TURNs the turn added to the
@@ -175,12 +176,14 @@ or :FAILED. MODEL is the model designator the turn ran with,
 PERMISSION-MODE its mode keyword, USAGE (input output cache-read
 cache-write) summed over the turn's responses, STEERING the steering
 messages delivered into the turn, as typed, in order. PLAN (H5a) is the
-PLAN-RECORD of the plan the turn ran in (plan mode), or NIL. INSTRUCTIONS
+PLAN-RECORD of the preview area the turn ran in (preview mode), or NIL. INSTRUCTIONS
 (H3e-1) is the id of the instruction-set revision current at the turn's end
 (src/instruction-sets.lisp: 64 lowercase hex characters), or NIL. H3f:
 COMPACTIONS are the compaction markers of the turn, oldest first (plists,
 see MAKE-COMPACTION-MARKER in src/resilience.lisp); RETRY-OF is the id of the
-failed revision this turn re-sent (--retry, /retry, turn/retry), or NIL."
+failed revision this turn re-sent (--retry, /retry, turn/retry), or NIL.
+H5c-0: PLAN-DOCUMENT is the PLAN-DOCUMENT-RECORD of a plan document the turn
+changed, or NIL."
   (prompt "" :type string)
   (turns '() :type list)
   (replace-p nil)
@@ -193,6 +196,7 @@ failed revision this turn re-sent (--retry, /retry, turn/retry), or NIL."
   (instructions nil :type (or null string))
   (compactions '() :type list)
   (retry-of nil)
+  (plan-document nil :type list)
   (version +version+))
 
 (defparameter +record-finishes+ '(:stop :max-steps :canceled :failed))
@@ -204,7 +208,8 @@ lists:
    :model S-or-NIL :permission-mode K :usage (I O CR CW) :steering (S …)
    :version S [:plan (:id S :kind K :base S :root S :status K)])
 The :PLAN key (H5a) is present only when the record has a plan; :INSTRUCTIONS S
-(H3e-1, an instruction-set revision id) only when it has one."
+(H3e-1, an instruction-set revision id) only when it has one; :PLAN-DOCUMENT
+(H5c-0) only when the turn changed a plan document."
   (check-type record turn-record)
   (append
    (list :format +session-format+
@@ -225,7 +230,10 @@ The :PLAN key (H5a) is present only when the record has a plan; :INSTRUCTIONS S
    (when (record-compactions record)
      (list :compactions (mapcar #'%compaction-marker-content (record-compactions record))))
    (when (record-retry-of record)
-     (list :retry-of (record-retry-of record)))))
+     (list :retry-of (record-retry-of record)))
+   ;; H5c-0
+   (when (record-plan-document record)
+     (list :plan-document (copy-list (record-plan-document record))))))
 
 (defun %malformed-record (content &optional cause)
   (error 'session-error
@@ -233,12 +241,16 @@ The :PLAN key (H5a) is present only when the record has a plan; :INSTRUCTIONS S
 
 (defun content-record (content)
   "→ the TURN-RECORD of a RECORD-CONTENT plist (turns read back with
-LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
+LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR. H5c-0
+MIGRATION: a record whose content has H5a's :PLAN key and the mode :PLAN was
+recorded by 0.4–0.14 plan mode, which is preview mode now: it reads back with
+mode :PREVIEW (plan-mode records of 0.15 never carry :PLAN)."
   (unless (and (listp content) (evenp (length content))
                (handler-case (progn (getf content :format) t) (error () nil)))
     (%malformed-record content "not a plist"))
   (destructuring-bind (&key format prompt turns replace finish model permission-mode
                             usage steering version plan instructions compactions retry-of
+                            plan-document
                             &allow-other-keys)
       content
     (unless (eql format +session-format+) (%malformed-record content ":format"))
@@ -261,18 +273,23 @@ LLM:STATE-TURN). A plist that is not one signals SESSION-ERROR."
       (%malformed-record content ":compactions"))
     (unless (or (null retry-of) (stringp retry-of))
       (%malformed-record content ":retry-of"))
+    (unless (and (listp plan-document) (evenp (length plan-document)))
+      (%malformed-record content ":plan-document"))
     (make-turn-record :prompt prompt
                       :turns (mapcar #'llm:state-turn turns)
                       :replace-p (and replace t)
                       :finish finish
                       :model model
-                      :permission-mode permission-mode
+                      :permission-mode (if (and plan (eq permission-mode :plan))
+                                           :preview
+                                           permission-mode)
                       :usage (copy-list usage)
                       :steering (copy-list steering)
                       :plan (copy-list plan)
                       :instructions (and instructions (copy-seq instructions))
                       :compactions (mapcar #'%content-compaction-marker compactions)
                       :retry-of retry-of
+                      :plan-document (copy-list plan-document)
                       :version version)))
 
 (defun revision-record (revision)

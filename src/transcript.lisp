@@ -72,9 +72,12 @@
 ;;; Styles are free; tests compare W:RUNS-STRING of each line.
 
 (defstruct (entry (:constructor make-entry
-                      (&key kind text id name input status result error-p)))
-  "One transcript block (see the file header)."
-  (kind :notice :type (member :user :assistant :tool :notice :error :plan))
+                                (&key kind text id name input status result error-p)))
+  "One transcript block (see the file header). H5c-0: :PLAN-DOCUMENT (the
+proposed markdown), :PLAN-STEPS (the checklist), :PLAN-RESULT (plan versus
+diff); :PLAN is H5a's preview projection."
+  (kind :notice :type (member :user :assistant :tool :notice :error :plan
+                              :plan-document :plan-steps :plan-result))
   (text "")
   (id nil)
   (name nil)
@@ -343,14 +346,18 @@ the others."
     (:notice (w:wrap-runs (entry-text entry) width))
     (:error (w:wrap-runs (list (w:text-run (concatenate 'string "error: " (entry-text entry))))
                          width))
-    (:plan (%plan-entry-lines entry width))))
+    (:plan (%plan-entry-lines entry width))
+    ;; H5c-0
+    (:plan-document (%plan-doc-entry-lines entry width))
+    ((:plan-steps :plan-result) (%plan-text-entry-lines entry width))))
 
 (defun %plan-entry-lines (entry width)
-  "H5a: the lines of a :plan ENTRY (see the file header)."
+  "H5a: the lines of a :plan ENTRY, a preview's projection (see the file
+header)."
   (let* ((id (or (entry-id entry) ""))
          (n (length (entry-input entry)))
          (header (w:truncate-runs
-                  (list (w:text-run (format nil "● plan ~a: ~d file~:p changed"
+                  (list (w:text-run (format nil "● preview ~a: ~d file~:p changed"
                                             (subseq id 0 (min 8 (length id))) n)
                                     :bold t))
                   width))
@@ -358,6 +365,25 @@ the others."
     (cons header
           (and (plusp (length text))
                (%prefixed "  " (md:render-diff-lines text (max 1 (- width 2))))))))
+
+(defun %plan-doc-entry-lines (entry width)
+  "H5c-0: a :plan-document ENTRY: a header, then the markdown rendered."
+  (let ((id (or (entry-id entry) "")))
+    (cons (w:truncate-runs
+           (list (w:text-run (format nil "● plan ~a" (subseq id 0 (min 8 (length id)))) :bold t))
+           width)
+          (%prefixed "  " (md:render-markdown (or (entry-text entry) "") (max 1 (- width 2)))))))
+
+(defun %plan-text-entry-lines (entry width)
+  "H5c-0: a :plan-steps or :plan-result ENTRY: its lines as they are (the
+diff part rendered as a diff)."
+  (let* ((text (or (entry-text entry) ""))
+         (split (search (format nil "~%~%diff --git") text)))
+    (append (loop for line in (%text-lines (if split (subseq text 0 split) text))
+                  append (w:wrap-runs line width))
+            (and split
+                 (cons '()
+                       (md:render-diff-lines (subseq text (+ split 2)) (max 1 width)))))))
 
 (defun transcript-lines (entries width &key streaming)
   "→ lines of runs showing ENTRIES at WIDTH (see the file header)."

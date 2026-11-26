@@ -191,10 +191,10 @@
       (ok (equal "mock:user" (settings-model s)) "the bad project file is skipped"))))
 
 (deftest settings-mode-names
-  (ok (equal '(:default :accept-edits :bypass-permissions :plan)
+  (ok (equal '(:default :accept-edits :bypass-permissions :plan :preview)
              (mapcar #'parse-permission-mode +permission-mode-names+)))
   (ok (equal +permission-mode-names+
-             (mapcar #'permission-mode-name '(:default :accept-edits :bypass-permissions :plan))))
+             (mapcar #'permission-mode-name '(:default :accept-edits :bypass-permissions :plan :preview))))
   (ok (null (parse-permission-mode "acceptedits")) "exact case")
   (ok (equal "default" (permission-mode-name nil))))
 

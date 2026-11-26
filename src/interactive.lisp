@@ -76,7 +76,7 @@
 ;;;                 a mode name: STATE-PERMISSION-MODE, (:set-permission-mode
 ;;;                 MODE), :notice "permission mode: <name>"; anything else:
 ;;;                 :error "unknown permission mode \"X\": use default,
-;;;                 acceptEdits, bypassPermissions, plan"
+;;;                 acceptEdits, bypassPermissions, plan, preview"
 ;;;   /exit         as (:quit)
 ;;;   other         :error "unknown command /X: try /help"
 ;;; While busy only /help and /exit run; /clear, /model and /permissions add
@@ -339,7 +339,7 @@
             "  /help                 this help"
             "  /clear                start a new conversation"
             "  /model [MODEL]        show or switch the model (provider or provider:model)"
-            "  /permissions [MODE]   show the rules, or switch to default, acceptEdits, bypassPermissions or plan"
+            "  /permissions [MODE]   show the rules, or switch to default, acceptEdits, bypassPermissions, plan or preview"
             "  /session              show the session id"
             "  /tree                 show the session's turns as a tree"
             "  /fork [AT]            branch off before turn AT (a number or an id from /tree; default the last)"
@@ -348,11 +348,12 @@
             "  /clone                continue in a copy of this session"
             "  /export FILE          write the conversation as markdown, or JSON for a .json FILE"
             "  /steer MESSAGE        send MESSAGE into the running turn (also Ctrl-T)"
-            "  /plan                 show the open plan's projected change (plan mode)"
-            "  /approve              apply the open plan to the project"
-            "  /reject               discard the open plan"
+            "  /plan, /save-plan     show the plan document; save it under docs/plans/"
+            "  /approve [accept|ask|preview]  run the plan, or apply the open preview"
+            "  /reject               reject the plan, or discard the open preview"
+            "  /preview              show the open preview's projected change"
             "  /ps                   the session's units (shell jobs, servers, subagents): logs, search, stop (also Ctrl-P)"
-            "  /mcp [reconnect [N]]  MCP servers, their status and tools; reconnect one or all"
+            "  /mcp [reconnect [N]]  MCP servers: status and tools; reconnect one or all"
             "  /compact [TEXT]       summarize the conversation now (TEXT: what the summary must keep)"
             "  /retry                re-send the last turn after it failed"
             "  /exit                 quit (also Ctrl-D, or Ctrl-C on an empty input)"
@@ -373,9 +374,9 @@ for feedback.")
 
 (defparameter +plan-choices+
   '((:approve "Approve")
-    (:continue "Keep planning")
+    (:continue "Keep working")
     (:reject "Reject"))
-  "H5a: the plan dialog's choices.")
+  "H5a: the preview dialog's choices (H5c-0: \"Keep working\").")
 
 (defparameter +drift-choices+
   '((:rebase "Rebase onto the working copy")
@@ -423,6 +424,15 @@ not taken yet, oldest first.")
          :documentation "NIL, or (:id ID :kind K :root ROOT :changes C :diff TEXT).")
    (plan-prompt :initform nil :accessor state-plan-prompt
                 :documentation "NIL, :PLAN or :DRIFT: the plan dialog to show.")
+   ;; H5c-0
+   (plan-document :initform nil :accessor state-plan-document
+                  :documentation "NIL, or (:id :revision :status :title :steps :path) of the
+session's plan document (src/plan-docs.lisp header, INTERACTIVE).")
+   (plan-document-prompt :initform nil :accessor state-plan-document-prompt
+                         :documentation "NIL, :PLAN-DOC (+PLAN-DOCUMENT-CHOICES+) or :PLAN-RESULT
+(+PLAN-RESULT-CHOICES+).")
+   (plan-document-pending :initform nil :accessor %state-plan-document-pending
+                          :documentation "The dialog to show when the running turn ends.")
    ;; H5b
    (rewind :initform nil :accessor state-rewind
            :documentation "NIL, or (:n N :turn T :parts P :paths PATHS) of the rewind being
@@ -591,17 +601,25 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
     (let ((busy (state-busy-p state)))
       (cond
         ((member command '("/session" "/tree" "/fork" "/rewind" "/clone" "/export" "/steer"
-                                 "/checkpoints")
+                           "/checkpoints")
                  :test #'string=)
          (%session-command state command argument))
+        ;; H5c-0: the plan document first, then the preview (H5a).
+        ((member command '("/plan" "/approve" "/reject" "/save-plan" "/preview") :test #'string=)
+         (%plan-doc-command state command argument))
         ;; H5a
-        ((or (member command '("/plan" "/approve" "/reject") :test #'string=)
-             (and (state-plan state)
-                  (or (string= command "/clear")
-                      (and (string= command "/permissions")
-                           (plusp (length argument))
-                           (not (eq :plan (parse-permission-mode argument)))))))
+        ((and (state-plan state)
+              (or (string= command "/clear")
+                  (and (string= command "/permissions")
+                       (plusp (length argument))
+                       (not (eq :preview (parse-permission-mode argument))))))
          (%plan-command state command argument))
+        ;; H5c-0: a proposed plan waits for /approve or /reject.
+        ((and (string= command "/clear") (not busy) (%plan-doc-waiting-p state))
+         (%add-entry state :kind :error
+                           :text (format nil "plan ~a is waiting: /approve or /reject it first"
+                                         (%plan-doc-id8 state)))
+         '())
         ;; H8d
         ((string= command "/ps") (%units-command state argument))
         ;; H3f
@@ -625,8 +643,8 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
         ((string= command "/exit") (%quit-effects state))
         ((and busy (member command '("/clear" "/model" "/permissions") :test #'string=))
          (%add-entry state :kind :error
-                         :text (format nil "~a is not available while a turn runs (Esc interrupts it)"
-                                       command))
+                           :text (format nil "~a is not available while a turn runs (Esc interrupts it)"
+                                         command))
          '())
         ((string= command "/clear")
          (setf (state-transcript state) '()
@@ -636,7 +654,7 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
          (if (zerop (length argument))
              (progn (%add-entry state :kind :notice
                                       :text (format nil "model: ~a" (state-model state)))
-                    '())
+               '())
              (list (list :set-model argument))))
         ((string= command "/permissions")
          (cond ((zerop (length argument))
@@ -644,8 +662,11 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
                 '())
                ((parse-permission-mode argument)
                 (let* ((mode (parse-permission-mode argument))
-                       ;; H5a: /permissions plan with a plan open stays in plan mode.
-                       (stays (and (state-plan state) (eq mode (state-permission-mode state)))))
+                       ;; H5a: /permissions preview with a preview open stays in preview mode.
+                       ;; H5c-0: with a plan waiting the mode changes in the state;
+                       ;; the program takes it before the next turn.
+                       (stays (or (and (state-plan state) (eq mode (state-permission-mode state)))
+                                  (%plan-doc-waiting-p state))))
                   (setf (state-permission-mode state) mode)
                   (%add-entry state :kind :notice
                                     :text (format nil "permission mode: ~a"
@@ -741,39 +762,52 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
             (ecase kind
               (:submit (%submit state (first args)))
               (:interrupt (cond ((state-approvals state) (%reply state :reject-all nil))
+                                ;; H5c-0
+                                ((state-plan-document-prompt state) (%plan-doc-event state event))
                                 ((state-plan-prompt state) (%plan-event state event))
                                 ((state-rewind-prompt state) (%rewind-event state event))
                                 ((state-busy-p state) (list (list :cancel)))
                                 (t '())))
               (:quit (%quit-effects state))
               (:part (setf (state-retry state) nil)
-               (%core-part state (first args)))
+                     (%core-part state (first args)))
               (:usage (setf (state-usage state) (mapcar #'+ (state-usage state) (first args)))
-               '())
+                      '())
               (:invocation (%core-invocation state (first args)))
               (:turn-end (destructuring-bind (&key reason pending message retryable) args
                            (setf (state-retry state) nil)
-                           (%on-turn-end state reason pending
-                                         (if (and retryable message (eq reason :failed))
-                                             (concatenate 'string message " — /retry to send it again")
-                                             message))))
+                           (prog1 (%on-turn-end state reason pending
+                                                (if (and retryable message (eq reason :failed))
+                                                    (concatenate 'string message " — /retry to send it again")
+                                                    message))
+                             ;; H5c-0: the plan dialog waited for the turn's end.
+                             (let ((pending (and (not (state-busy-p state))
+                                                 (shiftf (%state-plan-document-pending state) nil))))
+                               (when pending
+                                 (setf (state-plan-document-prompt state) pending))))))
               ;; H3f
               ((:retry :compacted :continuation :truncated :context :retry-refused
                 :compact-done)
                (%resilience-event state event))
               (:reply (cond ((state-approvals state) (%reply state (first args) (second args)))
+                            ;; H5c-0
+                            ((state-plan-document-prompt state) (%plan-doc-event state event))
                             ((state-plan-prompt state) (%plan-event state event))
                             ;; H5b
                             ((state-rewind-prompt state) (%rewind-event state event))
                             (t (%reply state (first args) (second args)))))
               (:model-set (setf (state-model state) (first args))
-               (%add-entry state :kind :notice :text (format nil "model: ~a" (first args)))
-               '())
+                          (%add-entry state :kind :notice :text (format nil "model: ~a" (first args)))
+                          '())
               (:notice (%add-entry state :kind :notice :text (first args)) '())
               (:error (%add-entry state :kind :error :text (first args)) '())
               ((:steer :steered :session :session-reset) (%session-event state event))
               ((:plan-opened :plan-projected :plan-drift :plan-closed)
                (%plan-event state event))
+              ;; H5c-0
+              ((:plan-doc-opened :plan-proposed :plan-step :plan-executed :plan-doc-closed
+                :plan-doc-saved :plan-doc-show :plan-execution)
+               (%plan-doc-event state event))
               ;; H5b
               ((:rewind-prompt :rewind-drift :rewound) (%rewind-event state event))
               ;; H4b
@@ -921,8 +955,9 @@ middle, not its end: the project directory name stays (#4)."
     (subseq id 0 (min 8 (length id)))))
 
 (defun %plan-command (state command argument)
-  "Run the plan command COMMAND (\"/plan\" \"/approve\" \"/reject\"), or refuse
-\"/clear\" / \"/permissions ARGUMENT\" while a plan is open. → effects."
+  "Run the preview command COMMAND (\"/preview\" \"/approve\" \"/reject\"), or
+refuse \"/clear\" / \"/permissions ARGUMENT\" while a preview is open. →
+effects."
   (declare (ignore argument))
   (flet ((entry (kind text)
            (%add-entry state :kind kind :text text)
@@ -932,17 +967,19 @@ middle, not its end: the project directory name stays (#4)."
        (entry :error (format nil "~a is not available while a turn runs (Esc interrupts it)"
                              command)))
       ((member command '("/clear" "/permissions") :test #'string=)
-       (entry :error (format nil "plan ~a is open: /approve or /reject it first"
+       (entry :error (format nil "preview ~a is open: /approve or /reject it first"
                              (%plan-id8 state))))
+      ((and (null (state-plan state)) (string= command "/preview"))
+       (entry :notice "no open preview"))
       ((null (state-plan state))
-       (entry (if (string= command "/plan") :notice :error) "no open plan"))
-      ((string= command "/plan") (list (list :show-plan)))
+       (entry :error "no proposed plan or open preview"))
+      ((string= command "/preview") (list (list :show-plan)))
       ((string= command "/approve") (list (list :approve-plan)))
       (t (list (list :reject-plan))))))
 
 (defun %plan-continue-notice (state)
   (%add-entry state :kind :notice
-                    :text (format nil "plan ~a stays open: send a message to keep planning, /plan to review it"
+                    :text (format nil "preview ~a stays open: send a message to keep working, /preview to review it"
                                   (%plan-id8 state)))
   '())
 
@@ -967,20 +1004,20 @@ middle, not its end: the project directory name stays (#4)."
     (%add-entry
      state :kind :notice
      :text (ecase status
-             (:applied (format nil "plan ~a applied: ~d file~:p changed" id8 (length changes)))
-             (:empty (format nil "plan ~a had no changes" id8))
-             (:discarded (format nil "plan ~a discarded" id8))
-             (:rebased (format nil "plan ~a rebased onto the working copy~@[; conflicts in ~{~a~^, ~}~]"
+             (:applied (format nil "preview ~a applied: ~d file~:p changed" id8 (length changes)))
+             (:empty (format nil "preview ~a had no changes" id8))
+             (:discarded (format nil "preview ~a discarded" id8))
+             (:rebased (format nil "preview ~a rebased onto the working copy~@[; conflicts in ~{~a~^, ~}~]"
                                id8 conflicts))
-             (:aborted (format nil "nothing applied; plan ~a stays open" id8))))
+             (:aborted (format nil "nothing applied; preview ~a stays open" id8))))
     (when (member status '(:applied :empty :discarded))
       (setf (state-plan state) nil))
     '()))
 
 (defun %plan-event (state event)
   "Apply EVENT, one of (:plan-opened …) (:plan-projected …) (:plan-drift …)
-(:plan-closed …), or a (:reply …) / (:interrupt) answering the plan prompt.
-→ effects."
+(:plan-closed …), or a (:reply …) / (:interrupt) answering the preview prompt.
+→ effects. (H5a's events; the user sees \"preview\".)"
   (destructuring-bind (kind &rest args) event
     (ecase kind
       (:plan-opened
@@ -988,7 +1025,7 @@ middle, not its end: the project directory name stays (#4)."
          (setf (state-plan state) (list :id id :kind kind :root root :changes '() :diff "")
                (state-plan-prompt state) nil)
          (%add-entry state :kind :notice
-                           :text (format nil "plan ~a (~(~a~)): edits go to a copy of the project in ~a; the project changes only when you approve"
+                           :text (format nil "preview ~a (~(~a~)): edits go to a copy of the project in ~a; the project changes only when you approve"
                                          (%plan-id8 state) kind root))
          '()))
       (:plan-projected
@@ -999,7 +1036,7 @@ middle, not its end: the project directory name stays (#4)."
                        :changes changes :diff (or diff ""))))
          (cond ((null changes)
                 (%add-entry state :kind :notice
-                                  :text (format nil "plan ~a: no changes yet" (%plan-id8 state))))
+                                  :text (format nil "preview ~a: no changes yet" (%plan-id8 state))))
                (t
                 (%add-entry state :kind :plan :id (getf (state-plan state) :id)
                                   :text (or diff "") :input changes)
@@ -1010,7 +1047,7 @@ middle, not its end: the project directory name stays (#4)."
        (destructuring-bind (&key paths) args
          (setf (state-plan-prompt state) :drift)
          (%add-entry state :kind :error
-                           :text (format nil "the working copy changed since plan ~a was opened: ~{~a~^, ~}"
+                           :text (format nil "the working copy changed since preview ~a was opened: ~{~a~^, ~}"
                                          (%plan-id8 state) paths))
          '()))
       (:plan-closed
@@ -1019,6 +1056,178 @@ middle, not its end: the project directory name stays (#4)."
       (:reply (%plan-reply state (first args)))
       (:interrupt
        (%plan-reply state (if (eq :drift (state-plan-prompt state)) :abort :continue))))))
+
+;;; H5c-0: plan documents (src/plan-docs.lisp header, INTERACTIVE).
+
+(defun %plan-doc-id8 (state)
+  (let ((id (or (getf (state-plan-document state) :id) "")))
+    (subseq id 0 (min 8 (length id)))))
+
+(defun %plan-doc-waiting-p (state)
+  "True when the session's plan document is :PROPOSED."
+  (eq :proposed (getf (state-plan-document state) :status)))
+
+(defun %plan-doc-set (state &rest keys)
+  (let ((doc (copy-list (state-plan-document state))))
+    (loop for (k v) on keys by #'cddr do (setf (getf doc k) v))
+    (setf (state-plan-document state) doc)))
+
+(defun %plan-steps-text (steps)
+  (format nil "~{~a~^~%~}"
+          (mapcar (lambda (s)
+                    (format nil "~a ~d. ~a" (%step-mark (getf s :status)) (getf s :index)
+                            (getf s :text)))
+                  steps)))
+
+(defun %plan-doc-dialog (state prompt)
+  "Show PROMPT now when idle, else when the turn ends."
+  (if (state-busy-p state)
+      (setf (%state-plan-document-pending state) prompt)
+      (setf (state-plan-document-prompt state) prompt)))
+
+(defun %plan-doc-revise-notice (state)
+  (%add-entry state :kind :notice
+                    :text (format nil "plan ~a r~d: send your feedback to revise it, /approve to run it"
+                                  (%plan-doc-id8 state)
+                                  (or (getf (state-plan-document state) :revision) 0)))
+  '())
+
+(defun %plan-doc-approve (state mode)
+  "Approve the plan document under MODE: the state's mode switches to it."
+  (setf (state-plan-document-prompt state) nil
+        (state-permission-mode state) mode)
+  (list (list :approve-plan-document :mode mode)))
+
+(defun %plan-doc-reply (state choice)
+  (let ((prompt (shiftf (state-plan-document-prompt state) nil)))
+    (ecase prompt
+      (:plan-doc
+       (ecase choice
+         (:approve-accept (%plan-doc-approve state :accept-edits))
+         (:approve-ask (%plan-doc-approve state :default))
+         (:approve-preview (%plan-doc-approve state :preview))
+         (:edit (list (list :edit-plan-document)))
+         (:revise (%plan-doc-revise-notice state))
+         (:reject (list (list :reject-plan-document)))
+         (:save (list (list :save-plan-document)))))
+      (:plan-result
+       (ecase choice
+         (:keep '())
+         (:rewind-files (list (list :rewind 1 :parts '(:files))))
+         (:save (list (list :save-plan-document))))))))
+
+(defparameter +approve-mode-words+
+  '(("accept" . :accept-edits) ("ask" . :default) ("preview" . :preview))
+  "/approve WORD → the execution mode.")
+
+(defun %plan-doc-command (state command argument)
+  "/plan /approve /reject /save-plan act on the plan document; /approve and
+/reject on the open preview when there is no document to act on; /preview is
+H5a's /plan. → effects."
+  (let* ((doc (state-plan-document state))
+         (status (getf doc :status)))
+    (flet ((entry (kind text)
+             (%add-entry state :kind kind :text text)
+             '()))
+      (cond
+        ((string= command "/preview") (%plan-command state command argument))
+        ((state-busy-p state)
+         (entry :error (format nil "~a is not available while a turn runs (Esc interrupts it)"
+                               command)))
+        ((string= command "/plan")
+         (if (and doc (plusp (or (getf doc :revision) 0)))
+             (list (list :show-plan-document))
+             (entry :notice "no plan yet")))
+        ((string= command "/save-plan")
+         (if (and doc (plusp (or (getf doc :revision) 0)))
+             (list (list :save-plan-document))
+             (entry :notice "no plan yet")))
+        ((and (string= command "/approve") (member status '(:proposed :interrupted)))
+         (let ((mode (if (zerop (length argument))
+                         :accept-edits
+                         (cdr (assoc argument +approve-mode-words+ :test #'string-equal)))))
+           (if mode
+               (%plan-doc-approve state mode)
+               (entry :error "usage: /approve [accept|ask|preview]"))))
+        ((and (string= command "/reject") (member status '(:drafting :proposed)))
+         (setf (state-plan-document-prompt state) nil)
+         (list (list :reject-plan-document)))
+        (t (%plan-command state command argument))))))
+
+(defun %plan-doc-event (state event)
+  "Apply a plan document EVENT (see the file header of src/plan-docs.lisp,
+INTERACTIVE). → effects."
+  (destructuring-bind (kind &rest args) event
+    (ecase kind
+      (:plan-doc-opened
+       (destructuring-bind (&key id path area) args
+         (setf (state-plan-document state)
+               (list :id id :revision 0 :status :drafting :title nil :steps '() :path path))
+         (%add-entry state :kind :notice
+                           :text (format nil "plan ~a: exploring in a copy of the project (~a); nothing there is ever applied"
+                                         (%plan-doc-id8 state) area))
+         '()))
+      (:plan-proposed
+       (destructuring-bind (&key id revision title markdown steps) args
+         (%plan-doc-set state :id id :revision revision :status :proposed :title title
+                              :steps (copy-tree steps))
+         (%add-entry state :kind :plan-document :id id :text (or markdown ""))
+         (%plan-doc-dialog state :plan-doc)
+         '()))
+      (:plan-step
+       (destructuring-bind (&key id steps) args
+         (%plan-doc-set state :steps (copy-tree steps))
+         (let ((entry (find-if (lambda (e) (and (eq :plan-steps (entry-kind e)) (equal id (entry-id e))))
+                               (state-transcript state))))
+           (if entry
+               (setf (entry-text entry) (%plan-steps-text steps))
+               (%add-entry state :kind :plan-steps :id id :text (%plan-steps-text steps))))
+         '()))
+      (:plan-executed
+       ;; PREVIEW: an execution in preview shows the preview's dialog instead.
+       (destructuring-bind (&key id status lines diff preview) args
+         (%plan-doc-set state :id id :status status)
+         (%add-entry state :kind :plan-result :id id
+                           :text (format nil "~{~a~^~%~}~@[~%~%~a~]" lines
+                                         (and diff (plusp (length diff)) diff)))
+         (unless preview
+           (%plan-doc-dialog state :plan-result))
+         '()))
+      (:plan-doc-closed
+       (destructuring-bind (&key id status) args
+         (declare (ignore id))
+         (let ((id8 (%plan-doc-id8 state)))
+           (%add-entry state :kind :notice
+                             :text (ecase status
+                                     (:rejected (format nil "plan ~a rejected" id8))
+                                     (:executed (format nil "plan ~a done" id8))
+                                     (:interrupted (format nil "plan ~a stopped before its end: /approve runs the remaining steps" id8))))
+           (if (eq status :interrupted)
+               (%plan-doc-set state :status :interrupted)
+               (setf (state-plan-document state) nil
+                     (state-plan-document-prompt state) nil)))
+         '()))
+      (:plan-doc-saved
+       (destructuring-bind (&key path) args
+         (%add-entry state :kind :notice
+                           :text (format nil "plan ~a saved to ~a" (%plan-doc-id8 state) path))
+         (when (%plan-doc-waiting-p state)
+           (%plan-doc-dialog state :plan-doc))
+         '()))
+      (:plan-doc-show
+       (%plan-doc-dialog state :plan-doc)
+       '())
+      (:plan-execution
+       ;; The execution turn starts: its message, busy.
+       (destructuring-bind (&key text) args
+         (%add-entry state :kind :user :text text)
+         (setf (state-busy-p state) t)
+         '()))
+      (:reply (%plan-doc-reply state (first args)))
+      (:interrupt
+       (if (eq :plan-doc (state-plan-document-prompt state))
+           (%plan-doc-reply state :revise)
+           (%plan-doc-reply state :keep))))))
 
 ;;; H5b: rewind (see the "H5b" part of the file header).
 
@@ -1058,7 +1267,7 @@ its one word is a PART."
                               ((string= part "files") (list :files))
                               (t (copy-list +rewind-parts+)))))
              (if (and (member :files parts) (state-plan state))
-                 (fail (format nil "plan ~a is open: /approve or /reject it first"
+                 (fail (format nil "preview ~a is open: /approve or /reject it first"
                                (%plan-id8 state)))
                  (progn
                    (setf (state-rewind state) (list :n n :parts parts))

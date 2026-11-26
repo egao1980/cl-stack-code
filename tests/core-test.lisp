@@ -273,7 +273,7 @@
       (ok (null fx))
       (ok (eq :default (state-permission-mode s)))
       (ok (eq :error (entry-kind (last-entry s))))
-      (ok (equal "unknown permission mode \"yolo\": use default, acceptEdits, bypassPermissions, plan"
+      (ok (equal "unknown permission mode \"yolo\": use default, acceptEdits, bypassPermissions, plan, preview"
                  (entry-text (last-entry s))))))
   (testing "refused while busy"
     (let ((s (busy-state)))

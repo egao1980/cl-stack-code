@@ -9,10 +9,10 @@
   "Feedback the model gets when an ask is refused in headless mode.")
 
 (defparameter +plan-mode-feedback+
-  "You are in plan mode: your edits and shell commands run in a copy of the project (the working directory above), not in the project itself. Make the change there and run the tests there; nothing reaches the project until the user approves the projected change."
-  "H5a: the system prompt section of a plan run (ASSEMBLE-SYSTEM-PROMPT :PLAN).
-Until 0.3 it was the feedback of plan mode's read-only policy, which H5a
-removed.")
+  "You are in preview mode: your edits and shell commands run in a copy of the project (the working directory above), not in the project itself. Make the change there and run the tests there; nothing reaches the project until the user approves the projected change."
+  "H5a: the system prompt section of a preview run (ASSEMBLE-SYSTEM-PROMPT with
+an H5a plan). H5c-0: the same text as +PREVIEW-MODE-FEEDBACK+, its preferred
+name; the Lisp name stays until the H5a API rename.")
 
 (defparameter +explicit-resource-prefixes+
   '("path:" "bash:" "program:" "cd:" "read:" "write:" "job:")
@@ -139,14 +139,16 @@ parentheses; empty pieces dropped."
     (case (or mode :default)
       (:default (rules +edit-tool-names+ :ask))
       (:accept-edits (rules +edit-tool-names+ :allow))
-      ;; H5a: plan mode edits the area, so its edits are allowed as in
-      ;; acceptEdits. 0.4.1 (the user's decision): the shell is allowed too,
-      ;; rooted at the area but NOT confined to it until R4d; these are the
-      ;; lowest rules, so ask and deny rules from settings or flags still win.
-      ;; R4d-4b: the shell allows hold while the plan's sandbox confines
-      ;; (PLAN-SHELL-ALLOWED); without it bash asks again, as in 0.4.0.
-      (:plan (append (rules +edit-tool-names+ :allow)
-                     (and plan-shell-allowed (rules +shell-tool-names+ :allow))))
+      ;; H5a: preview mode (H5a's plan mode) edits the area, so its edits are
+      ;; allowed as in acceptEdits. 0.4.1 (the user's decision): the shell is
+      ;; allowed too, rooted at the area; these are the lowest rules, so ask
+      ;; and deny rules from settings or flags still win. R4d-4b: the shell
+      ;; allows hold while the area's sandbox confines (PLAN-SHELL-ALLOWED);
+      ;; without it bash asks again, as in 0.4.0. H5c-0: plan mode has the
+      ;; same base rules; its policy (PLAN-MODE-TOOLS) confines the edits to
+      ;; .plan-scratch/.
+      ((:plan :preview) (append (rules +edit-tool-names+ :allow)
+                                (and plan-shell-allowed (rules +shell-tool-names+ :allow))))
       (t '()))))
 
 (defun settings-permission-rules (settings &key (plan-shell-allowed t))
@@ -160,11 +162,13 @@ drops plan mode's bash and job_input allows (no sandbox: they ask)."
           (settings-deny settings)))
 
 (defun settings-permission-policy (settings)
-  "The run's :permission-policy for SETTINGS. NIL in every mode since H5a:
-plan mode no longer denies edits and the shell, it runs them in the plan's
-area (src/plans.lisp). Kept as the hook for a mode that needs a policy."
-  (declare (ignore settings))
-  nil)
+  "The run's :permission-policy for SETTINGS. H5c-0: in plan mode
+PLAN-MODE-PERMISSION-POLICY (edits only under .plan-scratch/, no update_plan);
+NIL in every other mode (preview mode runs edits and the shell in its area,
+src/plans.lisp)."
+  (and settings
+       (eq :plan (settings-permission-mode settings))
+       (plan-mode-permission-policy)))
 
 (defun hidden-tool-names (settings names)
   "The members of NAMES (in order) that a deny rule with resource \"*\" in

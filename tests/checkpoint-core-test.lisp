@@ -48,12 +48,12 @@
     (ok (null (effects s '(:submit "/rewind files"))))
     (ok (equal "/rewind is not available while a turn runs (Esc interrupts it)"
                (entry-text (last-entry s)))))
-  (let ((s (rewind-state :permission-mode :plan)))
+  (let ((s (rewind-state :permission-mode :preview)))
     (feed s '(:plan-opened :id "0123456789abcdef0123456789abcdef" :kind :copy :root "/tmp/area/"))
     (ok (null (effects s '(:submit "/rewind files"))))
-    (ok (equal "plan 01234567 is open: /approve or /reject it first" (entry-text (last-entry s))))
+    (ok (equal "preview 01234567 is open: /approve or /reject it first" (entry-text (last-entry s))))
     (ok (equal '((:rewind 1 :parts (:conversation))) (effects s '(:submit "/rewind conversation")))
-        "the conversation alone is fine with a plan open")))
+        "the conversation alone is fine with a preview open")))
 
 (deftest core-rewind-prompt
   (let ((s (rewind-state)))
