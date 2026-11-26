@@ -692,7 +692,7 @@ defaults to USER-DATA-DIRECTORY). Given: PLANS-DIRECTORY's rule."
   (forbid :id "no-update-plan" :action "update_plan" :when (mode plan)
           :feedback "update_plan marks steps while an approved plan runs; in plan mode, call propose_plan."))
 
-;;; Stubs. Every function below signals %H5C0-PENDING until implemented.
+;;; The implementation (%H5C0-PENDING, given, is no longer called).
 
 (defclass plan-tools ()
   ((document :initarg :document :reader plan-tools-document)

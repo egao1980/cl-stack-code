@@ -122,6 +122,16 @@
 ;;;     "cancelled" (RESULT-STOP-REASON of the interrupted result), and a
 ;;;     permission request still pending is answered cancelled by the
 ;;;     client (acp-protocol).
+;;;   H5c-0 (src/plan-docs.lisp header, "ACP"): a prompt whose turn proposed
+;;;     a plan (propose_plan) asks once more after its plan update: a
+;;;     session/request_permission whose toolCall is the propose_plan call
+;;;     (kind "switch_mode", the markdown as content) with
+;;;     +ACP-PLAN-APPROVAL-OPTIONS+. An execution mode sends a
+;;;     current_mode_update and runs CLIENT-APPROVE-PLAN-DOCUMENT's execution
+;;;     turn in the same prompt (its stop reason answers); "plan" ends the
+;;;     prompt; "reject" rejects (an empty plan update). session/set_mode out
+;;;     of plan with a :PROPOSED document approves it (no turn); the next
+;;;     session/prompt executes it, its text as extra instructions.
 ;;;
 ;;; Client capabilities. When the client advertises fs.readTextFile /
 ;;; fs.writeTextFile, the session's file tools read / write files through
@@ -158,7 +168,7 @@
   (context-sent nil))  ; #41: the session-context update went out
 
 (defparameter +%mode-titles+
-  '("Default" "Accept edits" "Bypass permissions" "Plan")
+  '("Default" "Accept edits" "Bypass permissions" "Plan" "Preview")
   "The SESSION-MODE names, in +ACP-MODE-IDS+ order.")
 
 (defun make-code-acp-agent (&rest client-args)
@@ -481,15 +491,23 @@ hex digits: NORMALIZE-SESSION-ID leaves it as it is)."
   (with-sdk-errors ()
     (let* ((id (acp:session-id request))
            (as (%find-asess agent id))
+           (session (%asess-session as))
            (mode-id (acp:mode-id request))
            (mode (mode-id-permission-mode mode-id)))
       (unless mode
         (error 'acp:acp-invalid-params
                :message (format nil "Unknown mode ~s: use one of ~{~a~^, ~}" mode-id +acp-mode-ids+)))
-      (code:client-set-permission-mode (%asess-session as) mode)
-      (acp:acp-send-update acp:*acp-remote* (courier-session-id (%asess-courier as))
-                           (acp:make-acp 'acp:update-current-mode-update
-                                         :current-mode-id (permission-mode-mode-id mode)))
+      ;; H5c-0: out of plan with a plan proposed approves it under MODE (no
+      ;; turn here: the next session/prompt executes it).
+      (unless (and (eq :plan (code:code-session-permission-mode session))
+                   (member mode code:+plan-execution-modes+)
+                   (%plan-status-p session "proposed")
+                   (handler-case
+                       (progn (code:client-approve-plan-document session :mode mode :execute nil)
+                         t)
+                     (code:turn-busy () nil)))
+        (code:client-set-permission-mode session mode))
+      (%send-mode-update as (permission-mode-mode-id mode))
       (acp:make-acp 'acp:set-session-mode-response))))
 
 (defmethod acp:acp-cancel ((agent code-acp-agent) notification)
@@ -621,11 +639,15 @@ Calls a previous answer resolved already (:always, :reject-all) ask nothing."
             (code:approval-not-found () nil)))))))
 
 (defun %pump (agent as)
-  "Pump AS's courier on this (the prompt's) thread until the turn's result. → it."
+  "Pump AS's courier on this (the prompt's) thread until the turn's result.
+→ (values result proposal): PROPOSAL is the propose_plan call id when the
+turn proposed a plan (its \"plan\" \"proposed\" event), else NIL."
   (let ((courier (%asess-courier as))
         (client (code-acp-agent-client agent))
         (answered (make-hash-table :test 'equal))
-        (diffs (make-hash-table :test 'equal)))
+        (diffs (make-hash-table :test 'equal))
+        (propose-id nil)
+        (proposed nil))
     (loop
       (let ((item (courier-take courier 1)))
         (cond
@@ -635,9 +657,104 @@ Calls a previous answer resolved already (:always, :reject-all) ask nothing."
           ((eq :call (first item)) (courier-run-call courier item))
           (t (destructuring-bind (event diff) (rest item)
                (let ((type (code:event-type event)))
-                 (cond ((equal type "result") (return event))
+                 (when (and (equal type "tool_use")
+                            (equal "propose_plan" (code:event-value event "name")))
+                   (setf propose-id (code:event-value event "id")))
+                 (when (and (equal type "plan")
+                            (equal "proposed" (code:event-value event "subtype")))
+                   (setf proposed t))
+                 (cond ((equal type "result")
+                        (return (values event (and proposed (or propose-id "propose_plan")))))
                        ((equal type "approval_request") (%ask as event answered diffs))
                        (t (%send-event as event diff diffs)))))))))))
+
+(defun %courier-on-event (as)
+  "A turn's ON-EVENT (loop thread): each event, with its local diff, to AS's
+courier for the prompt thread."
+  (let ((courier (%asess-courier as)))
+    (lambda (s event)
+      (declare (ignore s))
+      (courier-post courier
+                    (list :event event
+                          ;; a diff is a nicety: never lose the event
+                          (handler-case (%local-diff as event)
+                            (error () nil)))))))
+
+(defun %run-turn (agent as start)
+  "START (a function of the turn's ON-EVENT) starts one SDK turn; pump it on
+this thread until its result. → (values result proposal), as %PUMP."
+  (let ((session (%asess-session as))
+        (result nil) (proposal nil) (started nil))
+    (unwind-protect
+        (progn
+          (funcall start (%courier-on-event as))
+          (setf started t)
+          (multiple-value-setq (result proposal) (%pump agent as)))
+      ;; Left without the result (an error, $/cancel_request): the turn
+      ;; must not run on unseen.
+      (when (and started (null result))
+        (handler-case (code:client-interrupt session)
+          (error () nil))))
+    (%rekey agent as (code:event-value result "session_id"))
+    (values result proposal)))
+
+(defun %plan-status-p (session status)
+  "H5c-0: SESSION has a plan document whose status is STATUS (a string)."
+  (let ((doc (handler-case (code:client-plan-document session)
+               (error () nil))))
+    (and doc (equal status (code:event-value doc "status")))))
+
+(defun %send-mode-update (as mode-id)
+  (acp:acp-send-update acp:*acp-remote* (courier-session-id (%asess-courier as))
+                       (acp:make-acp 'acp:update-current-mode-update :current-mode-id mode-id)))
+
+(defun %plan-approval-options ()
+  "+ACP-PLAN-APPROVAL-OPTIONS+ (optionId kind name) as ACP-ASK-PERMISSION's
+(option-id name kind)."
+  (mapcar (lambda (option)
+            (destructuring-bind (id kind name) option
+              (list id name kind)))
+          code:+acp-plan-approval-options+))
+
+(defun %plan-approval (agent as call-id)
+  "H5c-0: the prompt proposed a plan (CALL-ID the propose_plan call): one
+session/request_permission with +ACP-PLAN-APPROVAL-OPTIONS+. An execution
+mode runs the execution turn here (→ its result); \"plan\" (keep planning),
+\"reject\" or a cancelled outcome → NIL (the prompt ends)."
+  (let* ((session (%asess-session as))
+         (sid (courier-session-id (%asess-courier as)))
+         (doc (handler-case (code:client-plan-document session)
+                (error () nil))))
+    (when (and doc (equal "proposed" (code:event-value doc "status")))
+      (let* ((title (code:event-value doc "title"))
+             (markdown (code:event-value doc "markdown"))
+             (tool-call (acp:make-acp 'acp:tool-call-update
+                                      :tool-call-id call-id
+                                      :title (if (stringp title)
+                                                 (format nil "Plan: ~a" title)
+                                                 "Plan")
+                                      :kind "switch_mode"
+                                      :status "pending"
+                                      :content (%result-text-content
+                                                (if (stringp markdown) markdown "")))))
+        (multiple-value-bind (kind option-id)
+            (acp:acp-ask-permission acp:*acp-remote* sid tool-call (%plan-approval-options))
+          (declare (ignore kind))
+          (let ((mode (and (stringp option-id) (mode-id-permission-mode option-id))))
+            (cond
+              ((member mode code:+plan-execution-modes+)
+               (%send-mode-update as option-id)
+               (values (%run-turn agent as
+                                  (lambda (on-event)
+                                    (nth-value 1 (code:client-approve-plan-document
+                                                  session :mode mode :on-event on-event))))))
+              ((equal option-id "reject")
+               (code:client-reject-plan-document session)
+               (acp:acp-send-update acp:*acp-remote* sid
+                                    (acp:make-acp 'acp:update-plan :entries (vector)))
+               nil)
+              ;; "plan": keep planning (the next prompt is feedback); cancelled.
+              (t nil))))))))
 
 (defmethod acp:acp-prompt ((agent code-acp-agent) request)
   (with-sdk-errors ()
@@ -646,36 +763,34 @@ Calls a previous answer resolved already (:always, :reject-all) ask nothing."
            (courier (%asess-courier as)))
       (multiple-value-bind (text mentions) (%prompt-input session (%slot request 'acp:prompt))
         (courier-claim courier)
-        ;; #41: once per session, what it found (instructions, skills, rules)
-        (unless (%asess-context-sent as)
-          (setf (%asess-context-sent as) t)
-          (handler-case
-              (dolist (update (session-init-updates (code:code-session-init session)
-                                                    :cwd (code:code-session-cwd session)))
-                (acp:acp-send-update acp:*acp-remote* (courier-session-id courier) update))
-            (error () nil)))
-        (let ((result nil) (started nil))
+        (let ((result nil))
           (unwind-protect
-               (progn
-                 (code:client-turn session text
-                                   :mentions mentions
-                                   :on-event (lambda (s event)
-                                               (declare (ignore s))
-                                               (courier-post courier
-                                                             (list :event event
-                                                                   ;; a diff is a nicety:
-                                                                   ;; never lose the event
-                                                                   (handler-case (%local-diff as event)
-                                                                     (error () nil))))))
-                 (setf started t
-                       result (%pump agent as)))
-            (courier-release courier)
-            ;; Left without the result (an error, $/cancel_request): the turn
-            ;; must not run on unseen.
-            (when (and started (null result))
-              (handler-case (code:client-interrupt session)
-                (error () nil))))
-          (%rekey agent as (code:event-value result "session_id"))
+              (progn
+                ;; #41: once per session, what it found (instructions, skills, rules)
+                (unless (%asess-context-sent as)
+                  (setf (%asess-context-sent as) t)
+                  (handler-case
+                      (dolist (update (session-init-updates (code:code-session-init session)
+                                                            :cwd (code:code-session-cwd session)))
+                        (acp:acp-send-update acp:*acp-remote* (courier-session-id courier) update))
+                    (error () nil)))
+                (if (%plan-status-p session "approved")
+                    ;; H5c-0: session/set_mode approved the plan; this prompt
+                    ;; executes it, its text as extra instructions.
+                    (setf result (%run-turn agent as
+                                            (lambda (on-event)
+                                              (nth-value 1 (code:client-approve-plan-document
+                                                            session :prompt text :on-event on-event)))))
+                    (multiple-value-bind (first proposal)
+                        (%run-turn agent as
+                                   (lambda (on-event)
+                                     (code:client-turn session text :mentions mentions
+                                                                    :on-event on-event)))
+                      (setf result first)
+                      (when (and proposal (equal "end_turn" (result-stop-reason first)))
+                        (let ((execution (%plan-approval agent as proposal)))
+                          (when execution (setf result execution)))))))
+            (courier-release courier))
           (let ((reason (result-stop-reason result)))
             (if reason
                 (acp:make-acp 'acp:prompt-response :stop-reason reason)

@@ -227,18 +227,26 @@
 ;;;   (RESUME-AI-AGENT-ASYNC). A rule save that fails (SETTINGS-ERROR) still
 ;;;   approves the call once, as in the TUI.
 ;;;
-;;; Plans (H5a), checkpoints and rewinds (H5b): -p's objects
-;;;   CLIENT-APPROVE-PLAN session &key (ON-DRIFT :ABORT) → the plan object
-;;;     --apply writes: {"type":"plan","subtype":"applied","plan_id",
+;;; Previews (H5a; H5c-0 renamed plan → preview), checkpoints and rewinds
+;;; (H5b): -p's objects. Plan documents (H5c-0): src/plan-docs.lisp, "SDK AND
+;;; RPC".
+;;;   CLIENT-APPLY-PREVIEW session &key (ON-DRIFT :ABORT) (the preferred name;
+;;;     CLIENT-APPROVE-PLAN is H5a's, kept) → the preview object --apply
+;;;     writes: {"type":"preview","subtype":"applied","preview_id",
 ;;;     "changes"}, "rebased" (conflicts) or "drift" (paths; nothing written).
 ;;;     It is delivered as an event too. APPROVE-PLAN :CHECKPOINTER with
 ;;;     PLAN-DRIFT answered per ON-DRIFT (:ABORT, :REBASE, :OVERWRITE), then
 ;;;     RECORD-PLAN-CHECKPOINTS with the session's head (as the TUI). Once
-;;;     applied the plan is closed; the next plan-mode turn opens a new one.
-;;;     Busy → TURN-BUSY. No open plan → PLAN-NOT-FOUND "session S has no open
-;;;     plan".
-;;;   CLIENT-REJECT-PLAN session → {"type":"plan","subtype":"discarded",
-;;;     "plan_id"} (also an event). Errors as approving.
+;;;     applied the preview is closed; the next preview-mode turn opens a new
+;;;     one. Busy → TURN-BUSY. No open preview → PLAN-NOT-FOUND "session S has
+;;;     no open preview".
+;;;   CLIENT-REJECT-PREVIEW session (CLIENT-REJECT-PLAN, H5a's name) →
+;;;     {"type":"preview","subtype":"discarded","preview_id"} (also an
+;;;     event). Errors as applying.
+;;;   CLIENT-APPROVE-PLAN-DOCUMENT also takes ON-EVENT (the execution turn's,
+;;;     as CLIENT-TURN's) and EXECUTE (NIL: approve only, no turn; a later
+;;;     call on the :APPROVED document starts its execution under the
+;;;     approved mode; ACP-2's session/set_mode out of plan).
 ;;;   CLIENT-CHECKPOINTS session → a list, newest first, of {"id","ordinal",
 ;;;     "reason" ("before" "turn" "plan_before" "plan_after" "rewind"),"turn",
 ;;;     "files_kind" ("copy" "git" "jj"),"message","recorded_at" (unix
@@ -1364,27 +1372,39 @@ else NIL."
       (setf (agent:ai-agent-permissions agent) (%agent-permissions settings)))
     mode))
 
-(defun client-approve-plan-document (session &key (mode :accept-edits) prompt on-drift)
+(defun client-approve-plan-document (session &key (mode :accept-edits) prompt on-drift
+                                             on-event (execute t))
   "Approve the session's plan document under MODE and start its execution
-turn. → (values object turn)."
+turn. → (values object turn). ON-EVENT is the turn's, as CLIENT-TURN's.
+EXECUTE NIL only approves (→ (values object nil)); a document approved so
+waits for its execution turn, which a later call starts under the approved
+mode (ACP-2: session/set_mode out of plan, then session/prompt)."
   (declare (ignore on-drift))
   (%on-client-loop ((code-session-client session))
     (let ((st (%live session)))
       (%check-idle session st)
-      (let ((doc (%session-plan-doc-of session st)))
-        (approve-plan-document doc :mode mode)
-        (setf (%s-doc-area st) nil
-              (%s-exec-doc st) doc
-              (%s-exec-tools st) (make-plan-tools doc :phase :execute))
-        (%sdk-set-mode session st mode)
-        (unless (eq mode :preview)
-          (let ((store (p:make-memory-snapshot-store)))
-            (setf (%s-exec-snapshots st) store
-                  (%s-exec-before st) (%execution-snapshot (%s-project-dir st) store))))
-        (let* ((object (plan-document-object doc))
-               (turn (%start-turn session (plan-execution-prompt doc prompt) nil nil
-                                  :approved-doc doc)))
-          (values object turn))))))
+      (let* ((doc (%session-plan-doc-of session st))
+             (waiting (eq :approved (plan-document-status doc)))
+             (mode (if waiting (or (plan-document-execution-mode doc) mode) mode)))
+        (unless waiting
+          (approve-plan-document doc :mode mode))
+        (cond
+          ((not execute)
+           (%sdk-set-mode session st mode)
+           (values (plan-document-object doc) nil))
+          (t
+           (setf (%s-doc-area st) nil
+                 (%s-exec-doc st) doc
+                 (%s-exec-tools st) (make-plan-tools doc :phase :execute))
+           (%sdk-set-mode session st mode)
+           (unless (eq mode :preview)
+             (let ((store (p:make-memory-snapshot-store)))
+               (setf (%s-exec-snapshots st) store
+                     (%s-exec-before st) (%execution-snapshot (%s-project-dir st) store))))
+           (let* ((object (plan-document-object doc))
+                  (turn (%start-turn session (plan-execution-prompt doc prompt) nil on-event
+                                     :approved-doc doc)))
+             (values object turn))))))))
 
 (defun client-reject-plan-document (session)
   "Reject the session's plan document. → its object."

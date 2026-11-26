@@ -6,10 +6,10 @@
 ;;; Session modes (session/new's and session/load's "modes", session/set_mode)
 ;;;   +ACP-MODE-IDS+ = CL-STACK-CODE:+PERMISSION-MODE-NAMES+: the ACP mode
 ;;;   ids ARE the permission mode names ("default" "acceptEdits"
-;;;   "bypassPermissions" "plan"), in that order; a SESSION-MODE's name is a
-;;;   human title, its id the mode name.
+;;;   "bypassPermissions" "plan" "preview"), in that order; a SESSION-MODE's
+;;;   name is a human title, its id the mode name.
 ;;;   MODE-ID-PERMISSION-MODE id → :DEFAULT :ACCEPT-EDITS :BYPASS-PERMISSIONS
-;;;     :PLAN, or NIL for any other string (exact case).
+;;;     :PLAN :PREVIEW, or NIL for any other string (exact case).
 ;;;   PERMISSION-MODE-MODE-ID mode → the id; NIL means :DEFAULT. Another
 ;;;     keyword → CODE-USAGE-ERROR (as PERMISSION-MODE-NAME).
 ;;;
@@ -62,14 +62,20 @@
 ;;;                               "completed" when status is "done" and not
 ;;;                               is_error, else "failed"; content one CONTENT
 ;;;                               whose TEXT-CONTENT is the result text
-;;;     plan (H5a plan objects) → UPDATE-PLAN: subtype "projected": one
-;;;                               PLAN-ENTRY per change, content "<kind>
-;;;                               <path>" (e.g. "modified a.txt"), priority
-;;;                               "medium", status "pending"; "applied": the
-;;;                               same entries with status "completed";
-;;;                               "discarded": no entries. Other subtypes
-;;;                               ("opened", "reopened", "drift", "rebased")
-;;;                               → no update
+;;;     plan (H5c-0 plan documents)
+;;;                             → UPDATE-PLAN: subtype "proposed": one
+;;;                               PLAN-ENTRY per element of "steps", content
+;;;                               its text, priority "medium", status
+;;;                               "pending"; "step": the whole "steps" list
+;;;                               again (ACP replaces it), status "pending" /
+;;;                               "in_progress" / "completed" (a step's
+;;;                               "done"); "rejected": no entries. H5a's
+;;;                               subtypes, should a "plan" event carry them,
+;;;                               map as in 0.14 ("projected": "<kind>
+;;;                               <path>" pending; "applied": completed;
+;;;                               "discarded": no entries). Other subtypes
+;;;                               ("opened", "approved", "executed", …) → none
+;;;     preview (H5a's events, renamed) → no update
 ;;;     instructions {files: [{path, kind}]} (#41)
 ;;;                             → per file an UPDATE-TOOL-CALL, id
 ;;;                               "instructions:<path>", kind "read", status
@@ -169,7 +175,26 @@
 (defun %result-text-content (text)
   (vector (acp:make-acp 'acp:content :content (%text-content text))))
 
-(defun %plan-entries (event status)
+(defun %plan-entry-status (status)
+  "A plan step status (\"pending\" \"in_progress\" \"done\") → the ACP one."
+  (cond ((equal status "done") "completed")
+        ((equal status "in_progress") "in_progress")
+        (t "pending")))
+
+(defun %plan-entries (event &optional status)
+  "H5c-0: one PLAN-ENTRY per step of a plan document event's \"steps\", with
+STATUS, else the step's own status mapped to ACP's."
+  (map 'vector (lambda (step)
+                 (acp:make-acp 'acp:plan-entry
+                               :content (or (code:event-value step "text") "")
+                               :priority "medium"
+                               :status (or status
+                                           (%plan-entry-status (code:event-value step "status")))))
+       (let ((steps (code:event-value event "steps")))
+         (if (typep steps 'sequence) steps #()))))
+
+(defun %change-entries (event status)
+  "H5a: one PLAN-ENTRY per change of EVENT, \"<kind> <path>\", with STATUS."
   (map 'vector (lambda (change)
                  (acp:make-acp 'acp:plan-entry
                                :content (format nil "~a ~a"
@@ -209,13 +234,20 @@
                                      (let ((c (code:event-value event "content")))
                                        (if (stringp c) c (princ-to-string (or c ""))))))))
       ((equal type "plan")
+       ;; H5c-0: plan document events. The core sends H5a's preview events as
+       ;; "preview" now (no update); a "plan" event of H5a's subtypes still maps
+       ;; as in 0.14 (the mapping table is pure).
        (let ((subtype (code:event-value event "subtype")))
-         (cond ((equal subtype "projected")
+         (cond ((equal subtype "proposed")
                 (list (acp:make-acp 'acp:update-plan :entries (%plan-entries event "pending"))))
-               ((equal subtype "applied")
-                (list (acp:make-acp 'acp:update-plan :entries (%plan-entries event "completed"))))
-               ((equal subtype "discarded")
+               ((equal subtype "step")
+                (list (acp:make-acp 'acp:update-plan :entries (%plan-entries event))))
+               ((member subtype '("rejected" "discarded") :test #'equal)
                 (list (acp:make-acp 'acp:update-plan :entries (vector))))
+               ((equal subtype "projected")
+                (list (acp:make-acp 'acp:update-plan :entries (%change-entries event "pending"))))
+               ((equal subtype "applied")
+                (list (acp:make-acp 'acp:update-plan :entries (%change-entries event "completed"))))
                (t '()))))
       ((equal type "instructions")
        ;; #41: a lazily loaded AGENTS.md or path-scoped rule, as a finished

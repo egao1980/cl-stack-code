@@ -42,7 +42,8 @@
 ;;;                                                  (+RPC-PROTOCOL-VERSION+),"methods","events"
 ;;;                                                  (+EVENT-TYPES+)}. Optional: any method works first.
 ;;;   session/new      {cwd?, model?, permission_mode? (a mode name: "default"
-;;;                    "acceptEdits" "bypassPermissions" "plan"), session_id?}
+;;;                    "acceptEdits" "bypassPermissions" "plan" "preview"),
+;;;                    session_id?}
 ;;;                                               → the init object (CLIENT-NEW-SESSION)
 ;;;   session/resume   {session_id (id, prefix or UUID) | last: true, cwd?,
 ;;;                    model?, permission_mode?, fork?, new_session_id?}
@@ -58,9 +59,24 @@
 ;;;   turn/interrupt   {session_id}               → {"interrupted": true|false}
 ;;;   approval/respond {session_id, id, decision ("once" "always" "reject"
 ;;;                    "reject_all"), feedback?}  → {"resolved": [ids]}
-;;;   plan/approve     {session_id, on_drift? ("abort" "rebase" "overwrite")}
-;;;                                               → the plan object
-;;;   plan/reject      {session_id}               → the plan object
+;;;   plan/approve     {session_id, mode? ("default" "acceptEdits"
+;;;                    "bypassPermissions" "preview"), prompt?, on_drift?}
+;;;                                               → {"plan", "session_id"}: the plan document
+;;;                                                  approved, its execution turn started
+;;;                                                  (H5c-0). On an open preview: preview/apply
+;;;                                                  (0.15.x alias, deprecated; gone in 0.16.0)
+;;;   plan/reject      {session_id}               → {"plan"} (the document rejected); on an open
+;;;                                                  preview: preview/reject (alias, deprecated)
+;;;   plan/revise      {session_id, feedback}     → {"session_id"}: the plan turn revising it
+;;;   plan/get         {session_id}               → {"plan": object with "markdown" | null}
+;;;   plan/update      {session_id, markdown}     → {"plan"} (a :USER revision; a bad format
+;;;                                                  → -32602 with "missing")
+;;;   plan/save        {session_id, directory?}   → {"path"}
+;;;                    Plan document errors: PLAN-DOCUMENT-NOT-FOUND -32030,
+;;;                    PLAN-DOCUMENT-STATE-ERROR -32031 (data "plan_id", "status")
+;;;   preview/apply    {session_id, on_drift? ("abort" "rebase" "overwrite")}
+;;;                                               → the preview object (H5a's plan/approve)
+;;;   preview/reject   {session_id}               → the preview object (H5a's plan/reject)
 ;;;   checkpoint/list  {session_id}               → {"checkpoints": [objects]}
 ;;;   rewind           {session_id, turn (integer or string), mode? ("both"
 ;;;                    "conversation" "files"), on_drift?}
