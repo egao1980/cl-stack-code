@@ -90,12 +90,17 @@
         (steering (copy-list (record-steering record)))
         (tools (make-hash-table :test 'equal))
         (first-user t))
-    (push (make-entry :kind :user :text (record-prompt record)) entries)
+    ;; H3f: an idle /compact record has no user turn, only its marker.
+    (unless (and (null (record-turns record)) (record-compactions record)
+                 (string= "" (record-prompt record)))
+      (push (make-entry :kind :user :text (record-prompt record)) entries))
     (dolist (turn (record-turns record))
       (let ((parts (llm:llm-turn-parts turn)))
         (case (llm:llm-turn-role turn)
           (:user
            (cond (first-user (setf first-user nil))
+                 ;; H3f: continuation turns are hidden.
+                 ((agent:continuation-turn-p turn))
                  ((and parts
                        (every #'llm:llm-text-part-p parts)
                        (not (uiop:string-prefix-p
@@ -129,6 +134,9 @@
                     (setf (entry-status entry) :error)))))))))
     (when (eq :canceled (record-finish record))
       (push (make-entry :kind :notice :text "interrupted") entries))
+    ;; H3f: one notice per compaction marker.
+    (dolist (marker (record-compactions record))
+      (push (make-entry :kind :notice :text (compaction-notice-text marker)) entries))
     (nreverse entries)))
 
 (defun session-entries (store &optional (designator +head-ref+))

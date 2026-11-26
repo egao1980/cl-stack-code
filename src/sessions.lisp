@@ -886,7 +886,7 @@ system prompt is assembled again by every process that runs the session."
         ((stringp designator) designator)
         (t (rev:revision-id (rev:resolve-revision store designator)))))
 
-(defun commit-turn (store record &key (expected nil expected-p) id)
+(defun commit-turn (store record &key (expected nil expected-p) id message provenance)
   "Commit RECORD (a TURN-RECORD) as one revision on STORE's head and move the
 head to it. → (values revision store-it-went-to).
 
@@ -894,7 +894,9 @@ The parent is EXPECTED (default SESSION-BASE; NIL → a root) and the head
 moves by compare-and-swap from EXPECTED. The message is the prompt's first
 line, trimmed, cut to 72 characters (71 and \"…\" when longer); the
 provenance (:kind :turn :version +VERSION+); ID, when given, is the
-revision id (as REV:COMMIT-REVISION :ID). The \"last\" file of the sessions
+revision id (as REV:COMMIT-REVISION :ID). H3f: MESSAGE and PROVENANCE, when
+given, replace the message and the provenance (an idle /compact record).
+The \"last\" file of the sessions
 directory then names STORE. SESSION-BASE becomes the new revision's id.
 
 When the head on disk is not EXPECTED, nothing is written and
@@ -910,8 +912,9 @@ revision new-store). SESSION-LOCKED and file errors propagate."
                                             :parents (and expected (list expected))
                                             :ref +head-ref+
                                             :expected expected
-                                            :message (%turn-message (record-prompt record))
-                                            :provenance (list :kind :turn :version +version+)
+                                            :message (or message (%turn-message (record-prompt record)))
+                                            :provenance (or provenance
+                                                            (list :kind :turn :version +version+))
                                             :id id)
                      ;; Unwinds out of the write: the lock is released and
                      ;; nothing was persisted.
@@ -929,7 +932,8 @@ revision new-store). SESSION-LOCKED and file errors propagate."
               ;; H3e-1: the revision RECORD names goes with it.
               (when (record-instructions record)
                 (%copy-instruction-revisions store clone (list (record-instructions record))))
-              (commit-turn clone record :id id)))))))
+              (commit-turn clone record :id id :message message
+                                        :provenance provenance)))))))
 
 (defun %line-number-p (string)
   (and (stringp string) (plusp (length string)) (every #'digit-char-p string)))

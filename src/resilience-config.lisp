@@ -159,9 +159,6 @@
           retry-after-compaction abort-turn
           apply-request-timeout))
 
-(defun %h3f-pending (name)
-  (error "cl-stack-code 0.14.0: ~a is not implemented yet (H3f contract)" name))
-
 ;;; Constants (given).
 
 (defparameter +resilience-setting-keys+
@@ -263,46 +260,368 @@ limit and the cut tool call was answered with a tool error. Informational.")
     (turn-timeout . "error_turn_timeout"))
   "Condition type → result subtype; the first matching type wins.")
 
-;;; Stubs.
+;;; Settings.
+
+(defun %resilience-fail (file key control &rest args)
+  (apply #'%settings-fail file key control args))
+
+(defun %int-in-p (value low high)
+  "VALUE is an integer in [LOW, HIGH] (HIGH NIL: no upper bound)."
+  (and (integerp value) (>= value low) (or (null high) (<= value high))))
+
+(defun %range-text (low high)
+  (if high
+      (format nil "an integer between ~d and ~d" low high)
+      (format nil "an integer >= ~d" low)))
+
+(defun %parse-int-key (file path value low high &key nullable)
+  "VALUE (present in the object) checked for KEY PATH: :NULL when it is JSON
+null and NULLABLE, else an integer in [LOW, HIGH]."
+  (cond ((and nullable (eq value :null)) :null)
+        ((%int-in-p value low high) value)
+        (t (%resilience-fail file path "must be ~a~:[~;, or null~]"
+                             (%range-text low high) nullable))))
 
 (defun %parse-resilience (file object)
   "→ the RESILIENCE plist of the H3f keys present in the settings OBJECT."
-  (declare (ignore file object))
-  (%h3f-pending '%parse-resilience))
+  (let ((out '()))
+    (flet ((put (key value) (setf out (list* value key out)))
+           (entry (table key) (gethash key table)))
+      ;; retry
+      (multiple-value-bind (value present) (entry object "retry")
+        (when present
+          (cond ((eq value :null)
+                 (put :retry-max-attempts :null)
+                 (put :retry-initial-delay-ms :null)
+                 (put :retry-max-delay-ms :null))
+                ((not (hash-table-p value))
+                 (%resilience-fail file "retry"
+                                   "must be an object with maxAttempts, initialDelayMs and maxDelayMs"))
+                (t
+                 (loop for (json key low high) in '(("maxAttempts" :retry-max-attempts 1 20)
+                                                    ("initialDelayMs" :retry-initial-delay-ms 0 600000)
+                                                    ("maxDelayMs" :retry-max-delay-ms 0 3600000))
+                       do (multiple-value-bind (v p) (entry value json)
+                            (when p
+                              (put key (%parse-int-key file (format nil "retry.~a" json) v
+                                                       low high :nullable t)))))))))
+      ;; timeouts
+      (loop for (json key) in '(("requestTimeoutMs" :request-timeout-ms)
+                                ("turnTimeoutMs" :turn-timeout-ms))
+            do (multiple-value-bind (v p) (entry object json)
+                 (when p (put key (%parse-int-key file json v 1000 nil :nullable t)))))
+      ;; contextWindow
+      (multiple-value-bind (value present) (entry object "contextWindow")
+        (when present
+          (put :context-window
+               (cond ((eq value :null) :null)
+                     ((integerp value) (%parse-int-key file "contextWindow" value 1024 nil))
+                     ((hash-table-p value)
+                      (let ((alist '()))
+                        (maphash (lambda (k v)
+                                   (push (cons k (%parse-int-key
+                                                  file (format nil "contextWindow.~a" k)
+                                                  v 1024 nil))
+                                         alist))
+                                 value)
+                        (nreverse alist)))
+                     (t (%resilience-fail
+                         file "contextWindow"
+                         "must be an integer >= 1024, or an object of model, provider or \"*\" keys with integers >= 1024"))))))
+      ;; autoCompact
+      (multiple-value-bind (value present) (entry object "autoCompact")
+        (when present
+          (cond ((eq value :null)
+                 (put :auto-compact-enabled :null)
+                 (put :auto-compact-threshold-pct :null))
+                ((not (hash-table-p value))
+                 (%resilience-fail file "autoCompact"
+                                   "must be an object with enabled and thresholdPct"))
+                (t
+                 (multiple-value-bind (v p) (entry value "enabled")
+                   (when p
+                     (put :auto-compact-enabled
+                          (cond ((eq v :null) :null)
+                                ((eq v t) t)
+                                ((null v) :false)
+                                (t (%resilience-fail file "autoCompact.enabled"
+                                                     "must be true or false"))))))
+                 (multiple-value-bind (v p) (entry value "thresholdPct")
+                   (when p
+                     (put :auto-compact-threshold-pct
+                          (%parse-int-key file "autoCompact.thresholdPct" v 50 95
+                                          :nullable t))))))))
+      ;; the rest
+      (loop for (json key low high) in '(("maxContinuations" :max-continuations 0 10)
+                                         ("lengthRetryMaxTokens" :length-retry-max-tokens 256 nil)
+                                         ("maxToolResultChars" :max-tool-result-chars 1000 nil))
+            do (multiple-value-bind (v p) (entry object json)
+                 (when p (put key (%parse-int-key file json v low high :nullable t))))))
+    (nreverse out)))
 
 (defun %resilience-keys-present-p (object)
   "True when the settings OBJECT (a hash table) has one of +RESILIENCE-SETTING-KEYS+."
   (some (lambda (key) (nth-value 1 (gethash key object))) +resilience-setting-keys+))
 
+(defun %merge-context-windows (old new)
+  "Two :CONTEXT-WINDOW values: alists merge key by key (NEW wins), anything
+else is replaced by NEW."
+  (if (and (listp old) (listp new) old)
+      (let ((out (copy-alist old)))
+        (dolist (pair new out)
+          (let ((cell (assoc (car pair) out :test #'string=)))
+            (if cell
+                (setf (cdr cell) (cdr pair))
+                (setf out (append out (list (cons (car pair) (cdr pair)))))))))
+      new))
+
 (defun %merge-resilience (plists)
   "Per key, the later plist wins; :CONTEXT-WINDOW alists merge key by key."
-  (declare (ignore plists))
-  (%h3f-pending '%merge-resilience))
+  (let ((out '()))
+    (dolist (plist plists out)
+      (loop for (key value) on plist by #'cddr
+            do (setf (getf out key)
+                     (if (eq key :context-window)
+                         (%merge-context-windows (getf out key) value)
+                         value))))))
 
 (defun resilience-settings (settings)
-  (declare (ignore settings))
-  (%h3f-pending 'resilience-settings))
+  "SETTINGS's H3f keys with the defaults filled in (see the header)."
+  (let ((plist (and settings (settings-resilience settings))))
+    (flet ((value (key default)
+             (let ((v (getf plist key :absent)))
+               (case v
+                 (:absent default)
+                 (:null default)
+                 (:false nil)
+                 (t v)))))
+      (let ((initial (value :retry-initial-delay-ms +default-retry-initial-delay-ms+))
+            (max-delay (value :retry-max-delay-ms +default-retry-max-delay-ms+)))
+        (list :retry-max-attempts (value :retry-max-attempts +default-retry-max-attempts+)
+              :retry-initial-delay-ms initial
+              :retry-max-delay-ms (max initial max-delay)
+              :request-timeout-ms (value :request-timeout-ms nil)
+              :turn-timeout-ms (value :turn-timeout-ms nil)
+              :context-window (value :context-window nil)
+              :auto-compact-enabled (value :auto-compact-enabled t)
+              :auto-compact-threshold-pct (value :auto-compact-threshold-pct
+                                                 +default-auto-compact-threshold-pct+)
+              :max-continuations (value :max-continuations +default-max-continuations+)
+              :length-retry-max-tokens (value :length-retry-max-tokens nil)
+              :max-tool-result-chars (value :max-tool-result-chars
+                                            +default-max-tool-result-chars+))))))
+
+;;; Flags.
+
+(defun %flag-integer (text)
+  "TEXT as a decimal integer (an optional sign, then digits), else NIL."
+  (and (stringp text)
+       (let ((s (string-trim " " text)))
+         (and (plusp (length s))
+              (let ((digits (if (member (char s 0) '(#\- #\+)) (subseq s 1) s)))
+                (and (plusp (length digits))
+                     (every #'digit-char-p digits)
+                     (parse-integer s)))))))
+
+(defun %flag-seconds-ms (text)
+  "TEXT as decimal seconds (\"600\", \"1.5\") → milliseconds (an integer), or NIL."
+  (and (stringp text)
+       (let* ((s (string-trim " " text))
+              (dot (position #\. s))
+              (whole (subseq s 0 (or dot (length s))))
+              (frac (if dot (subseq s (1+ dot)) "")))
+         (and (plusp (length s))
+              (or (plusp (length whole)) (plusp (length frac)))
+              (every #'digit-char-p whole)
+              (every #'digit-char-p frac)
+              (or (null dot) (plusp (length frac)))
+              (round (* 1000 (+ (if (plusp (length whole)) (parse-integer whole) 0)
+                                (if (plusp (length frac))
+                                    (/ (parse-integer frac) (expt 10 (length frac)))
+                                    0))))))))
+
+(defun %flag-fail (control &rest args)
+  (error 'code-usage-error :message (apply #'format nil control args)))
 
 (defun %resilience-flags (&key max-retries request-timeout turn-timeout context-window
                             no-auto-compact)
-  (declare (ignore max-retries request-timeout turn-timeout context-window no-auto-compact))
-  (%h3f-pending '%resilience-flags))
+  "The flag layer's RESILIENCE plist (see the header)."
+  (let ((out '()))
+    (when max-retries
+      (let ((n (%flag-integer max-retries)))
+        (unless (and n (>= n 0))
+          (%flag-fail "--max-retries must be an integer >= 0, not ~s" max-retries))
+        (setf out (list* :retry-max-attempts (1+ n) out))))
+    (loop for (text flag key) in (list (list request-timeout "--request-timeout" :request-timeout-ms)
+                                       (list turn-timeout "--turn-timeout" :turn-timeout-ms))
+          when text
+            do (let ((ms (%flag-seconds-ms text)))
+                 (unless (and ms (>= ms 1000))
+                   (%flag-fail "~a must be a number of seconds >= 1, not ~s" flag text))
+                 (setf out (list* key ms out))))
+    (when context-window
+      (let ((n (%flag-integer context-window)))
+        (unless (and n (>= n 1024))
+          (%flag-fail "--context-window must be an integer >= 1024, not ~s" context-window))
+        (setf out (list* :context-window n out))))
+    (when no-auto-compact
+      (setf out (list* :auto-compact-enabled :false out)))
+    out))
 
 (defun check-retry-flags (invocation)
-  (declare (ignore invocation))
-  (%h3f-pending 'check-retry-flags))
+  "--retry needs --continue or --resume and takes no prompt (CODE-USAGE-ERROR,
+exit 2). → T."
+  (when (invocation-retry-p invocation)
+    (unless (or (invocation-continue-p invocation) (invocation-resume invocation))
+      (%flag-fail "--retry needs --continue or --resume"))
+    (when (invocation-prompt invocation)
+      (%flag-fail "--retry takes no prompt")))
+  t)
 
-(defun classify-model-failure (condition &key provider url model attempts)
-  (declare (ignore condition provider url model attempts))
-  (%h3f-pending 'classify-model-failure))
+;;; Classification.
+
+(defun %cause-details (cause)
+  "→ (values provider url model) of an llm-protocol CAUSE, when it has them."
+  (typecase cause
+    (llm:llm-http-error (values (llm:llm-error-provider cause) (llm:llm-error-url cause)
+                                (llm:llm-error-model cause)))
+    (llm:llm-transport-error (values (llm:llm-transport-error-provider cause)
+                                     (llm:llm-transport-error-url cause)
+                                     nil))
+    (t (values nil nil nil))))
+
+(defun classify-model-failure (condition &key provider url model attempts secrets)
+  "→ the MODEL-ERROR (not signalled) for the run failure CONDITION, or NIL
+when it is no model failure (see the header). SECRETS (strings): the message
+is computed now and passed through REDACT-SECRETS."
+  (let ((cause (if (typep condition 'agent:agent-generate-error)
+                   (agent:agent-generate-error-cause condition)
+                   condition)))
+    (multiple-value-bind (cause-provider cause-url cause-model) (%cause-details cause)
+      (let* ((common (list :cause cause
+                           :provider (or provider cause-provider)
+                           :url (or url cause-url)
+                           :model (or model cause-model)
+                           :attempts attempts))
+             (classified
+               (typecase cause
+                 (llm:llm-context-overflow
+                  (apply #'make-condition 'model-context-length-exceeded common))
+                 (llm:llm-rate-limited
+                  (apply #'make-condition 'model-rate-limited
+                         :retry-after (llm:llm-http-error-retry-after cause) common))
+                 (llm:llm-overloaded (apply #'make-condition 'model-overloaded common))
+                 (llm:llm-auth-error (apply #'make-condition 'model-auth-error common))
+                 (llm:llm-not-found (apply #'make-condition 'model-unavailable common))
+                 (llm:llm-transport-error
+                  (apply #'make-condition 'model-transport-error
+                         :kind (llm:llm-transport-error-kind cause) common))
+                 (llm:llm-incomplete-response
+                  (apply #'make-condition 'model-transport-error :kind :reset common))
+                 (llm:llm-http-error
+                  (apply #'make-condition 'model-http-error
+                         :status (llm:llm-http-error-status cause) common))
+                 (t
+                  (let ((kind (and cause (llm:transport-error-kind-for cause))))
+                    (and kind
+                         (apply #'make-condition 'model-transport-error :kind kind common)))))))
+        (if (and classified secrets)
+            (apply #'make-condition (type-of classified)
+                   :message (redact-secrets (model-failure-message classified) secrets)
+                   (append (typecase classified
+                             (model-rate-limited
+                              (list :retry-after (model-rate-limited-retry-after classified)))
+                             (model-transport-error
+                              (list :kind (model-transport-error-kind classified)))
+                             (model-http-error
+                              (list :status (model-http-error-status classified))))
+                           common))
+            classified)))))
+
+(defun %cause-text (cause)
+  "The provider's own text of CAUSE (its message, else its report)."
+  (let ((*print-pretty* nil))
+    (cond ((null cause) "unknown error")
+          ((and (typep cause 'llm:llm-error) (llm:llm-error-message cause)))
+          ((and (typep cause 'llm:llm-http-error) (stringp (llm:llm-http-error-body cause))
+                (plusp (length (llm:llm-http-error-body cause))))
+           (llm:llm-http-error-body cause))
+          (t (princ-to-string cause)))))
+
+(defun %cause-status (cause)
+  (and (typep cause 'llm:llm-http-error) (llm:llm-http-error-status cause)))
+
+(defun %transport-kind-text (kind)
+  (case kind
+    (:connect "connection failed")
+    (:reset "connection reset")
+    (:timeout "timed out")
+    (:tls "TLS failed")
+    (:canceled "canceled")
+    (t "connection failed")))
 
 (defun model-failure-message (condition)
-  (declare (ignore condition))
-  (%h3f-pending 'model-failure-message))
+  "The message of a MODEL-ERROR (see the header). Never names a secret: the
+key variable, not its value."
+  (let* ((cause (model-error-cause condition))
+         (provider (or (model-error-provider condition) "the provider"))
+         (url (model-error-url condition))
+         (where (format nil "~a~@[ (~a)~]" provider url))
+         (model (model-error-model condition))
+         (attempts (model-error-attempts condition))
+         ;; One call is no retry: "after N attempts" only when the loop retried.
+         (after (if (and attempts (> attempts 1))
+                    (format nil " after ~d attempts" attempts)
+                    ""))
+         (status (or (%cause-status cause)
+                     (and (typep condition 'model-http-error) (model-http-error-status condition))))
+         (http (if status (format nil " (HTTP ~a)" status) ""))
+         (text (%cause-text cause)))
+    (typecase condition
+      (model-auth-error
+       (format nil "~a rejected the API key~@[ for model ~a~]~a: ~a~@[; check ~a~]"
+               where model http text
+               (cdr (assoc (model-error-provider condition) +provider-key-variables+
+                           :test #'equal))))
+      (model-unavailable
+       (format nil "~a has no model ~a~a: ~a" where (or model "(unknown)") http text))
+      (model-transport-error
+       (format nil "~a could not be reached~a: ~a: ~a"
+               where after (%transport-kind-text (model-transport-error-kind condition)) text))
+      (model-overloaded
+       (format nil "~a is overloaded~a~a: ~a" provider http after text))
+      (model-rate-limited
+       (let ((wait (model-rate-limited-retry-after condition)))
+         (format nil "~a rate-limited the request~a~a~@[; it asked to wait ~a s~]: ~a"
+                 provider http after
+                 (and (realp wait) (if (integerp wait) wait (float wait)))
+                 text)))
+      (model-context-length-exceeded
+       (let ((window (model-context-length-window condition)))
+         (format nil "the conversation does not fit ~:[the model~;model ~:*~a~]'s context window~@[ (~a tokens)~] even after compacting: ~a; start a new session (/clear), /compact with instructions, or set contextWindow"
+                 model window text)))
+      (model-http-error
+       (format nil "~a refused the request~@[ for model ~a~]~a: ~a" where model http text))
+      (t (format nil "~a failed~@[ for model ~a~]~a: ~a" where model after text)))))
 
 (defun redact-secrets (text secrets)
-  (declare (ignore text secrets))
-  (%h3f-pending 'redact-secrets))
+  "TEXT with each secret of 8+ characters, and any 8+ character prefix of one,
+replaced by \"[redacted]\"."
+  (let ((secrets (remove-if-not (lambda (s) (and (stringp s) (>= (length s) 8))) secrets)))
+    (if (or (null secrets) (not (stringp text)))
+        text
+        (with-output-to-string (out)
+          (let ((i 0) (n (length text)))
+            (loop while (< i n)
+                  do (let ((best 0))
+                       (dolist (secret secrets)
+                         (let ((len (or (mismatch secret text :start2 i)
+                                        (length secret))))
+                           (when (and (>= len 8) (> len best))
+                             (setf best len))))
+                       (if (plusp best)
+                           (progn (write-string "[redacted]" out) (incf i best))
+                           (progn (write-char (char text i) out) (incf i))))))))))
 
 (defgeneric apply-request-timeout (backend seconds)
   (:documentation "Give BACKEND (an LLM-BACKEND) the per-request timeout
@@ -314,3 +633,11 @@ custom provider's backend is left alone. → BACKEND when applied.")
   (:method (backend seconds)
     (declare (ignore backend seconds))
     nil))
+
+(defmethod apply-request-timeout ((backend llm-protocol-openai:openai-compat-backend) seconds)
+  (setf (llm-protocol-openai:openai-request-timeout backend) seconds)
+  backend)
+
+(defmethod apply-request-timeout ((backend llm-protocol-anthropic:anthropic-backend) seconds)
+  (setf (llm-protocol-anthropic:anthropic-request-timeout backend) seconds)
+  backend)

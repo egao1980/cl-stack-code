@@ -235,7 +235,27 @@ count is 0."
   (mcp nil)                                   ; the session's MCP-MANAGER, or NIL
   ;; H3d: one emitter, a sink per destination.
   (sink nil)                                  ; NIL: -p (stream-json lines); else (lambda (object))
-  (denial-reason #'%headless-denial-reason))  ; decision → the denial's "reason"
+  (denial-reason #'%headless-denial-reason)   ; decision → the denial's "reason"
+  ;; H3f (src/resilience.lisp): the turn's counters, its compaction markers
+  ;; and the turns it added, kept as they appeared (a compaction drops turns
+  ;; from the run, not from the record).
+  (retries 0)
+  (compactions 0)
+  (continuations 0)
+  (attempts 1)                                ; calls of the current step
+  (markers '())                               ; newest first
+  (window nil)                                ; the effective context window
+  (secrets '())                               ; strings REDACT-SECRETS hides
+  (retry-of nil)                              ; the failed revision a retry re-sends
+  (timer nil)                                 ; the turn timer, or NIL
+  (timeout nil)                               ; a TURN-TIMEOUT once it fired
+  (timeout-source "turnTimeoutMs")
+  (timeout-ms nil)                            ; turnTimeoutMs, or NIL
+  (context-tokens nil)                        ; the last response's prompt tokens
+  (last-compaction nil)                       ; the last :COMPACTED payload
+  (ledger-seen (make-hash-table :test #'eq))  ; turns already in the ledger (or history)
+  (ledger '())                                ; the turn's own turns, newest first
+  (ledger-base 0))                            ; full-history turns before the turn
 
 (defun %headless-denial-reason (decision)
   "-p: the headless refusal of an ask is \"headless\", a rule or policy
@@ -273,15 +293,22 @@ streamed parts by then), else of RESPONSE itself."
     (remove-if-not #'llm:llm-tool-call-part-p parts)))
 
 (defun %on-response (report response)
-  (let ((counts (%usage-counts (llm:llm-response-usage response)))
-        (step (%report-step report)))
+  (let* ((counts (%usage-counts (llm:llm-response-usage response)))
+         (step (%report-step report))
+         ;; H3f: prompt tokens = input + cache read + cache write.
+         (context (+ (first counts) (third counts) (fourth counts)))
+         (window (%report-window report)))
     (incf (%report-turns report))
-    (setf (%report-usage report) (mapcar #'+ (%report-usage report) counts))
-    (%emit-event report "assistant"
+    (setf (%report-usage report) (mapcar #'+ (%report-usage report) counts)
+          (%report-context-tokens report) context)
+    (apply #'%emit-event report "assistant"
                  "step" step
                  "text" (or (llm:llm-response-text response) "")
                  "finish_reason" (%finish-reason-name (llm:llm-response-finish-reason response))
-                 "usage" (%usage-object counts))
+                 "usage" (%usage-object counts)
+                 (and window
+                      (list "context_tokens" context
+                            "context_pct" (context-usage-pct context window))))
     (dolist (call (%step-tool-calls report response))
       (let ((id (llm:llm-tool-call-part-id call)))
         (setf (gethash id (%report-call-steps report)) step)
@@ -346,11 +373,16 @@ output, each only when present."
 would only become a warning, so it never signals: the first error is kept,
 the run is canceled and the error fails the run afterwards."
   (handler-case
-      (case kind
+      (progn
+       ;; H3f: the turn's own turns, before a compaction can drop them.
+       (unless (member kind '(:part :started))
+         (%ledger-sync report))
+       (case kind
         (:started (setf (%report-run report) payload)
          ;; H4b: events queued before the run reach its first step.
          (%post-if-going (%report-image-tools report) payload))
-        (:step (setf (%report-step report) payload)
+        (:step (setf (%report-step report) payload
+                     (%report-attempts report) 1)
          ;; H3e-2a: before the model call (the set's thread).
          (%mcp-before-model-call (%report-mcp report)))
         (:part (cond ((and (llm:llm-text-part-p payload)
@@ -369,12 +401,152 @@ the run is canceled and the error fails the run afterwards."
         (:permission (%on-permission report payload))
         (:invocation (%on-invocation report payload))
         ;; H3e-1
-        (:instructions (%on-instructions report payload)))
+        (:instructions (%on-instructions report payload))
+        ;; H3f
+        (:retry (%on-retry report payload))
+        (:compacted (%on-compacted report payload))
+        (:continuation (%on-continuation report payload))
+        (:truncated (%on-truncated report payload))
+        (:finished (%disarm-turn-timer report))))
     (error (e)
       (unless (%report-failure report)
         (setf (%report-failure report) e))
       (let ((run (%report-run report)))
         (when run (agent:cancel-agent-run run))))))
+
+;;; H3f: the loop's resilience events (src/resilience.lisp header).
+
+(defun %ledger-sync (report)
+  "Add the run's turns the ledger has not seen yet (never :SYSTEM turns, nor
+the partial turn a streaming step is still writing)."
+  (let ((run (%report-run report)))
+    (when run
+      (let ((seen (%report-ledger-seen report))
+            (in-flight (agent:agent-run-in-flight-turn run)))
+        (dolist (turn (agent:agent-run-turns run))
+          (unless (or (gethash turn seen)
+                      (eq turn in-flight)
+                      (eq :system (llm:llm-turn-role turn)))
+            (setf (gethash turn seen) t)
+            (push turn (%report-ledger report))))))))
+
+(defun %ledger-start (report history base)
+  "The ledger of a turn whose run starts from HISTORY (turns already
+recorded); BASE is the number of full-history turns before it."
+  (dolist (turn history)
+    (setf (gethash turn (%report-ledger-seen report)) t))
+  (setf (%report-ledger report) '()
+        (%report-ledger-base report) base))
+
+(defun %ledger-turns (report run history)
+  "The turns the turn added, oldest first: the ledger after a last sync, without
+the partial turn of a failed step. HISTORY is only used when the ledger was
+never started (RUN's turns past HISTORY)."
+  (declare (ignore history))
+  (%ledger-sync report)
+  (let ((in-flight (and run (agent:agent-run-in-flight-turn run))))
+    (remove-if (lambda (turn) (eq turn in-flight))
+               (reverse (%report-ledger report)))))
+
+(defun %on-retry (report payload)
+  (incf (%report-retries report))
+  (when (getf payload :max-attempts)
+    (setf (%report-attempts report) (1+ (or (getf payload :attempt) 0))))
+  (apply #'%emit-event report "system"
+         (%retry-event-keys (list* :step (%report-step report) payload)
+                            (%report-secrets report))))
+
+(defun %compaction-marker-of (report payload)
+  "The marker of a :COMPACTED PAYLOAD against the full history the ledger holds."
+  (let* ((run (%report-run report))
+         (keep-k (or (getf payload :keep) 0))
+         (tail (and run (last (agent:agent-run-turns run) keep-k))))
+    (make-compaction-marker
+     :summary (getf payload :summary)
+     :keep (count :system tail :key #'llm:llm-turn-role :test-not #'eq)
+     :at (+ (%report-ledger-base report) (length (%report-ledger report)))
+     :reason (getf payload :reason)
+     :tokens-before (getf payload :tokens-before)
+     :instructions (%instruction-set-revision (%report-instruction-set report)))))
+
+(defun %on-compacted (report payload)
+  (incf (%report-compactions report))
+  (setf (%report-last-compaction report) payload)
+  (push (%compaction-marker-of report payload) (%report-markers report))
+  (apply #'%emit-event report "system"
+         (%compact-event-keys (list* :context-window (%report-window report) payload))))
+
+(defun %on-continuation (report payload)
+  (incf (%report-continuations report))
+  (apply #'%emit-event report "system" (%continuation-event-keys payload)))
+
+(defun %on-truncated (report payload)
+  (signal 'model-output-truncated :tool-use-ids (getf payload :calls)
+                                  :max-tokens (getf payload :max-tokens))
+  (apply #'%emit-event report "system" (%truncated-event-keys payload)))
+
+(defun %arm-turn-timer (report)
+  "turnTimeoutMs: one timer on the bound loop; when it fires the run is
+canceled and the turn ends with TURN-TIMEOUT. No limit when unset."
+  (let ((ms (%report-timeout-ms report)))
+    (when ms
+      (setf (%report-timer report)
+            (event:sleep* event:*event-backend* event:*event-loop* (/ ms 1000)
+                          :callback
+                          (lambda ()
+                            (setf (%report-timer report) nil)
+                            (let ((run (%report-run report)))
+                              (when (and run (null (agent:agent-run-finish-reason run)))
+                                (setf (%report-timeout report)
+                                      (make-condition 'turn-timeout
+                                                      :ms ms
+                                                      :source (%report-timeout-source report)))
+                                (agent:cancel-agent-run run)))))))))
+
+(defun %disarm-turn-timer (report)
+  (let ((timer (shiftf (%report-timer report) nil)))
+    (when timer
+      (ignore-errors (event:cancel event:*event-backend* timer)))))
+
+(defun %run-secrets (settings getenv)
+  "The effective env values of +PROVIDER-KEY-VARIABLES+ (8+ characters)."
+  (let ((lookup (%env-lookup settings (or getenv #'uiop:getenv))))
+    (loop for (nil . var) in +provider-key-variables+
+          for value = (funcall lookup var)
+          when (and (stringp value) (>= (length value) 8))
+            collect value)))
+
+(defun %resilience-report-setup (report settings backend designator getenv
+                                 &key (timeout-source "turnTimeoutMs"))
+  "Fill REPORT's H3f fields. → (values window source)."
+  (multiple-value-bind (window source) (effective-context-window settings backend designator)
+    (setf (%report-window report) window
+          (%report-secrets report) (%run-secrets settings getenv)
+          (%report-timeout-ms report) (getf (resilience-settings settings) :turn-timeout-ms)
+          (%report-timeout-source report) timeout-source)
+    (values window source)))
+
+(defun %error-class (condition)
+  "\"error_class\" of a classified failure: its type name, lower case."
+  (and condition
+       (typep condition '(or model-error turn-timeout))
+       (string-downcase (symbol-name (type-of condition)))))
+
+(defun %turn-outcome (report run failure interrupted max-turns)
+  "→ (values subtype condition): a turn timeout, else a classified model
+failure (+MODEL-ERROR-SUBTYPES+), else %OUTCOME."
+  (let ((classified (and failure
+                         (not (%report-timeout report))
+                         (classify-model-failure failure
+                                                 :attempts (%report-attempts report)
+                                                 :secrets (%report-secrets report)))))
+    (cond ((%report-timeout report)
+           (values "error_turn_timeout" (%report-timeout report)))
+          (classified
+           (values (cdr (assoc-if (lambda (type) (typep classified type))
+                                  +model-error-subtypes+))
+                   classified))
+          (t (%outcome run failure interrupted max-turns)))))
 
 (defun %directive-file-object (directive)
   (let ((path (steer:steer-directive-path directive)))
@@ -388,7 +560,7 @@ the run is canceled and the error fails the run afterwards."
                  "files" (map 'vector #'%directive-file-object directives)
                  "instruction_set" (or (and set (instruction-set-current set)) :null))))
 
-(defun %result-object (report subtype text error-message duration-ms)
+(defun %result-object (report subtype text error-message duration-ms &optional condition)
   (apply #'%json-object "type" "result"
                 "subtype" subtype
                 "is_error" (not (string= subtype "success"))
@@ -401,6 +573,17 @@ the run is canceled and the error fails the run afterwards."
                 "session_id" (%report-session report)
                 ;; H5a: only in plan mode, so the other shapes are unchanged.
                 (append
+                 ;; H3f: the counters once the turn retried, compacted or
+                 ;; continued (all three together), so a plain turn's result
+                 ;; keeps its shape; "error_class" on a model failure only.
+                 (when (or (plusp (%report-retries report))
+                           (plusp (%report-compactions report))
+                           (plusp (%report-continuations report)))
+                   (list "retries" (%report-retries report)
+                         "compactions" (%report-compactions report)
+                         "continuations" (%report-continuations report)))
+                 (let ((class (%error-class condition)))
+                   (and class (list "error_class" class)))
                  (if (%report-plan report)
                      (list "plan" (%report-plan report))
                      '())
@@ -499,16 +682,19 @@ SOURCE, or a new session (--session-id or a random id)."
 
 ;;; The run.
 
-(defun %agent-settings (cwd settings &key discovery)
+(defun %agent-settings (cwd settings &key discovery (backend nil backend-p) designator)
   "The agent's settings. H3e-1: the instructions discovery is DISCOVERY (the
-session's CODE-INSTRUCTION-DISCOVERY), else a new one for CWD with no rules."
+session's CODE-INSTRUCTION-DISCOVERY), else a new one for CWD with no rules.
+H3f: with BACKEND, RESILIENCE-AGENT-EXTRA for it and DESIGNATOR."
   (agent:make-agent-settings
    :llm (model-params-llm-settings settings)
    :max-steps (or (settings-max-turns settings) +default-max-turns+)
-   :extra (list :permission-policy (code-permission-policy settings)
-                :max-steps-wrap-up nil
-                :instructions-discovery
-                (or discovery (make-code-instruction-discovery cwd)))))
+   :extra (append
+           (list :permission-policy (code-permission-policy settings)
+                 :max-steps-wrap-up nil
+                 :instructions-discovery
+                 (or discovery (make-code-instruction-discovery cwd)))
+           (and backend-p (resilience-agent-extra settings backend :model designator)))))
 
 (defun %agent-permissions (settings &key (plan-shell-allowed t))
   "The agent's rule list. The lowest rule makes a shell command's program:
@@ -557,11 +743,14 @@ PLAN-SANDBOX-REFUSAL-RESULT, the notice going once to ERROR-OUTPUT.
                          (when run (agent:cancel-agent-run run)))
                        (continue c))))
       (handler-case
-          (values (agent:run-ai-agent agent prompt
-                                      :on-event (lambda (kind payload)
-                                                  (%on-agent-event report kind payload)))
-                  nil
-                  interrupted)
+          (progn
+            ;; H3f: the turn timer, on the bound loop.
+            (%arm-turn-timer report)
+            (values (agent:run-ai-agent agent prompt
+                                        :on-event (lambda (kind payload)
+                                                    (%on-agent-event report kind payload)))
+                    nil
+                    interrupted))
         (error (e) (values nil e interrupted))))))
 
 (defun %outcome (run failure interrupted max-turns)
@@ -583,14 +772,19 @@ on success."
           (t (values "success" nil)))))
 
 (defun %report-run-end (report run failure interrupted max-turns start)
-  "Write the run's result to the report's output; signal the failure, if any."
+  "Write the run's result to the report's output; signal the failure, if any.
+H3f: a model failure or a turn timeout is classified (%TURN-OUTCOME); in json
+and stream-json it is written into the result only, and its exit code is
+returned."
+  (%disarm-turn-timer report)
   (multiple-value-bind (subtype condition)
-      (%outcome run (or (%report-failure report) failure) interrupted max-turns)
+      (%turn-outcome report run (or (%report-failure report) failure) interrupted max-turns)
     ;; H5a: a plan step that failed after a good run (--apply on drift) fails it.
     (when (and (null condition) (%report-plan-failure report))
       (setf subtype "error_during_execution"
             condition (%report-plan-failure report)))
-    (let ((text (if (and run (not failure) (not (%report-failure report)))
+    (let ((text (if (and run (not failure) (not (%report-failure report))
+                         (not (%report-timeout report)))
                     (%trim-answer (agent:agent-run-text run))
                     ""))
           (duration (round (* 1000 (- (get-internal-real-time) start))
@@ -611,8 +805,11 @@ on success."
          (%write-json-line report
                            (%result-object report subtype text
                                            (and condition (princ-to-string condition))
-                                           duration))))
+                                           duration condition))))
       (when condition
+        (when (and (member (%report-format report) '(:json :stream-json))
+                   (typep condition '(or model-error turn-timeout)))
+          (return-from %report-run-end (condition-exit-code condition)))
         (error condition))
       0)))
 
@@ -633,9 +830,13 @@ or NIL when no run started."
   (let ((run (%report-run report)))
     (when run
       (let ((record (make-turn-record :prompt prompt
-                                      :turns (%new-turns run history)
-                                      :finish (%run-finish run (or (%report-failure report) failure)
+                                      :turns (%ledger-turns report run history)
+                                      :finish (%run-finish run (or (%report-failure report) failure
+                                                                   (%report-timeout report))
                                                            interrupted)
+                                      ;; H3f
+                                      :compactions (reverse (%report-markers report))
+                                      :retry-of (%report-retry-of report)
                                       :model designator
                                       :permission-mode mode
                                       :usage (copy-list (%report-usage report))
@@ -918,7 +1119,9 @@ result, then signals its failure."
       (%run-plan-action inv :output output :getenv getenv :data-dir data-dir
                             :user-config-dir user-config-dir :error-output error-output
                             :start start)))
-  (let* ((prompt (%read-prompt inv input))
+  (let* ((retry-p (invocation-retry-p inv))
+         ;; H3f: --retry re-sends the failed turn's prompt; none is read.
+         (prompt (if retry-p "" (%read-prompt inv input)))
          (cwd (%resolve-cwd (invocation-cwd inv)))
          (config (or user-config-dir (user-config-directory :getenv getenv)))
          (settings (load-settings cwd :user-config-dir config
@@ -932,7 +1135,7 @@ result, then signals its failure."
          (resolved (multiple-value-list
                     (resolve-model designator :providers providers
                                               :env (%env-lookup settings getenv))))
-         (backend (first resolved))
+         (backend (%apply-settings-request-timeout (first resolved) settings))
          (model (third resolved))
          (mode (or (settings-permission-mode settings) :default))
          ;; H4b: the checks, before the session is written.
@@ -944,8 +1147,22 @@ result, then signals its failure."
          ;; H5b: after the session, before anything is written to OUTPUT.
          (checkpointer (%make-run-checkpointer settings cwd data-dir getenv))
          (history (session-turns store))
+         ;; H3f: --retry continues from the failed turn as recorded.
+         (retried (and retry-p (%retry-head store)))
+         (prompt (if retried (record-prompt (revision-record retried)) prompt))
          (report (make-%report :format (invocation-output-format inv) :output output
-                               :session (session-id store)))
+                               :session (session-id store)
+                               :retry-of (and retried (rev:revision-id retried))))
+         (window-and-source
+           (progn
+             (%ledger-start report history (length (session-full-turns store)))
+             (multiple-value-list
+              (%resilience-report-setup
+               report settings backend designator getenv
+               :timeout-source (if (getf (settings-resilience (invocation-settings inv))
+                                         :turn-timeout-ms)
+                                   "--turn-timeout"
+                                   "turnTimeoutMs")))))
          ;; H5a: plan mode (or a plan flag) opens or reopens the session's plan.
          (plan-and-reopened
            (when (%plan-run-p inv mode)
@@ -1047,18 +1264,22 @@ result, then signals its failure."
                              :backend backend
                              :model model
                              :instructions instructions
-                             :tools sources
+                             :tools (%capped-sources sources settings (%tool-output-dir store))
                              :permissions (if sandbox
                                               (%plan-permissions settings sandbox)
                                               (%agent-permissions settings))
-                             :settings (%agent-settings cwd settings :discovery discovery)))
+                             :settings (%agent-settings cwd settings :discovery discovery
+                                                                     :backend backend
+                                                                     :designator designator)))
                      (root (find-project-root cwd)))
                  (apply #'%emit-event report "system"
                         (%system-init-keys cwd root designator mode offered files
                                            (and link settings)
                                            :context context :discovery discovery
                                            :instruction-set instruction-set
-                                           :mcp-servers (mcp-manager-connections mcp)))
+                                           :mcp-servers (mcp-manager-connections mcp)
+                                           :resilience (apply #'%resilience-init-keys settings
+                                                              window-and-source)))
                  (when plan
                    (apply #'%emit-event report "plan"
                           (%plan-open-keys plan (second plan-and-reopened) sandbox)))
@@ -1067,7 +1288,10 @@ result, then signals its failure."
                    (when notice (%plan-stderr-line error-output "~a" notice)))
                  (let ((pre (begin-checkpoint-turn checkpointer store)))
                    (multiple-value-bind (run failure interrupted)
-                       (%drive agent (append history (list (llm:user-turn prompt))) report mode
+                       (%drive agent (if retried
+                                         history
+                                         (append history (list (llm:user-turn prompt))))
+                               report mode
                                :sandbox sandbox :error-output error-output)
                      (when plan
                        (%headless-plan-finish report plan inv run
@@ -1094,8 +1318,24 @@ result, then signals its failure."
       (close-checkpointer checkpointer)
       (event:close-event-loop event-backend event-loop))))
 
+;;; H3f: requestTimeoutMs and --retry.
+
+(defun %apply-settings-request-timeout (backend settings)
+  "BACKEND after APPLY-REQUEST-TIMEOUT with requestTimeoutMs / 1000, when set."
+  (let ((ms (getf (resilience-settings settings) :request-timeout-ms)))
+    (when ms
+      (apply-request-timeout backend (/ ms 1000)))
+    backend))
+
+(defun %retry-head (store)
+  "The failed head revision a retry re-sends; NOTHING-TO-RETRY when the head
+did not fail."
+  (unless (failed-turn-p store)
+    (error 'nothing-to-retry))
+  (session-head store))
+
 (defun %system-init-keys (cwd root designator mode offered files image-settings
-                          &key context discovery instruction-set mcp-servers)
+                          &key context discovery instruction-set mcp-servers resilience)
   "The \"system\" init event's keys and values (after \"type\" and
 \"session_id\"); IMAGE-SETTINGS (the settings, when the image is on) adds
 \"lisp_image\". Shared by -p and the SDK (src/client.lisp). H3e-1: CONTEXT,
@@ -1133,6 +1373,8 @@ DISCOVERY and INSTRUCTION-SET give \"imports\", \"skills\", \"rules\",
            "notes" (coerce (and context (context-notes context)) 'vector)
            "instruction_set" (or (and instruction-set (instruction-set-current instruction-set)) :null)
            (append
+            ;; H3f: the limits (always present when given).
+            resilience
             ;; H4b: only with the image on.
             (and image-settings (list "lisp_image" (%lisp-image-object image-settings)))
             ;; H3e-2a: only with at least one server (MCP-SERVERS: the connections).
@@ -1192,6 +1434,8 @@ USER-DATA-DIRECTORY: sessions live under it."
   (let ((start (get-internal-real-time)))
     (handler-case
         (let ((inv (parse-arguments argv)))
+          ;; H3f: before anything runs.
+          (check-retry-flags inv)
           (cond ((invocation-help-p inv)
                  (%usage-text output)
                  0)

@@ -209,87 +209,409 @@
     (setf (getf copy :summary) (mapcar #'llm:state-turn (getf content :summary)))
     copy))
 
-;;; PLACEHOLDERS for H3e-1's amended instruction-set API (see task.md).
+;;; H3e-1's instruction-set API (the placeholders of the contract, filled).
 
-(defun %instruction-set-revision (store)
-  "PLACEHOLDER(H3e-1): the id of STORE's current instruction-set revision,
-i.e. H3e-1's (INSTRUCTION-SET-CURRENT <the session's INSTRUCTION-SET>)."
-  (declare (ignore store))
-  (%h3f-pending '%instruction-set-revision))
+(defun %instruction-set-revision (set)
+  "The id of the session's current instruction-set revision: H3e-1's
+INSTRUCTION-SET-CURRENT of SET (the session's INSTRUCTION-SET), or NIL."
+  (and set (instruction-set-current set)))
 
-(defun %instruction-set-reinjection (store revision)
-  "PLACEHOLDER(H3e-1): the instruction directives to re-inject after a
-compaction: H3e-1's (INSTRUCTION-SET-LOADED-RULES store REVISION), each rule's
-body read with INSTRUCTION-TEXT, in load order."
-  (declare (ignore store revision))
-  (%h3f-pending '%instruction-set-reinjection))
+(defun %instruction-set-reinjection (store revision &key rules)
+  "The instruction directives to re-inject after a compaction: the rules in
+context at REVISION of the INSTRUCTION-STORE STORE (H3e-1's
+INSTRUCTION-SET-LOADED-RULES), each with the body its revision recorded
+(INSTRUCTION-TEXT), in load order. RULES are the discovery's path-scoped rule
+directives, which give each path its pattern; a path no rule knows, or a text
+that is missing, is skipped (a re-injection never fails the run)."
+  (when (and store revision)
+    (let ((loaded (handler-case (instruction-set-loaded-rules store revision)
+                    (instruction-set-error () nil)))
+          (texts (handler-case (%revision-rule-texts store revision)
+                   (instruction-set-error () nil))))
+      (loop for native in loaded
+            for rule = (find native rules :key #'%rule-native :test #'string=)
+            for hash = (cdr (assoc native texts :test #'string=))
+            for body = (and hash (handler-case (instruction-text store hash)
+                                   (instruction-set-error () nil)))
+            when rule
+              collect (let ((directive (%rule-directive rule)))
+                        (when (and body (string/= body (steer:steer-directive-body directive)))
+                          (setf directive
+                                (steer:make-steer-directive
+                                 :kind :rule
+                                 :name (steer:steer-directive-name directive)
+                                 :body body
+                                 :path (steer:steer-directive-path directive)
+                                 :extra (list* :hash hash
+                                               (let ((extra (copy-list (steer:steer-directive-extra directive))))
+                                                 (remf extra :hash)
+                                                 extra)))))
+                        directive)))))
 
-;;; Stubs.
+(defun %revision-rule-texts (store revision)
+  "→ alist (native path . text hash) of the rules REVISION recorded."
+  (loop for entry in (getf (cdr (assoc :rules (read-instruction-set store revision))) :found)
+        when (and (getf entry :path) (getf entry :text))
+          collect (cons (getf entry :path) (getf entry :text))))
 
-(defun resilience-agent-extra (settings backend &key model)
-  (declare (ignore settings backend model))
-  (%h3f-pending 'resilience-agent-extra))
+;;; Instructions after compaction: a run's copy of the session's discovery.
+;;; Inside a run only the loop's compaction (%INSTRUCTIONS-COMPACTED) forgets
+;;; all instructions; it first collects LIST-DIRECTIVES' paths to re-inject.
+
+(defmethod steer:list-directives :around ((discovery code-instruction-discovery) &key)
+  ;; A run copy also names its loaded rules, so the turn after a compaction
+  ;; calls DISCOVER-INSTRUCTIONS (and gets them from PENDING).
+  (if (%discovery-run-copy-p discovery)
+      (append (call-next-method)
+              (loop for native in (discovery-loaded-rules discovery)
+                    for rule = (find native (discovery-rules discovery)
+                                     :key #'%rule-native :test #'string=)
+                    when (and rule (not (rule-always-p rule)))
+                      collect (%rule-directive rule)))
+      (call-next-method)))
+
+(defmethod steer:forget-instructions :around ((discovery code-instruction-discovery) &key path)
+  (if (and (%discovery-run-copy-p discovery) (null path))
+      (let* ((set (car (%discovery-link discovery)))
+             (store (and set (instruction-set-store set))))
+        ;; The rules stay loaded and the set is not committed; the loaded
+        ;; ones come back verbatim from the current revision.
+        (setf (%discovery-pending discovery)
+              (%instruction-set-reinjection store (%instruction-set-revision set)
+                                            :rules (discovery-rules discovery)))
+        (let ((*%keep-loaded-rules* t))
+          (call-next-method)))
+      (call-next-method)))
+
+(defmethod steer:discover-instructions :around ((discovery code-instruction-discovery) path
+                                                &key (mark t))
+  (declare (ignore path mark))
+  (if (and (%discovery-run-copy-p discovery) (%discovery-pending discovery)
+           (not *%rule-pass*))
+      (append (shiftf (%discovery-pending discovery) '()) (call-next-method))
+      (call-next-method)))
+
+;;; Agent extras and windows.
+
+(defun %resilience (settings)
+  "RESILIENCE-SETTINGS of SETTINGS (a SETTINGS, or already such a plist)."
+  (if (and (listp settings) (keywordp (first settings)))
+      settings
+      (resilience-settings settings)))
 
 (defun make-settings-retry-policy (settings)
-  (declare (ignore settings))
-  (%h3f-pending 'make-settings-retry-policy))
+  (let ((r (%resilience settings)))
+    (llm:make-retry-policy :max-attempts (getf r :retry-max-attempts)
+                           :base-delay (/ (getf r :retry-initial-delay-ms) 1000)
+                           :max-delay (/ (getf r :retry-max-delay-ms) 1000)
+                           :jitter +retry-jitter+)))
+
+(defun %designator-parts (designator)
+  "\"openai:qwen3\" → (values \"qwen3\" \"openai\"); \"mock\" → (values NIL NIL)."
+  (let ((colon (and (stringp designator) (position #\: designator))))
+    (if colon
+        (values (subseq designator (1+ colon)) (subseq designator 0 colon))
+        (values nil nil))))
 
 (defun effective-context-window (settings backend designator)
-  (declare (ignore settings backend designator))
-  (%h3f-pending 'effective-context-window))
+  "→ (values tokens source); see the header. Never signals."
+  (let ((given (getf (%resilience settings) :context-window)))
+    (multiple-value-bind (model provider) (%designator-parts designator)
+      (cond ((integerp given) (values given :settings))
+            ((and (consp given)
+                  (some (lambda (key)
+                          (and key (cdr (assoc key given :test #'string=))))
+                        (list designator model provider "*")))
+             (values (some (lambda (key)
+                             (and key (cdr (assoc key given :test #'string=))))
+                           (list designator model provider "*"))
+                     :settings))
+            (t
+             (let ((n (and backend
+                           (handler-case (llm:context-window backend (or model designator))
+                             (error () nil)))))
+               (if (and (integerp n) (plusp n))
+                   (values n :provider)
+                   (values +default-context-window+ :default))))))))
+
+(defun %run-max-tokens (settings)
+  (let ((llm (and (typep settings 'settings) (model-params-llm-settings settings))))
+    (and llm (llm:llm-settings-max-tokens llm))))
+
+(defun resilience-agent-extra (settings backend &key model)
+  "The H3f keys of the agent settings' :EXTRA (see the header). MODEL is the
+designator the window is looked up for."
+  (let* ((r (%resilience settings))
+         (window (effective-context-window settings backend model))
+         (length-retry (or (getf r :length-retry-max-tokens)
+                           (let ((max (%run-max-tokens settings)))
+                             (and (integerp max) (min +max-length-retry-tokens+ (* 2 max)))))))
+    (append
+     (list :retry-policy (make-settings-retry-policy r)
+           :compaction (conversation-protocol:make-summary-memory
+                        :backend backend :tail-tokens (min 15000 (floor window 4)))
+           :max-continuations (getf r :max-continuations))
+     (and (getf r :auto-compact-enabled)
+          (list :compact-at (floor (* window (getf r :auto-compact-threshold-pct)) 100)))
+     (and length-retry (list :length-retry-max-tokens length-retry)))))
 
 (defun context-usage-pct (used window)
-  (declare (ignore used window))
-  (%h3f-pending 'context-usage-pct))
+  (if (and (realp window) (plusp window))
+      (min 999 (floor (* 100 (or used 0)) window))
+      0))
 
 (defun context-status-text (used window)
-  (declare (ignore used window))
-  (%h3f-pending 'context-status-text))
+  (format nil "ctx ~d%" (context-usage-pct used window)))
+
+;;; Events.
+
+(defun %reason-name (reason)
+  (substitute #\_ #\- (string-downcase (string reason))))
+
+(defun %ms (seconds)
+  (if (realp seconds) (round (* 1000 seconds)) :null))
+
+(defun %or-null (x) (if (null x) :null x))
+
+(defun %retry-event-keys (plist &optional secrets)
+  (let ((c (getf plist :condition)))
+    (list "subtype" "retry"
+          "step" (%or-null (getf plist :step))
+          "attempt" (%or-null (getf plist :attempt))
+          "max_attempts" (%or-null (getf plist :max-attempts))
+          "delay_ms" (%ms (or (getf plist :delay) 0))
+          "reason" (%reason-name (or (getf plist :reason) :transient))
+          "status" (%or-null (getf plist :status))
+          "retry_after_ms" (%ms (getf plist :retry-after))
+          "error" (if c
+                      (redact-secrets (let ((*print-pretty* nil)) (princ-to-string c))
+                                      (or secrets (getf plist :secrets)))
+                      :null))))
+
+(defun %compact-event-keys (plist)
+  (list "subtype" "compact"
+        "reason" (%reason-name (or (getf plist :reason) :threshold))
+        "turns_before" (%or-null (getf plist :before))
+        "turns_after" (%or-null (getf plist :after))
+        "tokens_before" (%or-null (getf plist :tokens-before))
+        "context_window" (%or-null (getf plist :context-window))))
+
+(defun %continuation-event-keys (plist)
+  (list "subtype" "continuation"
+        "step" (%or-null (getf plist :step))
+        "count" (%or-null (getf plist :count))
+        "max" (%or-null (getf plist :max))))
+
+(defun %truncated-event-keys (plist)
+  (list "subtype" "truncated"
+        "step" (%or-null (getf plist :step))
+        "tool_use_ids" (coerce (getf plist :calls) 'vector)
+        "max_tokens" (%or-null (getf plist :max-tokens))))
 
 (defun retry-event-object (plist)
-  (declare (ignore plist))
-  (%h3f-pending 'retry-event-object))
+  (apply #'%json-object "type" "system" (%retry-event-keys plist)))
 
 (defun compact-event-object (plist)
-  (declare (ignore plist))
-  (%h3f-pending 'compact-event-object))
+  (apply #'%json-object "type" "system" (%compact-event-keys plist)))
 
 (defun continuation-event-object (plist)
-  (declare (ignore plist))
-  (%h3f-pending 'continuation-event-object))
+  (apply #'%json-object "type" "system" (%continuation-event-keys plist)))
 
 (defun truncated-event-object (plist)
-  (declare (ignore plist))
-  (%h3f-pending 'truncated-event-object))
+  (apply #'%json-object "type" "system" (%truncated-event-keys plist)))
 
-(defun failed-turn-p (store)
-  (declare (ignore store))
-  (%h3f-pending 'failed-turn-p))
+(defun %resilience-init-keys (settings window source)
+  "The init event's H3f keys (always present)."
+  (let ((r (%resilience settings)))
+    (list "context_window" window
+          "context_window_source" (string-downcase (string source))
+          "auto_compact" (%json-object "enabled" (and (getf r :auto-compact-enabled) t)
+                                       "threshold_pct" (getf r :auto-compact-threshold-pct))
+          "retry" (%json-object "max_attempts" (getf r :retry-max-attempts)
+                                "initial_delay_ms" (getf r :retry-initial-delay-ms)
+                                "max_delay_ms" (getf r :retry-max-delay-ms))
+          "request_timeout_ms" (%or-null (getf r :request-timeout-ms))
+          "turn_timeout_ms" (%or-null (getf r :turn-timeout-ms)))))
 
-(defun compacted-session-turns (records)
-  (declare (ignore records))
-  (%h3f-pending 'compacted-session-turns))
-
-(defun session-full-turns (store &optional (designator +head-ref+))
-  (declare (ignore store designator))
-  (%h3f-pending 'session-full-turns))
-
-(defun make-capped-tool-source (source &key max-chars output-dir)
-  (declare (ignore source max-chars output-dir))
-  (%h3f-pending 'make-capped-tool-source))
-
-(defun cap-tool-result (text max-chars &key ref)
-  (declare (ignore text max-chars ref))
-  (%h3f-pending 'cap-tool-result))
+(defun %reason-words (reason)
+  (case reason
+    (:rate-limit "rate limited")
+    (:overloaded "overloaded")
+    (:transient "connection")
+    (:context-overflow "context overflow")
+    (:output-truncated "output truncated")
+    (t (string-downcase (string (or reason "retry"))))))
 
 (defun retry-notice-text (plist seconds-left)
-  (declare (ignore plist seconds-left))
-  (%h3f-pending 'retry-notice-text))
+  (let ((status (getf plist :status))
+        (attempt (getf plist :attempt))
+        (max (getf plist :max-attempts)))
+    (format nil "retrying in ~d s (~@[~a ~]~a)~@[ · attempt ~d~]~@[ of ~d~] · Esc to stop"
+            (max 0 (ceiling (or seconds-left 0)))
+            status (%reason-words (getf plist :reason))
+            (and attempt (1+ attempt)) (and attempt max))))
 
-(defun client-compact (session &key instructions)
-  (declare (ignore session instructions))
-  (%h3f-pending 'client-compact))
+(defun compaction-notice-text (marker)
+  "A session entry's notice for a compaction MARKER."
+  (format nil "compacted: ~d turns summarized (~(~a~))"
+          (max 0 (- (getf marker :at 0) (getf marker :keep 0)))
+          (getf marker :reason)))
 
-(defun client-retry-turn (session)
-  (declare (ignore session))
-  (%h3f-pending 'client-retry-turn))
+(defun compact-notice-text (plist)
+  "The TUI's notice for a :COMPACTED payload."
+  (format nil "compacted the conversation (~a → ~a turns, ~(~a~))"
+          (getf plist :before) (getf plist :after) (getf plist :reason)))
+
+;;; Failed turns, compaction records.
+
+(defun failed-turn-p (store)
+  (let ((head (session-head store)))
+    (and head (eq :failed (record-finish (revision-record head))) t)))
+
+(defun %fold-record-turns (records)
+  "The full conversation of RECORDS (root first), markers ignored, no :SYSTEM turns."
+  (let ((turns '()))
+    (dolist (record records)
+      (setf turns (if (record-replace-p record)
+                      (copy-list (record-turns record))
+                      (append turns (record-turns record)))))
+    (remove :system turns :key #'llm:llm-turn-role)))
+
+(defun compacted-session-turns (records)
+  "The conversation of RECORDS with the latest compaction marker applied."
+  (let ((full (%fold-record-turns records))
+        (marker (loop for record in (reverse records)
+                      for markers = (record-compactions record)
+                      when markers return (car (last markers)))))
+    (if (null marker)
+        full
+        (let ((at (min (getf marker :at) (length full))))
+          (append (copy-list (getf marker :summary))
+                  (last (subseq full 0 at) (getf marker :keep))
+                  (nthcdr at full))))))
+
+(defun session-full-turns (store &optional (designator +head-ref+))
+  (%fold-record-turns (session-records store designator)))
+
+;;; Tool output cap.
+
+(defun cap-tool-result (text max-chars &key ref)
+  (if (or (not (stringp text)) (null max-chars) (<= (length text) max-chars))
+      text
+      (let* ((n (length text))
+             (head-max (floor max-chars 2))
+             (lf (position #\Newline text :end head-max :from-end t))
+             (head-end (if lf (1+ lf) head-max))
+             (tail-start (- n (- max-chars head-end))))
+        (unless (and (> tail-start 0) (char= (char text (1- tail-start)) #\Newline))
+          (let ((next (position #\Newline text :start tail-start)))
+            (when next (setf tail-start (1+ next)))))
+        (with-output-to-string (s)
+          (write-string text s :end head-end)
+          (unless (or (zerop head-end) (char= (char text (1- head-end)) #\Newline))
+            (terpri s))
+          (write-string text s :start tail-start)
+          (unless (char= (char text (1- n)) #\Newline)
+            (terpri s))
+          (format s "[truncated: ~d characters~@[; the full output is in ~a~]]" n ref)))))
+
+(defclass capped-tool-source (agent:wrapper-tool-source)
+  ((max-chars :initarg :max-chars :reader capped-tool-source-max-chars)
+   (output-dir :initarg :output-dir :initform nil :reader capped-tool-source-output-dir))
+  (:documentation "H3f: a wrapper whose long results are cut by CAP-TOOL-RESULT."))
+
+(defun make-capped-tool-source (source &key (max-chars +default-max-tool-result-chars+)
+                                         output-dir)
+  (make-instance 'capped-tool-source :inner source :max-chars max-chars
+                                     :output-dir output-dir))
+
+(defun %safe-file-name (id)
+  (let ((name (map 'string (lambda (c) (if (or (alphanumericp c) (member c '(#\- #\_))) c #\_))
+                   (or id ""))))
+    (if (plusp (length name)) name (format nil "out-~36r" (random (expt 36 8))))))
+
+(defun %save-full-output (dir id text)
+  "TEXT into DIR/<id>.txt (atomic). → its native namestring, or NIL."
+  (when dir
+    (handler-case
+        (let ((file (merge-pathnames (make-pathname :name (%safe-file-name id) :type "txt")
+                                     (uiop:ensure-directory-pathname dir))))
+          (ensure-directories-exist file)
+          (p:write-text file text :atomic t)
+          (uiop:native-namestring file))
+      (error () nil))))
+
+(defun %cap-result (source result context)
+  (let ((max (capped-tool-source-max-chars source)))
+    (flet ((cap (text)
+             (if (and (stringp text) max (> (length text) max))
+                 (let* ((inv (and (listp context) (getf context :invocation)))
+                        (id (and inv (agent:agent-invocation-id inv)))
+                        (ref (%save-full-output (capped-tool-source-output-dir source) id text)))
+                   (cap-tool-result text max :ref ref))
+                 text)))
+      (typecase result
+        (string (cap result))
+        (agent:agent-tool-output
+         (let ((text (agent:agent-tool-output-text result)))
+           (if (and (stringp text) max (> (length text) max))
+               (agent:make-agent-tool-output :text (cap text)
+                                             :parts (agent:agent-tool-output-parts result)
+                                             :structured (agent:agent-tool-output-structured result))
+               result)))
+        (t result)))))
+
+(defmethod agent:invoke-tool-async ((source capped-tool-source) name arguments
+                                    &key context callback error-callback)
+  (agent:invoke-tool-async (agent:tool-source-inner source) name arguments
+                           :context context
+                           :callback (lambda (result)
+                                       (when callback
+                                         (funcall callback (%cap-result source result context))))
+                           :error-callback error-callback))
+
+;; WRAPPER-TOOL-SOURCE delegates only the four core generic functions; the
+;; permission resources and the instruction paths of the inner source must
+;; hold for the capped one too (skill(NAME) rules, path-scoped rules).
+(defmethod agent:tool-permission-resources ((source capped-tool-source) name arguments
+                                            &key context)
+  (agent:tool-permission-resources (agent:tool-source-inner source) name arguments
+                                   :context context))
+
+(defmethod agent:tool-permission-always-resources ((source capped-tool-source) name arguments
+                                                   &key context)
+  (agent:tool-permission-always-resources (agent:tool-source-inner source) name arguments
+                                          :context context))
+
+(defmethod agent:tool-instruction-paths ((source capped-tool-source) name arguments
+                                         &key context)
+  (agent:tool-instruction-paths (agent:tool-source-inner source) name arguments
+                                :context context))
+
+(defun %capped-sources (sources settings output-dir)
+  "SOURCES for the agent: the first two (agent-tools' files and shell, capped
+already) as they are, every later one wrapped by MAKE-CAPPED-TOOL-SOURCE."
+  (let ((max (getf (%resilience settings) :max-tool-result-chars)))
+    (append (subseq sources 0 (min 2 (length sources)))
+            (mapcar (lambda (s) (make-capped-tool-source s :max-chars max :output-dir output-dir))
+                    (nthcdr 2 sources)))))
+
+(defun %tool-output-dir (store)
+  (and store (merge-pathnames "tool-output/" (session-directory store))))
+
+;;; The idle /compact record.
+
+(defun commit-compaction-record (store marker &key model (permission-mode :default)
+                                                   instructions)
+  "Commit an idle compaction's record on STORE: prompt \"\", no turns, MARKER,
+finish :STOP, provenance (:kind :compaction), message \"/compact\". → (values
+revision store-it-went-to); a conflict forks as a turn's commit does."
+  (let ((record (make-turn-record :prompt "" :compactions (list marker) :finish :stop
+                                  :model model :permission-mode (or permission-mode :default)
+                                  :instructions instructions)))
+    (handler-bind ((session-conflict
+                     (lambda (c)
+                       (let ((restart (find-restart 'fork-session c)))
+                         (when restart (invoke-restart restart))))))
+      (commit-turn store record :message "/compact"
+                                :provenance (list :kind :compaction :version +version+)))))

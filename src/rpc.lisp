@@ -261,6 +261,18 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
     (subscription-not-found (list "subscription" (%null (subscription-not-found-id condition))))
     ;; H3e-2a
     (mcp-server-not-found (list "server" (%null (mcp-server-not-found-server condition))))
+    ;; H3f
+    (model-error (list "error_class" (string-downcase (symbol-name (type-of condition)))
+                       "status" (%null (let ((cause (model-error-cause condition)))
+                                         (or (and (typep condition 'model-http-error)
+                                                  (model-http-error-status condition))
+                                             (and (typep cause 'llm:llm-http-error)
+                                                  (llm:llm-http-error-status cause)))))
+                       "retry_after_ms" (let ((s (and (typep condition 'model-rate-limited)
+                                                      (model-rate-limited-retry-after condition))))
+                                          (if (realp s) (round (* 1000 s)) :null))))
+    (turn-timeout (list "ms" (%null (turn-timeout-ms condition))
+                        "source" (%null (turn-timeout-source condition))))
     (t '())))
 
 (defun rpc-error-for (condition)
@@ -370,6 +382,19 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
            (let ((session (%session-param client method params))
                  (server (%param method params "server" :string)))
              (%json-object "servers" (coerce (client-reconnect-mcp session server) 'vector)))))
+   ;; H3f
+   (cons "session/compact"
+         (lambda (client method params)
+           (let* ((session (%session-param client method params))
+                  (event (client-compact session
+                                         :instructions (%param method params "instructions"
+                                                               :string))))
+             (%json-object "compacted" (and event t) "event" (or event :null)))))
+   (cons "turn/retry"
+         (lambda (client method params)
+           (let ((session (%session-param client method params)))
+             (client-retry-turn session)
+             (%json-object "session_id" (code-session-id session)))))
    (cons "session/resume"
          (lambda (client method params)
            (let* ((last (%param method params "last" :boolean))
