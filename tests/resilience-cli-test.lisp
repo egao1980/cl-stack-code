@@ -50,7 +50,7 @@
         (ok (every (lambda (e) (eql 3 (jget e "max_attempts"))) retries))
         (ok (eql 529 (jget (first retries) "status")))
         (let ((d1 (jget (first retries) "delay_ms")) (d2 (jget (second retries) "delay_ms")))
-          (ok (and (integerp d1) (<= 8 d1 10)) (format nil "first delay ~a in [8, 10]" d1))
+          (ok (and (integerp d1) (<= 16 d1 20)) (format nil "first delay ~a in [16, 20]" d1))
           (ok (and (integerp d2) (<= 16 d2 20)) (format nil "second delay ~a in [16, 20]" d2))))
       (let ((r (result-line lines)))
         (ok (equal "success" (jget r "subtype")))
@@ -274,7 +274,7 @@
                                                        collect (format nil "line ~d of a large file with words" i)))))
 
 (defun read-big ()
-  (list :tool "read" (json-args "path" "big.txt")))
+  (list :tool "read" (json-args "file_path" "big.txt")))
 
 (deftest proactive-compaction-at-the-threshold
   (with-project (project config) (list +big-file+)
@@ -391,7 +391,7 @@
     (multiple-value-bind (exit lines err backend)
         (h3f-stream project config '("--permission-mode" "acceptEdits" "write it")
                     :steps (list '(:length-tool "write" "{\"path\":\"a.txt\",\"content\":\"aa")
-                                 (list :tool "write" (json-args "path" "a.txt" "content" "aaaa"))
+                                 (list :tool "write" (json-args "file_path" "a.txt" "content" "aaaa"))
                                  "done"))
       (ok (eql 0 exit) err)
       (ok (equal "aaaa" (read-file project "a.txt")))

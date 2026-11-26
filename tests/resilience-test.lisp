@@ -233,8 +233,8 @@
 
 (deftest program-status-line-shows-context
   (with-project (project config) '()
-    (write-file config "settings.json" "{\"contextWindow\":1000}")
-    (with-code-tui (tui program backend :steps '((:usage 450 "hello"))) (project config)
+    (write-file config "settings.json" "{\"contextWindow\":2000}")
+    (with-code-tui (tui program backend :steps '((:usage 900 "hello"))) (project config)
       (ok (not (has "ctx " (last-row tui))) "no ctx before the first response")
       (send-line tui "hi")
       (ok (wait-screen tui "hello"))
