@@ -186,6 +186,11 @@
 (defparameter +mcp-search-settings-keys+ '("mcpToolSearch" "mcpToolSearchThreshold")
   "H3e-2b: the settings keys %PARSE-MCP-SEARCH-KEYS parses.")
 
+;; Here, not in src/mcp-context.lisp (which exports it): src/mcp.lisp's
+;; MCP-MANAGER-TOOL-SOURCE reads it, and mcp.lisp compiles first (#67).
+(defparameter +tool-search-tool-name+ "tool_search"
+  "H3e-2b: the name of the tool that loads deferred MCP tools.")
+
 (defclass mcp-server-config ()
   ((name :initarg :name :reader mcp-server-config-name)
    (scope :initarg :scope :initform nil :accessor mcp-server-config-scope

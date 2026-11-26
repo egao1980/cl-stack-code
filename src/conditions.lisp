@@ -257,6 +257,8 @@ whose private ref was deleted and the object pruned). Nothing was restored.
 The default message is \"checkpoint <id8> for turn T was garbage-collected\".
 Exit 1.")
   (:report (lambda (c s)
+             ;; CHECKPOINT is defined later (src/checkpoints.lisp): not inlined (#67).
+             (declare (notinline checkpoint-id checkpoint-turn))
              (format s "~a" (or (code-error-message c)
                                 (let ((k (checkpoint-expired-checkpoint c)))
                                   (format nil "checkpoint ~a for turn ~a was garbage-collected"

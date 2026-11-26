@@ -113,9 +113,6 @@
 (defparameter +max-mcp-instructions-chars+ 8000
   "The longest server instructions text that goes into the prompt whole.")
 
-(defparameter +tool-search-tool-name+ "tool_search"
-  "The name of the tool that loads deferred MCP tools.")
-
 ;;; Stubbed (the header's rules).
 
 (defun mcp-connection-instructions (connection)
