@@ -271,20 +271,16 @@
                    'acp:acp-resource-not-found))))))
 
 (deftest acp-loopback-plan-mode
+  ;; H5c-0: H5a's mode is "preview"; preview events are no longer ACP plan
+  ;; updates (plan updates carry plan documents: plan-test).
   (with-project (project config) (list (list "a.txt" (nl "alpha")))
     (with-loopback (ra client project config :plan-area :copy
-                    :steps (list (write-step "a.txt" (nl "beta")) "Planned."))
+                                             :steps (list (write-step "a.txt" (nl "beta")) "Previewed."))
       (let ((sid (req (new-session-id ra project))))
-        (req (set-mode ra sid "plan"))
+        (req (set-mode ra sid "preview"))
         (ok (equal "end_turn" (req (stop-reason ra sid "make it beta") :seconds 90)))
-        (ok (equal (nl "alpha") (read-file project "a.txt")) "plan mode: the project is untouched")
-        (let ((plan (car (last (client-updates client 'acp:update-plan)))))
-          (ok plan "a plan update")
-          (when plan
-            (let ((entries (coerce (acp:entries plan) 'list)))
-              (ok (= 1 (length entries)))
-              (ok (has "a.txt" (acp:content (first entries))))
-              (ok (equal "pending" (acp:status (first entries)))))))))))
+        (ok (equal (nl "alpha") (read-file project "a.txt")) "preview mode: the project is untouched")
+        (ok (null (client-updates client 'acp:update-plan)) "no plan update from preview events")))))
 
 ;;; Stop reasons and errors.
 

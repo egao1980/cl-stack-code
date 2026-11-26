@@ -438,14 +438,18 @@ only
 ;;; Settings.
 
 (deftest plan-doc-settings
-  (with-project (project config) '()
+  (with-project (project config :base base) '()
     (write-file project ".cl-stack-code/settings.json"
                 "{\"planTemplate\": \"spec\", \"planSaveDirectory\": \"notes/plans\"}")
     (let ((s (load-settings project :user-config-dir config)))
       (ok (eq :spec (settings-plan-template s)))
       (ok (equal "notes/plans" (settings-plan-save-directory s))))
-    (ok (null (settings-plan-template (load-settings (subdir project "nowhere/") :user-config-dir config)))
-        "unset")))
+    ;; Contract fix: a sibling of the project (outside it, no settings file);
+    ;; a directory under the project would get the project's planTemplate.
+    (let ((elsewhere (subdir base "elsewhere/")))
+      (ensure-directories-exist elsewhere)
+      (ok (null (settings-plan-template (load-settings elsewhere :user-config-dir config)))
+          "unset"))))
 
 (deftest-parametrize plan-doc-settings-errors
     ((json key)

@@ -84,8 +84,9 @@ it signalled is signalled again here; no answer → CALL-TIMED-OUT."
             :documentation "fs/*: absolute native path → text.")
    (terminals :initform 0 :accessor %terminal-count)
    (permission :initarg :permission :initform 'acp:allow-once :accessor client-permission
-               :documentation "The restart invoked for ACP-PERMISSION-REQUIRED, or NIL
-to leave it unhandled (→ cancelled).")
+               :documentation "The restart invoked for ACP-PERMISSION-REQUIRED, an option id (a string,
+selected with SELECT-PERMISSION-OPTION), or NIL to leave it unhandled
+(→ cancelled).")
    (on-permission :initarg :on-permission :initform nil :accessor client-on-permission
                   :documentation "(lambda (client request)) run first.")
    (remote :initform nil :accessor client-remote
@@ -146,12 +147,18 @@ METHOD's when given."
   (%record client 'calls (cons "session/request_permission" request))
   (when (client-on-permission client)
     (funcall (client-on-permission client) client request))
-  (let ((restart (client-permission client)))
-    (if restart
-        (handler-bind ((acp:acp-permission-required
-                         (lambda (c) (invoke-restart (find-restart restart c)))))
-          (call-next-method))
-        (call-next-method))))
+  (let ((answer (client-permission client)))
+    (cond ((stringp answer)
+           ;; H5c-0: an option id, answered with SELECT-PERMISSION-OPTION (the
+           ;; plan approval offers several options of one kind).
+           (handler-bind ((acp:acp-permission-required
+                            (lambda (c) (acp:invoke-select-permission-option answer c))))
+             (call-next-method)))
+          (answer
+           (handler-bind ((acp:acp-permission-required
+                            (lambda (c) (invoke-restart (find-restart answer c)))))
+             (call-next-method)))
+          (t (call-next-method)))))
 
 (defmethod acp:acp-read-text-file ((client recording-client) request)
   (%record client 'calls (cons "fs/read_text_file" request))

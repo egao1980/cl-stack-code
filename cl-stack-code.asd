@@ -335,6 +335,8 @@
                (:file "mapping-test")
                (:file "loopback-test")
                (:file "loopback-tools-test")
+               ;; H5c-0: plan documents over ACP
+               (:file "plan-test")
                (:file "process-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
