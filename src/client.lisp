@@ -427,7 +427,10 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
   (unit-subs '())                       ; ("sub-N" SUP:SUBSCRIPTION), loop thread
   (unit-sub-counter 0)                  ; loop thread
   (units-lock (bt:make-lock "cl-stack-code session units"))
-  prev-sample prev-sample-time)         ; CLIENT-UNITS :RESOURCES, under UNITS-LOCK
+  prev-sample prev-sample-time          ; CLIENT-UNITS :RESOURCES, under UNITS-LOCK
+  ;; H3f (set once by %OPEN-CODE-SESSION): the effective context window and
+  ;; the secrets messages hide; RETRY-OF of the turn being started.
+  window secrets retry-of)
 
 ;;; The loop thread and dispatch.
 
@@ -698,7 +701,7 @@ MCP-CONFIGS, when given, are the servers exactly (a fork's)."
                                                               :sdk-servers mcp-servers :env env)))
          (resolved (multiple-value-list
                     (resolve-model designator :providers (%client-providers client) :env env)))
-         (backend (first resolved))
+         (backend (%apply-settings-request-timeout (first resolved) settings))
          (mode (or (settings-permission-mode settings) :default))
          (link (when (settings-lisp-image settings)
                  (check-lisp-image-settings settings mode)
@@ -774,9 +777,11 @@ MCP-CONFIGS, when given, are the servers exactly (a fork's)."
                               :backend backend
                               :model (third resolved)
                               :instructions instructions
-                              :tools sources
+                              :tools (%capped-sources sources settings (%tool-output-dir store))
                               :permissions (%agent-permissions settings)
-                              :settings (%agent-settings dir settings :discovery discovery)
+                              :settings (%agent-settings dir settings :discovery discovery
+                                                                      :backend backend
+                                                                      :designator designator)
                               :permission-store rules))
                       (session (make-instance 'code-session
                                               :client client
@@ -798,7 +803,10 @@ MCP-CONFIGS, when given, are the servers exactly (a fork's)."
                                    :unit-tools (code-unit-tools sources)
                                    :context context :discovery discovery
                                    :instruction-set instruction-set :render render
-                                   :mcp mcp))
+                                   :mcp mcp
+                                   :window (multiple-value-list
+                                            (effective-context-window settings backend designator))
+                                   :secrets (%run-secrets settings getenv)))
                  (push session (%client-sessions client))
                  (setf done t)
                  (when link
@@ -815,7 +823,10 @@ MCP-CONFIGS, when given, are the servers exactly (a fork's)."
                                                          (and link settings)
                                                          :context context :discovery discovery
                                                          :instruction-set instruction-set
-                                                         :mcp-servers (mcp-manager-connections mcp))
+                                                         :mcp-servers (mcp-manager-connections mcp)
+                                                         :resilience (apply #'%resilience-init-keys
+                                                                            settings
+                                                                            (%s-window (%session-state session))))
                                       (and turns (list "turns" turns))
                                       (and forked-from (list "forked_from" forked-from)))))
                  session))))
@@ -1169,7 +1180,9 @@ again, the run dropped."
     (%close-code-units nil :unit-tools (list (code-unit-tools sources))
                            :shell-tools (list (second sources)))))
 
-(defun %start-turn (session prompt mentions on-event)
+(defun %start-turn (session prompt mentions on-event &key retry-of)
+  "Start a turn. H3f: RETRY-OF (a failed revision id) starts a new run from the
+recorded conversation, adding no user turn."
   (let ((st (%live session)))
     (unless (eq :idle (%s-state st))
       (error 'turn-busy :session-id (code-session-id session)))
@@ -1183,6 +1196,14 @@ again, the run dropped."
            (store (code-session-store session))
            (ok (%sdk-callback session))
            (err (%sdk-error-callback session)))
+      ;; H3f
+      (setf (%report-window report) (first (%s-window st))
+            (%report-secrets report) (%s-secrets st)
+            (%report-timeout-ms report) (getf (resilience-settings (%s-settings st))
+                                              :turn-timeout-ms)
+            (%report-retry-of report) retry-of)
+      (when retry-of
+        (setf (%s-run st) nil (%s-handle st) nil))
       (setf (%s-turn st) turn
             (%s-report st) report
             (%s-state st) :running
@@ -1201,18 +1222,24 @@ again, the run dropped."
                   (run (%s-run st)))
               (if run
                   (progn
-                    (setf (%report-run report) run
-                          (%s-handle st) (agent:continue-ai-agent-async run text :callback ok
+                    (setf (%report-run report) run)
+                    (%ledger-start report (agent:agent-run-turns run) 0)
+                    (%arm-turn-timer report)
+                    (setf (%s-handle st) (agent:continue-ai-agent-async run text :callback ok
                                                                                  :error-callback err)))
                   (let ((history (session-turns store))
                         (committed (make-hash-table :test 'eq)))
                     (dolist (old history) (setf (gethash old committed) t))
+                    (%ledger-start report history 0)
+                    (%arm-turn-timer report)
                     (setf (%s-committed st) committed
                           (%s-usage st) (list 0 0 0 0)
                           (%s-steering st) '()
                           (%s-handle st)
                           (agent:run-ai-agent-async (%s-agent st)
-                                                    (append history (list (llm:user-turn text)))
+                                                    (if retry-of
+                                                        history
+                                                        (append history (list (llm:user-turn text))))
                                                     :on-event (%sdk-agent-event session)
                                                     :callback ok :error-callback err))))
               ;; H4b: image events queued while idle follow the prompt.
@@ -1223,6 +1250,100 @@ again, the run dropped."
 (defun client-turn (session prompt &key mentions on-event)
   (%on-client-loop ((code-session-client session))
     (%start-turn session prompt mentions on-event)))
+
+;;; H3f: re-sending a failed turn, and compacting an idle session.
+
+(defun client-retry-turn (session)
+  "Re-send SESSION's failed last turn from the recorded conversation (no new
+user turn). → a CODE-TURN; NOTHING-TO-RETRY when the head did not fail."
+  (%on-client-loop ((code-session-client session))
+    (let* ((st (%live session))
+           (store (code-session-store session)))
+      (unless (eq :idle (%s-state st))
+        (error 'turn-busy :session-id (code-session-id session)))
+      (unless (failed-turn-p store)
+        (error 'nothing-to-retry))
+      (let ((head (session-head store)))
+        (%start-turn session (record-prompt (revision-record head)) nil nil
+                     :retry-of (rev:revision-id head))))))
+
+(defun client-compact (session &key instructions)
+  "Compact SESSION's conversation now (idle only; busy → TURN-BUSY). The
+compaction is recorded as an idle /compact record. → the compact event
+object, or NIL when nothing was compacted."
+  (check-type instructions (or null string))
+  (let ((client (code-session-client session)))
+    (when (%loop-thread-p client)
+      (error 'code-usage-error :message "CLIENT-COMPACT cannot run on the client's loop thread"))
+    (let ((lock (bt:make-lock "client compact"))
+          (cv (bt:make-condition-variable))
+          (box nil))
+      (flet ((done (value)
+               (bt:with-lock-held (lock)
+                 (setf box (or value (list :none)))
+                 (bt:condition-notify cv))))
+        (%on-client-loop (client)
+          (let ((st (%live session)))
+            (unless (eq :idle (%s-state st))
+              (error 'turn-busy :session-id (code-session-id session)))
+            (let ((run (%s-run st)))
+              (if (null run)
+                  (done nil)
+                  (let ((report (%session-report session)))
+                    (%ledger-start report (agent:agent-run-turns run) 0)
+                    (setf (%report-run report) run
+                          (%report-window report) (first (%s-window st))
+                          (%s-report st) report
+                          (%s-state st) :compacting)
+                    (flet ((finish (value)
+                             (setf (%s-state st) :idle
+                                   (%s-report st) nil)
+                             (done value)))
+                      (handler-case
+                          (agent:compact-agent-run
+                           run :instructions instructions
+                               :callback
+                               (lambda (did)
+                                 (finish
+                                  (handler-case
+                                      (let ((marker (first (%report-markers report))))
+                                        (when (and did marker)
+                                          (%commit-session-compaction session st marker)
+                                          (list :event (compact-event-object
+                                                        (list :reason :manual
+                                                              :before (%compact-payload-before report)
+                                                              :after (length (agent:agent-run-turns run))
+                                                              :tokens-before (getf marker :tokens-before)
+                                                              :context-window (first (%s-window st)))))))
+                                    (error (e) (list :error e)))))
+                               :error-callback (lambda (e) (finish (list :error e))))
+                        (error (e) (finish (list :error e))))))))))
+        (bt:with-lock-held (lock)
+          (loop until box do (bt:condition-wait cv lock :timeout 0.2)))
+        (case (first box)
+          (:event (second box))
+          (:error (let ((e (second box)))
+                    ;; "no compaction memory" or "run is busy": nothing compacted.
+                    (if (typep e 'agent:agent-condition) nil (error e))))
+          (t nil))))))
+
+(defun %compact-payload-before (report)
+  (getf (%report-last-compaction report) :before))
+
+(defun %commit-session-compaction (session st marker)
+  "Loop thread: commit the idle /compact record of MARKER."
+  (let ((old (code-session-store session)))
+    (multiple-value-bind (revision store)
+        (commit-compaction-record old marker
+                                  :model (%s-designator st)
+                                  :permission-mode (%s-mode st)
+                                  :instructions (let ((set (%s-instruction-set st)))
+                                                  (and set (instruction-set-current set))))
+      (unless (eq store old)
+        (%rehome-instruction-set (%s-instruction-set st) store)
+        (setf (code-session-store session) store
+              (code-session-id session) (session-id store)))
+      revision)))
 
 (defun client-wait (turn &key timeout)
   (let ((client (code-session-client (code-turn-session turn))))
@@ -1342,7 +1463,9 @@ on the loop thread. The watcher only reads the session's state."
               (%s-mode st) mode
               (code-session-permission-mode session) mode
               (agent:ai-agent-settings agent) (%agent-settings (%s-cwd st) settings
-                                                               :discovery (%s-discovery st))
+                                                               :discovery (%s-discovery st)
+                                                               :backend (agent:ai-agent-backend agent)
+                                                               :designator (%s-designator st))
               ;; The next turn starts a new run on SESSION-TURNS.
               (%s-run st) nil
               (%s-handle st) nil)
@@ -1479,11 +1602,14 @@ on the loop thread. The watcher only reads the session's state."
 forks the session (the \"session\" \"forked\" event). → (values revision
 store) or NIL."
   (let* ((committed (%s-committed st))
+         (in-flight (agent:agent-run-in-flight-turn run))
          (new (remove-if (lambda (turn)
-                           (or (eq :system (llm:llm-turn-role turn)) (gethash turn committed)))
+                           (or (eq :system (llm:llm-turn-role turn)) (gethash turn committed)
+                               ;; H3f: the partial turn of a failed step
+                               (eq turn in-flight)))
                          (agent:agent-run-turns run))))
     (setf (%s-usage st) (mapcar #'+ (%s-usage st) (%report-usage report)))
-    (when new
+    (when (or new (%report-markers report))
       (handler-case
           (let* ((old (code-session-store session))
                  (plan (%s-plan st))
@@ -1498,7 +1624,10 @@ store) or NIL."
                                                       (plan-record plan))
                                            ;; H3e-1
                                            :instructions (let ((set (%s-instruction-set st)))
-                                                           (and set (instruction-set-current set))))))
+                                                           (and set (instruction-set-current set)))
+                                           ;; H3f
+                                           :compactions (reverse (%report-markers report))
+                                           :retry-of (%report-retry-of report))))
             (multiple-value-bind (revision store) (%commit-forking old record)
               (dolist (turn new) (setf (gethash turn committed) t))
               (setf (%s-usage st) (list 0 0 0 0)
@@ -1521,6 +1650,7 @@ result; then the session is idle and CLIENT-WAIT answers."
   (when (member (%s-state st) '(:idle :ending))
     (return-from %finish-turn nil))
   (setf (%s-state st) :ending)
+  (%disarm-turn-timer (%s-report st))
   (let* ((report (%s-report st))
          (turn (%s-turn st))
          (failure (or (%report-failure report) failure))
@@ -1553,7 +1683,8 @@ result; then the session is idle and CLIENT-WAIT answers."
             (setf (%report-plan report)
                   (%plan-object plan :open (plan-changes plan) (plan-diff-text plan) '())))))
     (multiple-value-bind (revision store)
-        (and run (%sdk-commit session st run report (%run-finish run failure interrupted)))
+        (and run (%sdk-commit session st run report
+                              (%run-finish run (or failure (%report-timeout report)) interrupted)))
       (let ((pre (shiftf (%s-pre st) nil)))
         (when (and revision pre)
           (handler-case (end-checkpoint-turn (%s-checkpointer st) store pre revision)
@@ -1561,14 +1692,19 @@ result; then the session is idle and CLIENT-WAIT answers."
     (when paused
       (setf (%s-run st) nil (%s-handle st) nil))
     (multiple-value-bind (subtype condition)
-        (%outcome run failure interrupted (%s-max-turns st))
+        (%turn-outcome report run failure interrupted (%s-max-turns st))
+      ;; H3f: after a model failure or a timeout the next turn starts from the
+      ;; recorded conversation, never from a run holding a half step.
+      (when (typep condition '(or model-error turn-timeout))
+        (setf (%s-run st) nil (%s-handle st) nil))
       (setf result (%result-object report subtype
-                                   (if (and run (not failure))
+                                   (if (and run (not failure) (not (%report-timeout report)))
                                        (%trim-answer (agent:agent-run-text run))
                                        "")
                                    (and condition (princ-to-string condition))
                                    (round (* 1000 (- (get-internal-real-time) (%s-start st)))
-                                          internal-time-units-per-second)))
+                                          internal-time-units-per-second)
+                                   condition))
       (funcall (%report-sink report) result))
     (setf (%s-state st) :idle
           (%s-turn st) nil

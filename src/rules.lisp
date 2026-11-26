@@ -86,7 +86,12 @@ order; copies share the cons.")
    (link :initarg :link :reader %discovery-link
          :initform (list nil)
          :documentation "A cons whose car is the INSTRUCTION-SET this discovery
-commits (MAKE-INSTRUCTION-SET :DISCOVERY), or NIL; copies share the cons."))
+commits (MAKE-INSTRUCTION-SET :DISCOVERY), or NIL; copies share the cons.")
+   ;; H3f (src/resilience.lisp, "Instructions after compaction")
+   (run-copy-p :initform nil :accessor %discovery-run-copy-p
+               :documentation "True for a run's copy (COPY-INSTRUCTION-DISCOVERY).")
+   (pending :initform '() :accessor %discovery-pending
+            :documentation "Rule directives a compaction left to re-inject."))
   (:documentation "H3e-1: nested AGENTS.md (the parent class) plus path-scoped
 rules, loaded once per session. See the header."))
 
@@ -201,7 +206,9 @@ RULE-FORMAT-ERROR. See the header."
     (setf (slot-value new 'rules) (discovery-rules discovery)
           (slot-value new 'project-dir) (discovery-project-dir discovery)
           (slot-value new 'loaded) (%discovery-loaded discovery)
-          (slot-value new 'link) (%discovery-link discovery))
+          (slot-value new 'link) (%discovery-link discovery)
+          ;; H3f
+          (%discovery-run-copy-p new) t)
     new))
 
 (defun %rule-directive (rule)
@@ -259,7 +266,13 @@ parent's per-path calls give AGENTS.md directives only.")
           (unless (member native (car cell) :test #'string=)
             (setf (car cell) (append (car cell) (list native)))))))))
 
+(defvar *%keep-loaded-rules* nil
+  "H3f: true while a run's compaction forgets its instructions: the rules stay
+loaded and nothing is committed (src/resilience.lisp).")
+
 (defmethod steer:forget-instructions :after ((discovery code-instruction-discovery) &key path)
+  (when *%keep-loaded-rules*
+    (return-from steer:forget-instructions))
   (let* ((cell (%discovery-loaded discovery))
          (before (car cell))
          (always (loop for rule in (discovery-rules discovery)

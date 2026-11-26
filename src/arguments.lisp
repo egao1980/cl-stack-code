@@ -54,7 +54,10 @@ NIL to read the prompt from input (no free argument, or \"-\").")
           :documentation "--rpc: serve JSON-RPC 2.0 on standard input and output.")
    ;; ACP-2
    (acp-p :initarg :acp-p :reader invocation-acp-p :initform nil
-          :documentation "--acp: serve the Agent Client Protocol on standard input and output."))
+          :documentation "--acp: serve the Agent Client Protocol on standard input and output.")
+   ;; H3f
+   (retry-p :initarg :retry-p :reader invocation-retry-p :initform nil
+            :documentation "--retry: re-send the resumed session's failed last turn."))
   (:documentation "One parsed command line."))
 
 (defparameter +output-format-names+ '("text" "json" "stream-json")
@@ -129,6 +132,15 @@ ours to rebind, so it goes in as :BACKEND)."
            (opt "mcp-config" "MCP servers from a file (or JSON text) in .mcp.json shape; repeatable"
                 :kind :list)
            (opt "strict-mcp-config" "Use only the --mcp-config servers (ignore .mcp.json and settings)"
+                :kind :flag)
+           ;; H3f
+           (opt "max-retries" "Retries of a failed model call (0 = none; default 3)")
+           (opt "request-timeout" "Seconds a model request may take (passed to the provider backend)")
+           (opt "turn-timeout" "Seconds a whole turn may take (default: no limit)")
+           (opt "context-window" "The model's context window in tokens (when the provider does not say)")
+           (opt "no-auto-compact" "Do not compact the conversation when it nears the context window"
+                :kind :flag)
+           (opt "retry" "With --resume or --continue and no prompt: re-send the session's failed last turn"
                 :kind :flag)))))
 
 (defun %lisp-image-flag (value observe)
@@ -255,6 +267,7 @@ are present is checked by RUN-CLI, not here."
          :list-checkpoints-p (and (get-opt :list-checkpoints) t)
          :rpc-p (and (get-opt :rpc) t)
          :acp-p (and (get-opt :acp) t)
+         :retry-p (and (get-opt :retry) t)
          :settings (make-settings
                     :model (get-opt :model)
                     :max-turns (%max-turns (get-opt :max-turns))
@@ -272,7 +285,17 @@ are present is checked by RUN-CLI, not here."
                     :skill-dirs (%path-flags "--skill-dir" (get-opt :skill-dir) t)
                     :context-files (%path-flags "--context-file" (get-opt :context-file) nil)
                     ;; H3e-2a
-                    :mcp (%mcp-flags (get-opt :mcp-config) (get-opt :strict-mcp-config))))))))
+                    :mcp (%mcp-flags (get-opt :mcp-config) (get-opt :strict-mcp-config))
+                    ;; H3f
+                    :resilience (and (or (get-opt :max-retries) (get-opt :request-timeout)
+                                         (get-opt :turn-timeout) (get-opt :context-window)
+                                         (get-opt :no-auto-compact))
+                                     (%resilience-flags
+                                      :max-retries (get-opt :max-retries)
+                                      :request-timeout (get-opt :request-timeout)
+                                      :turn-timeout (get-opt :turn-timeout)
+                                      :context-window (get-opt :context-window)
+                                      :no-auto-compact (get-opt :no-auto-compact)))))))))
 
 (defun %usage-text (stream)
   "Write the --help text to STREAM."

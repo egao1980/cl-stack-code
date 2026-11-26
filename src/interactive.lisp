@@ -353,6 +353,8 @@
             "  /reject               discard the open plan"
             "  /ps                   the session's units (shell jobs, servers, subagents): logs, search, stop (also Ctrl-P)"
             "  /mcp [reconnect [N]]  MCP servers, their status and tools; reconnect one or all"
+            "  /compact [TEXT]       summarize the conversation now (TEXT: what the summary must keep)"
+            "  /retry                re-send the last turn after it failed"
             "  /exit                 quit (also Ctrl-D, or Ctrl-C on an empty input)"
             "Keys:"
             "  Enter send · Alt+Enter, Shift+Enter or Ctrl+J newline · Up/Down history"
@@ -438,7 +440,12 @@ asked about or run.")
    (mcp :initform '() :accessor state-mcp
         :documentation "The MCP servers (MCP-CONNECTION-OBJECT hash tables), from (:mcp-status …).")
    (mcp-prompt :initform '() :accessor state-mcp-prompt
-               :documentation "((NAME . MESSAGE) …): project servers waiting for the approval dialog."))
+               :documentation "((NAME . MESSAGE) …): project servers waiting for the approval dialog.")
+   ;; H3f (src/resilience.lisp, "TUI")
+   (retry :initform nil :accessor state-retry
+          :documentation "NIL, or (PLIST . DEADLINE): the retry waiting, DEADLINE an internal real time.")
+   (context :initform nil :accessor state-context
+            :documentation "NIL, or \"ctx P%\" of the last response."))
   (:documentation "What the interactive mode knows; see INTERACTIVE-UPDATE."))
 
 (defun make-interactive-state (&key (model +default-model+) (permission-mode :default)
@@ -597,6 +604,19 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
          (%plan-command state command argument))
         ;; H8d
         ((string= command "/ps") (%units-command state argument))
+        ;; H3f
+        ((member command '("/compact" "/retry") :test #'string=)
+         (cond (busy
+                (%add-entry state :kind :error
+                                  :text (format nil "~a is not available while a turn runs (Esc interrupts it)"
+                                                command))
+                '())
+               ((string= command "/compact")
+                (setf (state-busy-p state) t)
+                (list (list :compact (and (plusp (length argument)) argument))))
+               (t
+                (setf (state-busy-p state) t)
+                (list (list :retry-turn)))))
         ;; H3e-2a
         ((string= command "/mcp") (%mcp-command state argument))
         ((string= command "/help")
@@ -726,12 +746,21 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
                                 ((state-busy-p state) (list (list :cancel)))
                                 (t '())))
               (:quit (%quit-effects state))
-              (:part (%core-part state (first args)))
+              (:part (setf (state-retry state) nil)
+               (%core-part state (first args)))
               (:usage (setf (state-usage state) (mapcar #'+ (state-usage state) (first args)))
                '())
               (:invocation (%core-invocation state (first args)))
-              (:turn-end (destructuring-bind (&key reason pending message) args
-                           (%on-turn-end state reason pending message)))
+              (:turn-end (destructuring-bind (&key reason pending message retryable) args
+                           (setf (state-retry state) nil)
+                           (%on-turn-end state reason pending
+                                         (if (and retryable message (eq reason :failed))
+                                             (concatenate 'string message " — /retry to send it again")
+                                             message))))
+              ;; H3f
+              ((:retry :compacted :continuation :truncated :context :retry-refused
+                :compact-done)
+               (%resilience-event state event))
               (:reply (cond ((state-approvals state) (%reply state (first args) (second args)))
                             ((state-plan-prompt state) (%plan-event state event))
                             ;; H5b
@@ -755,6 +784,38 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
               ;; H3e-2a
               ((:mcp-status :mcp-approval :mcp-reply) (%mcp-event state event))))))
     (values state effects)))
+
+;;; H3f: resilience events (src/resilience.lisp, "TUI").
+
+(defun %resilience-event (state event)
+  (destructuring-bind (kind &rest args) event
+    (ecase kind
+      (:retry (let* ((plist (first args))
+                     (delay (or (getf plist :delay) 0)))
+                (setf (state-retry state)
+                      (cons plist (+ (get-internal-real-time)
+                                     (round (* delay internal-time-units-per-second))))))
+       '())
+      (:compacted (%add-entry state :kind :notice :text (compact-notice-text (first args)))
+       '())
+      ((:continuation :truncated) '())
+      (:context (setf (state-context state) (context-status-text (first args) (second args)))
+       '())
+      (:retry-refused (setf (state-busy-p state) nil)
+       (%add-entry state :kind :error :text (first args))
+       '())
+      (:compact-done (setf (state-busy-p state) nil)
+       (when (first args)
+         (%add-entry state :kind :notice :text (first args)))
+       '()))))
+
+(defun state-retry-notice (state)
+  "The spinner row's text while a retry waits, or NIL."
+  (let ((retry (state-retry state)))
+    (and retry
+         (retry-notice-text (car retry)
+                            (max 0 (/ (- (cdr retry) (get-internal-real-time))
+                                      internal-time-units-per-second))))))
 
 (defun %home-relative (dir)
   "DIR (a native directory namestring) with the user's home shown as \"~/\"."
@@ -836,11 +897,13 @@ middle, not its end: the project directory name stays (#4)."
                   ""))
          (right (destructuring-bind (input output &optional (cache-read 0) (cache-write 0))
                     (state-usage state)
-                  (format nil "~@[~a · ~]~a in~@[ (~a cached)~] · ~a out "
+                  (format nil "~@[~a · ~]~a in~@[ (~a cached)~] · ~a out ~@[· ~a ~]"
                           (%units-marker state)
                           (%token-count (+ input cache-read cache-write))
                           (and (plusp cache-read) (%token-count cache-read))
-                          (%token-count output)))))
+                          (%token-count output)
+                          ;; H3f
+                          (state-context state)))))
     ;; The widget gives the left side WIDTH - right - 1 columns (all of
     ;; WIDTH when the right side is dropped, at right + 2 > WIDTH).
     (when (and width (plusp (length dir)))

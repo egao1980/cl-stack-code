@@ -382,7 +382,18 @@
            :documentation "→ the working directory's system prompt, from the set's current revision.")
    ;; H3e-2a (set by MAKE-CODE-PROGRAM)
    (mcp :initarg :mcp :initform nil :reader %cp-mcp
-        :documentation "The session's MCP-MANAGER."))
+        :documentation "The session's MCP-MANAGER.")
+   ;; H3f (loop thread; set by MAKE-CODE-PROGRAM)
+   (window :initarg :window :initform nil :accessor %cp-window
+           :documentation "The effective context window (tokens).")
+   (secrets :initarg :secrets :initform '() :reader %cp-secrets
+            :documentation "The strings model-failure messages hide.")
+   (turn-markers :initform '() :accessor %cp-turn-markers
+                 :documentation "Compaction markers since the last commit, newest first.")
+   (turn-retry-of :initform nil :accessor %cp-turn-retry-of
+                  :documentation "The failed revision the running turn re-sends, or NIL.")
+   (turn-attempts :initform 1 :accessor %cp-turn-attempts
+                  :documentation "Calls of the current step (for the failure message)."))
   (:documentation "The interactive mode as a tui-protocol program."))
 
 (defun %make-input (program-cell)
@@ -413,7 +424,7 @@ configuration errors of -p signal here."
          (mcp-configs (effective-mcp-servers cwd settings :user-config-dir config :env env))
          (resolved (multiple-value-list
                     (resolve-model designator :providers providers :env env)))
-         (backend (first resolved))
+         (backend (%apply-settings-request-timeout (first resolved) settings))
          (mode (or (settings-permission-mode settings) :default))
          ;; H4b: the checks, before the session is written.
          (link (when (settings-lisp-image settings)
@@ -488,9 +499,12 @@ configuration errors of -p signal here."
                                   :backend backend
                                   :model (third resolved)
                                   :instructions instructions
-                                  :tools sources
+                                  :tools (%capped-sources sources settings
+                                                          (%tool-output-dir session))
                                   :permissions (%agent-permissions settings)
-                                  :settings (%agent-settings cwd settings :discovery discovery)
+                                  :settings (%agent-settings cwd settings :discovery discovery
+                                                                          :backend backend
+                                                                          :designator designator)
                                   :permission-store store))
                           (cell (list nil))
                           (program
@@ -527,6 +541,9 @@ configuration errors of -p signal here."
                              :instruction-set instruction-set
                              :render render
                              :mcp mcp
+                             ;; H3f
+                             :window (effective-context-window settings backend designator)
+                             :secrets (%run-secrets settings getenv)
                              :viewport (make-instance 'w:viewport :follow t :wrap nil)
                              :spinner (make-instance 'w:spinner
                                                      :active nil
@@ -641,10 +658,13 @@ before the turn end reaches the UI. A conflict forks the session; any other
 error is an (:error M) and the turns go into the next commit. → (values
 revision store), or NIL when nothing was committed."
   (let* ((committed (%cp-committed program))
+         (in-flight (agent:agent-run-in-flight-turn run))
          (new (remove-if (lambda (turn)
-                           (or (eq :system (llm:llm-turn-role turn)) (gethash turn committed)))
+                           (or (eq :system (llm:llm-turn-role turn)) (gethash turn committed)
+                               ;; H3f: the partial turn of a failed step
+                               (eq turn in-flight)))
                          (agent:agent-run-turns run))))
-    (when new
+    (when (or new (%cp-turn-markers program))
       (handler-case
           (let ((old (%cp-session program))
                 (record (make-turn-record :prompt (%cp-turn-prompt program)
@@ -659,11 +679,16 @@ revision store), or NIL when nothing was committed."
                                                        (plan-record plan)))
                                           ;; H3e-1
                                           :instructions (let ((set (%cp-instruction-set program)))
-                                                          (and set (instruction-set-current set))))))
+                                                          (and set (instruction-set-current set)))
+                                          ;; H3f
+                                          :compactions (reverse (%cp-turn-markers program))
+                                          :retry-of (%cp-turn-retry-of program))))
             (multiple-value-bind (revision store) (%commit-forking old record)
               (dolist (turn new) (setf (gethash turn committed) t))
               (setf (%cp-turn-usage program) (list 0 0 0 0)
-                    (%cp-turn-steering program) '())
+                    (%cp-turn-steering program) '()
+                    (%cp-turn-markers program) '()
+                    (%cp-turn-retry-of program) nil)
               (unless (eq store old)
                 ;; H3e-1: the set's revisions go to the clone from now on.
                 (%rehome-instruction-set (%cp-instruction-set program) store)
@@ -715,11 +740,20 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
 (defun %turn-error-callback (program)
   (lambda (condition)
     (%refresh-files program)
-    (let ((run (%cp-run program)))
+    (let ((run (%cp-run program))
+          ;; H3f: a model failure is classified; its message names no secret.
+          (classified (classify-model-failure condition
+                                              :attempts (%cp-turn-attempts program)
+                                              :secrets (%cp-secrets program))))
       (%end-steering program run)
       (multiple-value-bind (revision store) (and run (%commit-run program run :failed))
-        (%end-checkpoint-turn program revision store)))
-    (%send program (list :turn-end :reason :failed :message (%message-text condition)))))
+        (%end-checkpoint-turn program revision store))
+      ;; The next turn (or /retry) starts from the recorded conversation.
+      (when classified
+        (%drop-run program))
+      (%send program (list :turn-end :reason :failed
+                                     :message (%message-text (or classified condition))
+                                     :retryable (and classified t))))))
 
 (defun %on-inbox (program turns)
   "The run took TURNS from its inbox: the steering among them, as typed."
@@ -745,21 +779,39 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
           (:response (let ((counts (%usage-counts (llm:llm-response-usage payload))))
                        (setf (%cp-turn-usage program)
                              (mapcar #'+ (%cp-turn-usage program) counts))
-                       (%send program (list :usage counts))))
+                       (%send program (list :usage counts))
+                       ;; H3f: the status line's ctx P%.
+                       (when (%cp-window program)
+                         (%send program (list :context (+ (first counts) (third counts)
+                                                          (fourth counts))
+                                              (%cp-window program))))))
           (:inbox (%on-inbox program payload))
           (:invocation (%send program (list :invocation payload)))
           ;; H3e-2a: before the model call.
-          (:step (%mcp-before-model-call (%cp-mcp program))))
+          (:step (setf (%cp-turn-attempts program) 1)
+           (%mcp-before-model-call (%cp-mcp program)))
+          ;; H3f
+          (:retry (when (getf payload :max-attempts)
+                    (setf (%cp-turn-attempts program) (1+ (or (getf payload :attempt) 0))))
+                  (%send program (list :retry (let ((p (copy-list payload)))
+                                                (remf p :condition)
+                                                p))))
+          (:compacted (push (%program-compaction-marker program payload)
+                            (%cp-turn-markers program))
+                      (%send program (list :compacted payload)))
+          ((:continuation :truncated) (%send program (list kind payload))))
       (error (e) (%send program (list :error (%message-text e)))))))
 
-(defun %loop-start-turn (program text &key message more)
+(defun %loop-start-turn (program text &key message more retry-of)
   "Loop thread: send TEXT (mentions expanded) as the next user message. A new
 run starts on the session's conversation. H4b: MESSAGE (an LLM-TURN) is sent
 instead, as it is, with TEXT as the record's prompt, and the turns MORE are
 posted right after it; then the queued image events are posted."
   (let ((ok (%turn-callback program))
         (err (%turn-error-callback program)))
-    (setf (%cp-turn-prompt program) text)
+    (setf (%cp-turn-prompt program) text
+          (%cp-turn-retry-of program) retry-of)
+    (when retry-of (%drop-run program))
     (handler-case
         (let* ((root (progn
                        ;; H5a: plan mode opens (or reopens) the plan first;
@@ -790,10 +842,12 @@ posted right after it; then the queued image events are posted."
                             (%cp-turn-usage program) (list 0 0 0 0)
                             (%cp-turn-steering program) '())
                       (agent:run-ai-agent-async (%cp-agent program)
-                                                (append history
-                                                        (list (if (stringp prompt)
-                                                                  (llm:user-turn prompt)
-                                                                  prompt)))
+                                                (if retry-of
+                                                    history
+                                                    (append history
+                                                            (list (if (stringp prompt)
+                                                                      (llm:user-turn prompt)
+                                                                      prompt))))
                                                 :on-event (%program-agent-event program)
                                                 :callback ok :error-callback err))))
           ;; H4b: the run is going now (:started came synchronously, a
@@ -865,7 +919,8 @@ notices (lisp-mcp/agent has no way to queue them again)."
           (resolve-model designator :providers (%cp-providers program) :env (%cp-env program))
         (declare (ignore name))
         (let ((agent (%cp-agent program)))
-          (setf (agent:ai-agent-backend agent) backend
+          (setf (agent:ai-agent-backend agent) (%apply-settings-request-timeout
+                                                backend (%cp-settings program))
                 (agent:ai-agent-model agent) model
                 (%cp-designator program) designator))
         (%send program (list :model-set designator)))
@@ -1045,7 +1100,74 @@ from the tip's (H5b), else H3c's conversation rewind."
                                             (lambda (m) (reconnect-mcp-server m name)))))
       (:mcp-approve (destructuring-bind (name choice) args
                       (%on-loop program (lambda () (%mcp-approve program name choice)))))
+      ;; H3f
+      (:compact (let ((text (first args)))
+                  (%on-loop program (lambda () (%compact-effect program text)))))
+      (:retry-turn (setf (%cp-interrupted program) nil)
+       (%on-loop program (lambda () (%retry-turn-effect program))))
       (:quit nil))))
+
+;;; H3f: /compact and /retry (loop thread).
+
+(defun %program-compaction-marker (program payload)
+  "The marker of a :COMPACTED PAYLOAD: AT counts the recorded full history
+and the run's turns not committed yet."
+  (let* ((run (%cp-run program))
+         (committed (%cp-committed program))
+         (pending (and run (count-if (lambda (turn)
+                                       (and (not (eq :system (llm:llm-turn-role turn)))
+                                            (not (gethash turn committed))))
+                                     (last (agent:agent-run-turns run)
+                                           (or (getf payload :keep) 0)))))
+         (tail (and run (last (agent:agent-run-turns run) (or (getf payload :keep) 0))))
+         (keep (count :system tail :key #'llm:llm-turn-role :test-not #'eq)))
+    (make-compaction-marker
+     :summary (getf payload :summary)
+     :keep keep
+     :at (+ (length (session-full-turns (%cp-session program))) (or pending 0))
+     :reason (getf payload :reason)
+     :tokens-before (getf payload :tokens-before)
+     :instructions (%instruction-set-revision (%cp-instruction-set program)))))
+
+(defun %compact-effect (program instructions)
+  "(:compact TEXT): compact the live run now; the idle /compact record."
+  (let ((run (%cp-run program)))
+    (flet ((done (&optional notice)
+             (%send program (list :compact-done notice))))
+      (if (null run)
+          (done "nothing to compact yet")
+          (handler-case
+              (agent:compact-agent-run
+               run :instructions instructions
+                   :callback (lambda (did)
+                               (handler-case
+                                   (let ((markers (shiftf (%cp-turn-markers program) '())))
+                                     (if (and did markers)
+                                         (multiple-value-bind (revision store)
+                                             (commit-compaction-record
+                                              (%cp-session program) (first markers)
+                                              :model (%cp-designator program)
+                                              :permission-mode (%cp-mode program)
+                                              :instructions (let ((set (%cp-instruction-set program)))
+                                                              (and set (instruction-set-current set))))
+                                           (declare (ignore revision))
+                                           (unless (eq store (%cp-session program))
+                                             (setf (%cp-session program) store)
+                                             (%send program (list :session (session-id store))))
+                                           (done))
+                                         (done "nothing to compact")))
+                                 (error (e) (done (%message-text e)))))
+                   :error-callback (lambda (e) (done (%message-text e))))
+            (error (e) (done (%message-text e))))))))
+
+(defun %retry-turn-effect (program)
+  "(:retry-turn): re-send the failed last turn, or (:retry-refused M)."
+  (let ((session (%cp-session program)))
+    (if (failed-turn-p session)
+        (let ((head (session-head session)))
+          (%loop-start-turn program (record-prompt (revision-record head))
+                            :retry-of (rev:revision-id head)))
+        (%send program (list :retry-refused (%message-text (make-condition 'nothing-to-retry)))))))
 
 ;;; H3e-2a: the MCP servers in the program.
 
@@ -1169,6 +1291,10 @@ goes back to the input)."
                                   :feedback-choice :reject)
                    (%cp-dialog-invocation program) (first approvals)
                    (w:widget-focused-p input) nil))))
+    ;; H3f: a retry waiting replaces the spinner's label.
+    (let ((label (or (state-retry-notice state) "Working… (Esc to interrupt)")))
+      (unless (equal label (w:spinner-label spinner))
+        (setf (w:spinner-label spinner) label)))
     (cond ((and (state-busy-p state) (not (w:spinner-active-p spinner)))
            (w:spinner-start spinner))
           ((and (not (state-busy-p state)) (w:spinner-active-p spinner))

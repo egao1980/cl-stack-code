@@ -396,8 +396,8 @@ beta
 
 (deftest program-help
   (with-project (project config) '()
-    ;; H3e-2a: /help grew by the /mcp line
-    (with-code-tui (tui program backend :rows 32) (project config)
+    ;; H3e-2a: /help grew by the /mcp line; H3f: by /compact and /retry
+    (with-code-tui (tui program backend :rows 34) (project config)
       (send-line tui "/help")
       (ok (wait-screen tui "/permissions [MODE]"))
       (ok (null (scripted-requests backend)) "nothing goes to the model"))))

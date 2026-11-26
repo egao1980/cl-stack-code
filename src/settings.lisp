@@ -68,6 +68,10 @@ in order. LOAD-SETTINGS keeps it from the user file and the flag layer only.")
 MCP-SERVER-CONFIG, from \"mcpServers\"), :ENABLE-ALL-PROJECT, :ENABLED, :DISABLED (the
 project-server approvals), :TIMEOUT, :TOOL-TIMEOUT (ms), :CONFIG-FILES and :STRICT (the
 flags). See MCP-SETTINGS.")
+   ;; H3f
+   (resilience :initarg :resilience :reader settings-resilience :initform nil
+               :documentation "The H3f keys (retry, timeouts, contextWindow,
+autoCompact, …) as a plist; see src/resilience-config.lisp.")
    (files :initarg :files :reader settings-files :initform nil
           :documentation "Settings files this layer was read from, in order."))
   (:documentation "One settings layer, or the merge of several."))
@@ -82,7 +86,7 @@ flags). See MCP-SETTINGS.")
 
 (defun make-settings (&key model max-turns permission-mode allow ask deny env
                         append-system-prompt files checkpoints lisp-image
-                        model-params sandbox skill-dirs context-files mcp)
+                        model-params sandbox skill-dirs context-files mcp resilience)
   "A SETTINGS layer. NIL means unset for every scalar. CHECKPOINTS (H5b): a
 plist of the checkpoints keys this layer sets. LISP-IMAGE (H4b): a plist of the
 lispImage keys this layer sets. MODEL-PARAMS: an alist (wire-name . value) of
@@ -99,6 +103,7 @@ CONTEXT-FILES (H3e-1): lists of pathnames."
                            :skill-dirs (copy-list skill-dirs)
                            :context-files (copy-list context-files)
                            :mcp (copy-list mcp)
+                           :resilience (copy-list resilience)
                            :files files))
 
 ;;; H5b: the checkpoints object.
@@ -520,7 +525,10 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
                                 (%json-present object "contextFiles")
                               (and present (%parse-path-array file "contextFiles" value))))
              ;; H3e-2a
-             (mcp (%parse-mcp-settings file object)))
+             (mcp (%parse-mcp-settings file object))
+             ;; H3f
+             (resilience (and (%resilience-keys-present-p object)
+                              (%parse-resilience file object))))
         (make-settings
          :model model
          :max-turns max-turns
@@ -537,6 +545,7 @@ ignored. Rules are parsed with PARSE-PERMISSION-RULE."
          :skill-dirs skill-dirs
          :context-files context-files
          :mcp mcp
+         :resilience resilience
          :files (and file (list file)))))))
 
 (defun read-settings-file (pathname)
@@ -608,6 +617,9 @@ gives the value (NIL = unset). Fresh conses; the layers are not modified."
        :skill-dirs (%merge-paths (mapcar #'settings-skill-dirs layers))
        :context-files (%merge-paths (mapcar #'settings-context-files layers))
        :mcp (%merge-mcp (mapcar #'settings-mcp layers))
+       ;; H3f
+       :resilience (let ((plists (remove nil (mapcar #'settings-resilience layers))))
+                     (and plists (%merge-resilience plists)))
        :files (loop for layer in layers append (settings-files layer))))))
 
 ;;; Where the files are.
