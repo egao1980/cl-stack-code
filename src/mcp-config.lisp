@@ -90,6 +90,73 @@
 ;;; (10 minutes; Claude Code's default is about 28 hours, which lets one hung
 ;;; server stall a headless run for a day).
 ;;; Startup covers spawning or connecting, initialize and the first tool list.
+;;;
+;;; H3e-2b (0.16.0, brief "H3e-2b — locked"). The runtime rules are in
+;;; src/mcp-requests.lisp (sampling, elicitation) and src/mcp-context.lisp
+;;; (server instructions, deferred tool loading). The configuration:
+;;;   Server keys (optional, on every transport; unknown keys still ignored):
+;;;     "sampling"  false (the default) | true | {"model": STRING,
+;;;                 "maxTokens": INTEGER >= 1}. The server may ask the
+;;;                 session's model (sampling/createMessage); without it the
+;;;                 client has no sampling handler and does not advertise the
+;;;                 capability. true = the session's model and
+;;;                 +DEFAULT-MCP-SAMPLING-MAX-TOKENS+. "model" is a model
+;;;                 designator ("openai:qwen3-small"), resolved when a request
+;;;                 comes (RESOLVE-MODEL with the session's providers); a bad
+;;;                 one fails that request, never the session. "maxTokens" caps
+;;;                 every request's maxTokens. Slot SAMPLING: NIL, or (:MODEL M
+;;;                 :MAX-TOKENS N) with NIL for an absent key.
+;;;     "elicitation"  true (the default) | false. false: no elicitation
+;;;                 handler, the capability not advertised.
+;;;     "includeInstructions"  true | false; absent = :DEFAULT. The server's
+;;;                 initialize "instructions" join the system prompt
+;;;                 (MCP-SERVER-INCLUDES-INSTRUCTIONS-P config &key (approval
+;;;                 :approved)):
+;;;                   a trusted server (MCP-SERVER-TRUSTED-P: user, flag, sdk)
+;;;                   unless this is false;
+;;;                   a project or local server only when this is true AND the
+;;;                   server is approved (APPROVAL :APPROVED, MCP-SERVER-APPROVAL:
+;;;                   enabledMcpjsonServers / enableAllProjectMcpServers from the
+;;;                   user file or the flags). Unapproved and rejected servers
+;;;                   never (they do not run either). Decided by the user,
+;;;                   2026-11-23: the user's approval plus the server's explicit
+;;;                   opt-in, so lisp-workspace's lisp-mcp, approved and opted
+;;;                   in, reaches the prompt.
+;;;     "alwaysLoad"  true | false (default; Claude Code's key): this server's
+;;;                 tools are never deferred behind tool_search.
+;;;     A wrong type → SETTINGS-ERROR with the key path, as every server key:
+;;;       mcpServers.NAME.sampling            "must be true, false or an object"
+;;;       mcpServers.NAME.sampling.model      "must be a string"
+;;;       mcpServers.NAME.sampling.maxTokens  "must be an integer >= 1"
+;;;       mcpServers.NAME.elicitation | .includeInstructions | .alwaysLoad
+;;;                                           "must be true or false"
+;;;     Unknown keys inside "sampling" are ignored.
+;;;     %PARSE-MCP-SERVER-EXTRAS name object file → a plist of initargs
+;;;     (:SAMPLING :ELICITATION :INCLUDE-INSTRUCTIONS :ALWAYS-LOAD, only the
+;;;     keys present), called by %PARSE-MCP-SERVER only when one of
+;;;     +MCP-SERVER-EXTRA-KEYS+ is present.
+;;;   Settings keys (any layer; the later layer wins, as "mcpTimeout"):
+;;;     "mcpToolSearch"           "auto" (default) | "always" | "never"
+;;;                               → :TOOL-SEARCH :AUTO / :ALWAYS / :NEVER;
+;;;                               else "must be \"auto\", \"always\" or \"never\""
+;;;     "mcpToolSearchThreshold"  integer >= 0 (default
+;;;                               +DEFAULT-MCP-TOOL-SEARCH-THRESHOLD+)
+;;;                               → :TOOL-SEARCH-THRESHOLD; else "must be an
+;;;                               integer >= 0"
+;;;     %PARSE-MCP-SEARCH-KEYS file object → that plist (keys present only).
+;;;   MCP-SAMPLING-SETTINGS config → (values enabled-p model max-tokens):
+;;;     enabled-p true when SAMPLING is not NIL; MODEL the designator or NIL
+;;;     (= the session's); MAX-TOKENS the cap, +DEFAULT-MCP-SAMPLING-MAX-TOKENS+
+;;;     when unset.
+;;;   MCP-TOOL-SEARCH-SETTINGS settings → (values mode threshold), defaults
+;;;     filled in (:AUTO, +DEFAULT-MCP-TOOL-SEARCH-THRESHOLD+).
+;;;   The config hash of the instruction-set snapshot (%MCP-CONFIG-HASH)
+;;;   gains :SAMPLING, :ELICITATION, :INCLUDE-INSTRUCTIONS and :ALWAYS-LOAD
+;;;   only when they differ from the defaults, so a 0.13 server hashes as it
+;;;   did.
+;;; Given here: the slots, the constructor keys, the copy, the merge of the
+;;; two scalars and the gated calls of the two parsers, so a 0.13 file never
+;;; reaches a stub.
 
 ;;; Given: constants, the config object, the layer hooks.
 
@@ -107,8 +174,17 @@
 
 (defparameter +mcp-settings-keys+
   '("mcpServers" "enableAllProjectMcpServers" "enabledMcpjsonServers"
-    "disabledMcpjsonServers" "mcpTimeout" "mcpToolTimeout")
+    "disabledMcpjsonServers" "mcpTimeout" "mcpToolTimeout"
+    ;; H3e-2b
+    "mcpToolSearch" "mcpToolSearchThreshold")
   "Settings keys parsed by %PARSE-MCP-SETTINGS.")
+
+(defparameter +mcp-server-extra-keys+
+  '("sampling" "elicitation" "includeInstructions" "alwaysLoad")
+  "H3e-2b: the server keys %PARSE-MCP-SERVER-EXTRAS parses.")
+
+(defparameter +mcp-search-settings-keys+ '("mcpToolSearch" "mcpToolSearchThreshold")
+  "H3e-2b: the settings keys %PARSE-MCP-SEARCH-KEYS parses.")
 
 (defclass mcp-server-config ()
   ((name :initarg :name :reader mcp-server-config-name)
@@ -132,6 +208,17 @@
    (cache-tools :initarg :cache-tools :initform t :reader mcp-server-config-cache-tools)
    (tool-error-behavior :initarg :tool-error-behavior :initform :retry
                         :reader mcp-server-config-tool-error-behavior)
+   ;; H3e-2b (src/mcp-requests.lisp, src/mcp-context.lisp)
+   (sampling :initarg :sampling :initform nil :reader mcp-server-config-sampling
+             :documentation "NIL (the default: no sampling), or a plist (:MODEL designator-or-NIL
+:MAX-TOKENS n-or-NIL) from \"sampling\": true or {\"model\", \"maxTokens\"}.")
+   (elicitation :initarg :elicitation :initform t :reader mcp-server-config-elicitation
+                :documentation "\"elicitation\": T (the default) or NIL.")
+   (include-instructions :initarg :include-instructions :initform :default
+                         :reader mcp-server-config-include-instructions
+                         :documentation "\"includeInstructions\": :DEFAULT (unset), T or NIL.")
+   (always-load :initarg :always-load :initform nil :reader mcp-server-config-always-load
+                :documentation "\"alwaysLoad\" (Claude Code's key): its tools are never deferred.")
    (file :initarg :file :initform nil :accessor mcp-server-config-file
          :documentation "The file it came from (a pathname), or NIL (flags as JSON text, SDK)."))
   (:documentation "One MCP server as configured (before or after ${VAR} expansion)."))
@@ -144,16 +231,20 @@
 (defun make-mcp-server-config (name &rest initargs &key scope transport command args env url
                                                        headers disabled timeout startup-timeout
                                                        (cache-tools t) (tool-error-behavior :retry)
+                                                       sampling (elicitation t)
+                                                       (include-instructions :default) always-load
                                                        file)
   (declare (ignore scope transport command args env url headers disabled timeout startup-timeout
-                   cache-tools tool-error-behavior file))
+                   cache-tools tool-error-behavior sampling elicitation include-instructions
+                   always-load file))
   (apply #'make-instance 'mcp-server-config :name name initargs))
 
 (defun %copy-mcp-config (config &rest changes)
   "A copy of CONFIG with CHANGES (initargs) applied."
   (let ((copy (allocate-instance (class-of config))))
     (dolist (slot '(name scope transport command args env url headers disabled timeout
-                    startup-timeout cache-tools tool-error-behavior file))
+                    startup-timeout cache-tools tool-error-behavior
+                    sampling elicitation include-instructions always-load file))
       (setf (slot-value copy slot) (slot-value config slot)))
     (loop for (key value) on changes by #'cddr
           do (setf (slot-value copy (find-symbol (symbol-name key) '#:cl-stack-code)) value))
@@ -197,7 +288,9 @@ layer's server replaces an earlier one, in first-seen order), :ENABLED,
         (dolist (key '(:enabled :disabled :config-files))
           (when (getf plist key)
             (setf (getf out key) (append (getf out key) (getf plist key)))))
-        (dolist (key '(:enable-all-project :timeout :tool-timeout :strict))
+        (dolist (key '(:enable-all-project :timeout :tool-timeout :strict
+                       ;; H3e-2b
+                       :tool-search :tool-search-threshold))
           (multiple-value-bind (k v tail) (get-properties plist (list key))
             (declare (ignore k))
             (when tail (setf (getf out key) v))))))
@@ -310,17 +403,21 @@ config-files strict) of SETTINGS's MCP plist (servers: alist name . config)."
           (%settings-fail file (%mcp-server-key name "command") "a stdio server needs a command"))
         (when (and (member transport '(:http :sse)) (null url))
           (%settings-fail file (%mcp-server-key name "url") "an ~(~a~) server needs a url" transport))
-        (make-mcp-server-config name :scope scope :transport transport
-                                     :command (and (eq transport :stdio) command)
-                                     :args (and (eq transport :stdio) args)
-                                     :env (and (eq transport :stdio) env)
-                                     :url (and (not (eq transport :stdio)) url)
-                                     :headers (and (not (eq transport :stdio)) headers)
-                                     :disabled (and disabled t)
-                                     :timeout timeout :startup-timeout startup
-                                     :cache-tools (and cache-tools t)
-                                     :tool-error-behavior behavior
-                                     :file file)))))
+        (apply #'make-mcp-server-config name :scope scope :transport transport
+               :command (and (eq transport :stdio) command)
+               :args (and (eq transport :stdio) args)
+               :env (and (eq transport :stdio) env)
+               :url (and (not (eq transport :stdio)) url)
+               :headers (and (not (eq transport :stdio)) headers)
+               :disabled (and disabled t)
+               :timeout timeout :startup-timeout startup
+               :cache-tools (and cache-tools t)
+               :tool-error-behavior behavior
+               :file file
+               ;; H3e-2b: only when one of its keys is there
+               (and (some (lambda (k) (nth-value 1 (%json-present object k)))
+                          +mcp-server-extra-keys+)
+                    (%parse-mcp-server-extras name object file)))))))
 
 (defun %parse-mcp-keys (file object)
   "The MCP plist of the settings OBJECT: only the keys present are set (the
@@ -346,7 +443,11 @@ merge looks at presence)."
                    (setf (getf out indicator) (%mcp-string-array file key value)))))
       (loop for (key indicator) in '(("mcpTimeout" :timeout) ("mcpToolTimeout" :tool-timeout))
             do (multiple-value-bind (value present) (scalar key #'%mcp-ms-p "an integer >= 1 (ms)")
-                 (when present (setf (getf out indicator) value)))))
+                 (when present (setf (getf out indicator) value))))
+      ;; H3e-2b: only when one of its keys is there
+      (when (some (lambda (k) (nth-value 1 (%json-present object k))) +mcp-search-settings-keys+)
+        (loop for (k v) on (%parse-mcp-search-keys file object) by #'cddr
+              do (setf (getf out k) v))))
     out))
 
 (defun parse-mcp-servers (object &key file scope)
@@ -604,3 +705,86 @@ way round; :LATER → nothing. Other keys of the file are kept. → the file."
                     (%env-ms env "MCP_TOOL_TIMEOUT")
                     +default-mcp-tool-timeout-ms+)))
       (values (/ startup 1000) (/ tool 1000)))))
+
+;;; H3e-2b: the new keys (the header's rules). Given: the constants; then
+;;; the parsers and the readers.
+
+(defparameter +default-mcp-sampling-max-tokens+ 4096
+  "The maxTokens cap of a server's sampling request when its config sets none.")
+
+(defparameter +default-mcp-tool-search-threshold+ 40
+  "mcpToolSearch \"auto\" defers the MCP tools when more than this many are offered.")
+
+(defparameter +mcp-tool-search-modes+ '(:auto :always :never))
+
+(defun %parse-mcp-server-extras (name object file)
+  "The H3e-2b keys of server NAME's OBJECT → initargs (see the header)."
+  (let ((out '()))
+    (multiple-value-bind (value present) (%json-present object "sampling")
+      (when present
+        (setf (getf out :sampling)
+              (cond ((eq value t) (list :model nil :max-tokens nil))
+                    ((null value) nil)
+                    ((hash-table-p value)
+                     (let ((model (multiple-value-bind (m p) (%json-present value "model")
+                                    (when (and p (not (stringp m)))
+                                      (%settings-fail file (%mcp-server-key name "sampling.model")
+                                                      "must be a string"))
+                                    (and p m)))
+                           (max (multiple-value-bind (m p) (%json-present value "maxTokens")
+                                  (when (and p (not (%mcp-ms-p m)))
+                                    (%settings-fail file (%mcp-server-key name "sampling.maxTokens")
+                                                    "must be an integer >= 1"))
+                                  (and p m))))
+                       (list :model model :max-tokens max)))
+                    (t (%settings-fail file (%mcp-server-key name "sampling")
+                                       "must be true, false or an object"))))))
+    (loop for (key indicator) in '(("elicitation" :elicitation)
+                                   ("includeInstructions" :include-instructions)
+                                   ("alwaysLoad" :always-load))
+          do (multiple-value-bind (value present) (%json-present object key)
+               (when present
+                 (unless (%mcp-boolean-p value)
+                   (%settings-fail file (%mcp-server-key name key) "must be true or false"))
+                 (setf (getf out indicator) (and value t)))))
+    out))
+
+(defun %parse-mcp-search-keys (file object)
+  "\"mcpToolSearch\" / \"mcpToolSearchThreshold\" of OBJECT → plist (see the header)."
+  (let ((out '()))
+    (multiple-value-bind (value present) (%json-present object "mcpToolSearch")
+      (when present
+        (setf (getf out :tool-search)
+              (or (and (stringp value)
+                       (find value +mcp-tool-search-modes+
+                             :key (lambda (mode) (string-downcase (symbol-name mode)))
+                             :test #'string=))
+                  (%settings-fail file "mcpToolSearch"
+                                  "must be \"auto\", \"always\" or \"never\"")))))
+    (multiple-value-bind (value present) (%json-present object "mcpToolSearchThreshold")
+      (when present
+        (unless (and (integerp value) (>= value 0))
+          (%settings-fail file "mcpToolSearchThreshold" "must be an integer >= 0"))
+        (setf (getf out :tool-search-threshold) value)))
+    out))
+
+(defun mcp-sampling-settings (config)
+  "→ (values enabled-p model max-tokens) of CONFIG (see the header)."
+  (let ((sampling (mcp-server-config-sampling config)))
+    (values (and sampling t)
+            (getf sampling :model)
+            (or (getf sampling :max-tokens) +default-mcp-sampling-max-tokens+))))
+
+(defun mcp-server-includes-instructions-p (config &key (approval :approved))
+  "True when CONFIG's server instructions may join the system prompt; APPROVAL
+is MCP-SERVER-APPROVAL's value for project and local servers (see the header)."
+  (let ((include (mcp-server-config-include-instructions config)))
+    (if (mcp-server-trusted-p config)
+        (and include t)
+        (and (eq include t) (eq approval :approved)))))
+
+(defun mcp-tool-search-settings (settings)
+  "→ (values mode threshold) of SETTINGS's MCP plist (see the header)."
+  (let ((plist (and settings (settings-mcp settings))))
+    (values (or (getf plist :tool-search) :auto)
+            (or (getf plist :tool-search-threshold) +default-mcp-tool-search-threshold+))))

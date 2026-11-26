@@ -4,106 +4,59 @@ test-system: cl-stack-code/tests
 brief: ../cl-stack/docs/capabilities/cl-stack-code.md
 ---
 
-# H5c-0 — plan mode plans (cl-stack-code 0.15.0)
+# H3e-2b: MCP part 2 — sampling, elicitation, server instructions, deferred tool loading (cl-stack-code 0.16.0)
 
-Implement the brief's "H5c-0 — locked" section. The spec is the header of
-`src/plan-docs.lisp` together with the tests. The version is **0.15.0**
-(ACP-2 0.11.0, H3e-1 0.12.0, H3e-2a 0.13.0 and H3f 0.14.0 land first; the
-number follows merge order, so rebase on whatever main is and keep the version
-checks in step).
+Brief section: "H3e-2b — locked". Rules: the H3e-2b paragraph of `src/mcp-config.lisp`
+(the new server and settings keys), the header of `src/mcp-requests.lisp` (sampling,
+elicitation, the decision through the permission rules, the broker, approval objects,
+events, the TUI core and dialog), the header of `src/mcp-context.lisp` (server
+instructions in the prompt, deferred tool loading, the snapshot additions, visibility) and
+the header of `src/acp/requests.lisp` (ACP). The acp system's tests are
+`cl-stack-code/acp/tests` (`tests/acp/mcp-requests-test.lisp`); run them too.
 
-The user's direction (2026-11-22): "Plan mode is supposed to _plan_ changes. It
-can run exploratory scripts, but it's not for creating a full solution." And:
-"the current plan behaviour is valuable but let's not call it plan mode."
+**Order (do not start before these are published):**
+- mcp-protocol **0.5.0** (egao1980/mcp-protocol, the H3e-2b issue and its contract PR): the
+  client advertises `sampling` / `elicitation` (form) / `roots` from the handlers it has, in
+  initialize and in every 2026-07-28 request's `_meta`; a server tool's REQUEST-SAMPLING /
+  REQUEST-ELICITATION gets the client's answer when the retried tools/call carries
+  `inputResponses` (MRTR).
+- ai-agent-protocol **0.17.0** with ai-agent-protocol/mcp **0.3.0** (egao1980/ai-agent-protocol,
+  the H3e-2b issue and its contract PR), after 0.16.0 (H3f): `make-deferred-tool-source`
+  (tool_search, the loaded set, a deferred tool called by name loads, ON-LOAD `:via`, the
+  loop routing a name no source lists to the source that executes it); `make-mcp-sampling-handler`
+  `:model` (the server's hints never pick the model), `:max-tokens` (the cap), image content.
+Raise the `.asd` versions to them. H3f (0.14.0) and H5c-0 (0.15.0) merge first; this lands as
+0.16.0 (renumber in merge order).
 
-So there are two modes:
+Implement every stub (`%h3e2b-pending`, then remove it), and wire:
+- configuration (`src/mcp-config.lisp`): `%parse-mcp-server-extras`, `%parse-mcp-search-keys`,
+  `mcp-sampling-settings`, `mcp-server-includes-instructions-p`, `mcp-tool-search-settings`
+  (the slots, the copy, the merge, the gated calls and the config hash are given).
+- the user's decisions of 2026-11-23 (in the headers): instructions of approved project / local
+  servers with `"includeInstructions": true`; a deferred tool called by name is loaded and run.
+- the manager (`src/mcp.lisp`): `make-mcp-request-handlers` passed to `mcp-connect`
+  (`:sampling-handler`, `:elicitation-handler`) for stdio (both paths) and HTTP; the running
+  MCP calls per server (for `tool_use_id`); the request counter; `mcp-manager-tool-source`
+  wrapped in the deferred source; the snapshot's `:instructions`, `:deferred`, `:loaded` and
+  their restore; `mcp-connection-object`'s five keys; `mcp-status-lines`' suffixes.
+- -p (`src/headless.lisp`): `make-headless-mcp-broker` with -p's reporter, so the system events
+  go out on the loop thread in order and denied samples join `permission_denials`; the
+  init event's `mcp_tool_search`; the MCP instruction blocks last in the system prompt.
+- `assemble-system-prompt` (`src/instructions.lisp`): `mcp-instruction-blocks` of the current
+  revision as the last sections when an instruction set is given.
+- the SDK (`src/client.lisp`) and --rpc (`src/rpc.lisp`): the session's broker (approval_request
+  objects of kind `mcp_*`, ON-APPROVAL, `client-pending-approvals`, `%respond-mcp-request`,
+  interrupt and close answers, the "always" rule saved to settings.local.json and added to the
+  session's rules); `approval/respond`'s `content`; the init event as -p's.
+- the TUI (`src/interactive.lisp`, `src/program.lisp`): `%mcp-request-event`, `(:interrupt)` with
+  a request queued, the broker feeding `(:mcp-request …)`, the dialogs (`mcp-request-dialog-lines`,
+  the field prompts through `parse-elicitation-input`), `(:mcp-respond …)`, the notices; the
+  prompt rendered again when the background MCP start settles before the first run.
+- ACP (`src/acp/agent.lisp`, `src/acp/mapping.lisp`): the stubs of `src/acp/requests.lisp`; the
+  prompt thread asking sampling through a tool call and `session/request_permission`,
+  elicitation through `elicitation/create` (with `:elicitation-form`) or declining;
+  `tool-kind` "tool_search" → "search".
 
-- **plan**: explore and propose. File tools read the exploration area
-  (an H5a area, never applied), shell commands run confined there (R4d-4b),
-  writes only under `.plan-scratch/`, `ask_user`, and `propose_plan` writes
-  `plan.md`. The user approves (accept edits / ask before edits / in preview),
-  edits, revises or rejects the document. Approval runs the plan in the real
-  project with an `update_plan` checklist, and ends with the plan next to the
-  diff.
-- **preview**: H5a + R4d-4b exactly as they are, renamed. Every user-facing
-  "plan" of that machinery becomes "preview" (header: USER-FACING RENAMES).
-
-Every stub calls `%H5C0-PENDING`; replace them all.
-
-## Given (in the contract)
-
-- `src/plan-docs.lisp`: exports, constants, conditions, the `plan-step` /
-  `plan-revision` structs, the `plan-document` and `plan-tools` classes and
-  their readers, `plan-documents-directory`, `plan-document-path`, the
-  policy-protocol policy `plan-mode-tools`, and `client-apply-preview` /
-  `client-reject-preview` (the preview's preferred SDK names, over H5a's
-  functions). `+preview-mode-feedback+`.
-- `.asd`: version 0.15.0, `policy-protocol` 0.1.0 and `logic-backend-datalog`
-  0.1.0 (both published), the component after `checkpoints`, and the six test
-  files.
-- The moved tests (below).
-
-## Left to the implementation
-
-- Every function stubbed in `src/plan-docs.lisp`, plus making `plan-tools` an
-  ai-agent-protocol tool source (propose_plan ends the run: when
-  ai-agent-protocol has no way for a tool to end a run, add one there: issue +
-  PR + publish, not a workaround).
-- The renames in settings, arguments, headless, interactive, program, client,
-  rpc, sandbox and transcript (header: USER-FACING RENAMES and its "Other
-  texts"). Keep H5a's Lisp names; aliases where the header says so
-  (`invocation-plan-area`, `--plan-area`, the RPC methods).
-- `settings-permission-policy` returning `plan-mode-permission-policy` in plan
-  mode; `%mode-base-rules :plan` = H5a's rules; `:preview` = H5a's rules.
-- Settings keys `planTemplate`, `planSaveDirectory`; the record slot
-  `plan-document` (content key `:plan-document`, `+session-format+` stays 1);
-  old records read as preview (MIGRATION); the migration notice and its marker.
-- The wiring: -p (plan runs, `--approve-plan`, `--reject-plan`,
-  `--save-plan`, `--propose-only`), the TUI (dialogs, `$EDITOR`, checklist,
-  result dialog, ask_user dialog), the SDK and RPC, /tree marks, export,
-  conversation rewinds.
-- Docs: README (plan mode, preview mode, the migration), the client.lisp /
-  rpc.lisp headers. A demo in cl-stack-demos (`harness/plan/`: propose, edit,
-  approve, the plan next to the diff), run locally with outputs committed.
-- Follow-up issues to file when done: the Lisp API rename (`plan` → `preview`
-  for H5a's class, functions, conditions, restarts, checkpoint reasons, merge
-  labels, core events), with aliases for one minor; dropping the plan/approve
-  alias in 0.16.0.
-
-## Tests
-
-New (Rove, `cl-stack-code/tests`): `plan-doc-support`, `plan-doc-test`
-(API, format, policy, tools, settings, records), `plan-doc-cli-test` (-p),
-`plan-doc-core-test` (pure core), `plan-doc-program-test` (TUI harness),
-`plan-doc-client-test` (SDK, RPC, aliases).
-
-Moved (H5a's meaning under the name preview; assertions otherwise unchanged):
-`plan-cli-test`, `plan-core-test`, `plan-program-test`, `client-plan-test`,
-`sandbox-test`, `sandbox-cli-test`, `sandbox-program-test`, `sandbox-support`,
-`plan-support`, `rpc-test` (`rpc-preview-apply-and-reject`, flags, method
-list), `tools-test` (`tools-preview-mode`), `permissions-test` (base rules for
-both modes, the policy, the feedback constants), `lisp-image-test` (a preview
-row), `checkpoint-core-test` (the open-preview refusal), `settings-test` (five
-mode names). The version checks expect 0.15.0. `plan-test` (H5a's Lisp API)
-does not change.
-
-### ACP (cl-stack-code/acp; ACP-2 is not on main yet)
-
-When ACP-2 is merged, add to `cl-stack-code/acp/tests` (loopback, mock LLM):
-
-1. `session/new` modes list five ids, "plan" and "preview" separately, in
-   `+permission-mode-names+` order.
-2. A plan-mode prompt that calls propose_plan sends a `plan` update (entries
-   = the steps, "pending", "medium") and then a `session/request_permission`
-   whose toolCall has kind "switch_mode" and the markdown as content, with
-   `+acp-plan-approval-options+` in order.
-3. Answering "acceptEdits": a `current_mode_update` to acceptEdits, the
-   execution turn in the same prompt (edits land in the project), `plan`
-   updates per update_plan with "in_progress" / "completed", stop reason
-   end_turn.
-4. Answering "plan" (keep planning): the prompt ends end_turn, the document
-   stays proposed; the next prompt is a revision (a new `plan` update).
-5. Answering "reject": `plan` update with no entries; the document is rejected.
-6. `session/set_mode` to "default" while a plan is proposed approves it; the
-   next `session/prompt` executes it.
-7. Preview-mode events produce no `plan` update.
+Measure with the published stack (the contract's `.asd` pins today's versions so it loads).
+Run the suite with a 4 GB heap on macOS (`ros dynamic-space-size=4096 …`, #18). Given code
+stays; tests/ and this file are read-only.

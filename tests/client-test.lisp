@@ -39,7 +39,7 @@
         (ok (hex-id-p (code-session-id s)))
         (ok (equal "system" (event-type init)))
         (ok (equal "init" (event-value init "subtype")))
-        (ok (equal "0.15.0" (event-value init "version")))
+        (ok (equal "0.16.0" (event-value init "version")))
         (ok (equal (code-session-id s) (event-value init "session_id")))
         (ok (equal (native project) (event-value init "cwd")))
         (ok (equal (native project) (event-value init "project_root")))

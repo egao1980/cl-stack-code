@@ -302,11 +302,10 @@
 ;;; the product owns, debugger events in the inbox, restart rules); the
 ;;; brief says so.
 ;;;
-;;; Later (H3e-2b): sampling (make-mcp-sampling-handler behind an ask,
-;;; action mcp_sampling, samplingModel), elicitation through the approval
-;;; UI, server instructions in the prompt (includeInstructions, a tagged
-;;; <mcp-instructions server="x"> block), deferred tool loading, roots,
-;;; resources and prompts, deferred approvals for -p.
+;;; H3e-2b (0.16.0): sampling and elicitation (src/mcp-requests.lisp), server
+;;; instructions in the prompt and deferred tool loading (src/mcp-context.lisp,
+;;; which also amends this file's snapshot, objects and /mcp lines). Later:
+;;; roots, resources and prompts, deferred approvals for -p.
 
 ;;; Given: constants, classes, condition.
 
@@ -377,6 +376,9 @@ opinion answers."
    (cwd :initarg :cwd :initform nil :reader mcp-manager-cwd)
    (http-backend :initarg :http-backend :initform nil :reader mcp-manager-http-backend)
    (on-status :initarg :on-status :initform nil :reader mcp-manager-on-status)
+   ;; H3e-2b (src/mcp-requests.lisp): who answers the servers' requests
+   (broker :initarg :broker :initform nil :accessor mcp-manager-broker
+           :documentation "The session's MCP-REQUEST-BROKER, or NIL (requests answered as headless).")
    (closed :initform nil :accessor mcp-manager-closed-p)
    ;; The instruction set (see the header)
    (component :initform nil :accessor mcp-manager-component
@@ -437,7 +439,9 @@ opinion answers."
    (pinned :initarg :pinned :initform nil :reader %mcp-pinned-hash
            :documentation "A placeholder's :CONFIG hash (the revision's).")
    (placeholder :initarg :placeholder :initform nil :reader %mcp-placeholder-p
-                :documentation "True for a revision server this process never held.")))
+                :documentation "True for a revision server this process never held.")
+   ;; H3e-2b: the manager it belongs to (deferral and requests).
+   (manager :initarg :manager :initform nil :accessor %mcp-connection-manager)))
 
 (defclass %code-mcp-manager (mcp-manager)
   ((held :initform '() :accessor %mcp-held
@@ -453,7 +457,25 @@ opinion answers."
    (noticed :initform '() :accessor %mcp-noticed
             :documentation "Tool names already reported as offered twice.")
    (notices :initform '() :accessor %mcp-notices
-            :documentation "Notice texts not yet taken (%TAKE-MCP-NOTICES), newest first.")))
+            :documentation "Notice texts not yet taken (%TAKE-MCP-NOTICES), newest first.")
+   ;; H3e-2b (src/mcp-requests.lisp, src/mcp-context.lisp)
+   (tool-source :initform nil :accessor %mcp-tool-source-cache
+                :documentation "MCP-MANAGER-TOOL-SOURCE's source, made once.")
+   (deferred :initform nil :accessor %mcp-deferred-source
+     :documentation "The one AGENT:DEFERRED-TOOL-SOURCE around the 0.13 source.")
+   (waits :initform '() :accessor %mcp-waits
+          :documentation "The servers' requests being decided (%MCP-WAITs), oldest first.")
+   (counters :initform '() :accessor %mcp-counters
+             :documentation "Plist kind → the last request number given.")
+   (running :initform '() :accessor %mcp-running
+            :documentation "(connection . tool-use-id) of the MCP tool calls running.")
+   (added-rules :initform '() :accessor %mcp-added-rules
+                :documentation "Allow rules \"always\" added in this session (mcp_sampling(S)).")
+   (rule-store :initform nil :accessor %mcp-rule-store
+               :documentation "The session's PERMISSION-RULE-STORE (settings.local.json), or NIL.")
+   (sampler :initform nil :accessor %mcp-sampler
+            :documentation "Plist (:backend :model :designator :resolve :secrets :http :maker)
+the sampling handler generates with (the surface sets it).")))
 
 (defstruct (%mcp-seed (:constructor %make-mcp-seed (tools read-only plists generation)))
   tools          ; LLM-TOOLs (the server's own names) rebuilt from the revision's texts
@@ -470,25 +492,36 @@ opinion answers."
   "The snapshot's :CONFIG: sha256 of the config's data without env or header values."
   (p:octets-hash
    (p:utf8-encode
-    (%print-data (list :transport (mcp-server-config-transport config)
-                       :command (mcp-server-config-command config)
-                       :args (copy-list (mcp-server-config-args config))
-                       :env-names (mapcar #'car (mcp-server-config-env config))
-                       :url (mcp-server-config-url config)
-                       :header-names (mapcar #'car (mcp-server-config-headers config))
-                       :disabled (and (mcp-server-config-disabled-p config) t)
-                       :timeout (mcp-server-config-timeout config)
-                       :startup-timeout (mcp-server-config-startup-timeout config)
-                       :cache-tools (and (mcp-server-config-cache-tools config) t)
-                       :tool-error-behavior (mcp-server-config-tool-error-behavior config))))))
+    (%print-data (append
+                  (list :transport (mcp-server-config-transport config)
+                        :command (mcp-server-config-command config)
+                        :args (copy-list (mcp-server-config-args config))
+                        :env-names (mapcar #'car (mcp-server-config-env config))
+                        :url (mcp-server-config-url config)
+                        :header-names (mapcar #'car (mcp-server-config-headers config))
+                        :disabled (and (mcp-server-config-disabled-p config) t)
+                        :timeout (mcp-server-config-timeout config)
+                        :startup-timeout (mcp-server-config-startup-timeout config)
+                        :cache-tools (and (mcp-server-config-cache-tools config) t)
+                        :tool-error-behavior (mcp-server-config-tool-error-behavior config))
+                  ;; H3e-2b: only when not the default, so 0.13 configs hash as before
+                  (and (mcp-server-config-sampling config)
+                       (list :sampling (copy-list (mcp-server-config-sampling config))))
+                  (and (not (mcp-server-config-elicitation config))
+                       (list :elicitation nil))
+                  (and (not (eq :default (mcp-server-config-include-instructions config)))
+                       (list :include-instructions
+                             (and (mcp-server-config-include-instructions config) t)))
+                  (and (mcp-server-config-always-load config)
+                       (list :always-load t)))))))
 
 (defun %mcp-connection-hash (connection)
   (or (and (typep connection '%live-mcp-connection) (%mcp-pinned-hash connection))
       (%mcp-config-hash (mcp-connection-config connection))))
 
-(defun %make-mcp-connection (config &key lazy)
+(defun %make-mcp-connection (config &key lazy manager)
   (let ((c (make-instance '%live-mcp-connection
-                          :config config :lazy lazy
+                          :config config :lazy lazy :manager manager
                           :status (cond ((mcp-server-config-disabled-p config) :disabled)
                                         ((eq :sse (mcp-server-config-transport config)) :unsupported)
                                         (t :pending)))))
@@ -521,16 +554,17 @@ opinion answers."
                   (bt:with-lock-held ((%mcp-manager-lock manager))
                     (copy-list (%mcp-held manager))))))
 
-(defun make-mcp-manager (configs &key supervisor settings env cwd http-backend on-status)
+(defun make-mcp-manager (configs &key supervisor settings env cwd http-backend on-status broker)
   (let ((manager (make-instance '%code-mcp-manager
                                 :supervisor supervisor
+                                :broker broker
                                 :settings (or settings (make-settings))
                                 :env (or env (constantly nil))
                                 :cwd cwd
                                 :http-backend http-backend
                                 :on-status on-status)))
     (setf (mcp-manager-connections manager)
-          (mapcar (lambda (config) (%make-mcp-connection config)) configs)
+          (mapcar (lambda (config) (%make-mcp-connection config :manager manager)) configs)
           (mcp-manager-component manager)
           (make-instance 'mcp-servers-component :manager manager))
     (dolist (config configs)
@@ -608,6 +642,8 @@ other transports), then stop UNIT."
       t)))
 
 (defun %mcp-close-connection (manager connection &key (status :closed) (dirty t))
+  ;; H3e-2b: its server's requests still waiting are answered first ("closed").
+  (%mcp-answer-all manager "closed" :connection connection)
   (multiple-value-bind (client unit) (%mcp-take connection)
     (%mcp-dispose client unit))
   (unless (%mcp-placeholder-p connection)
@@ -643,53 +679,61 @@ the next model call."
 
 (defun %mcp-open-client (manager connection attempt scope)
   "Spawn or connect CONNECTION's server → its MCP-CLIENT, or NIL when ATTEMPT
-went stale meanwhile."
+went stale meanwhile. H3e-2b: the client gets the request handlers
+(MAKE-MCP-REQUEST-HANDLERS) on every transport, so its capabilities follow."
   (let* ((config (mcp-connection-config connection))
          (supervisor (mcp-manager-supervisor manager))
          (changed (%mcp-tools-changed manager)))
-    (ecase (mcp-server-config-transport config)
-      (:stdio
-       (let ((argv (cons (mcp-server-config-command config) (mcp-server-config-args config))))
-         (if supervisor
-             (let ((unit (sup:start-unit supervisor +mcp-unit-kind+
-                                         :command argv
-                                         :owner scope
-                                         :labels (list :server (mcp-server-config-name config))
-                                         :cwd (mcp-manager-cwd manager)
-                                         :env (mcp-server-config-env config)
-                                         :restart :never
-                                         :stdio :channel)))
-               (unless unit
-                 (error 'code-error :message "the supervisor refused the unit"))
-               (if (not (%mcp-claim connection attempt :unit unit))
-                   (progn (%mcp-stop-unit unit) nil)
-                   (multiple-value-bind (input output) (sup:unit-channel-streams unit)
-                     (let ((client (mcp-protocol:mcp-connect
-                                    :backend (mcp-backend-stdio:make-stdio-mcp-backend)
-                                    :input input :output output
-                                    :log-handler (%mcp-unit-log-handler unit)
-                                    :on-tools-changed changed)))
-                       (if (%mcp-claim connection attempt :client client)
-                           client
-                           (progn (%mcp-dispose client unit) nil))))))
-             (let ((client (mcp-protocol:mcp-connect
-                            :backend (mcp-backend-stdio:make-stdio-mcp-backend)
-                            :command argv
-                            :env (mcp-server-config-env config) :env-mode :merge
-                            :directory (mcp-manager-cwd manager)
-                            :error-output nil
-                            :on-tools-changed changed)))
-               (if (%mcp-claim connection attempt :client client)
-                   client
-                   (progn (%mcp-dispose client nil) nil))))))
-      (:http
-       (let ((client (mcp-protocol:mcp-connect
-                      :backend (mcp-backend-streamable-http:make-streamable-http-mcp-backend)
-                      :url (mcp-server-config-url config)
-                      :headers (mcp-server-config-headers config)
-                      :on-tools-changed changed
-                      :probe t)))
-         (and (%mcp-claim connection attempt :client client) client))))))
+    (multiple-value-bind (sampling elicitation) (make-mcp-request-handlers manager connection)
+      (ecase (mcp-server-config-transport config)
+        (:stdio
+         (let ((argv (cons (mcp-server-config-command config) (mcp-server-config-args config))))
+           (if supervisor
+               (let ((unit (sup:start-unit supervisor +mcp-unit-kind+
+                                           :command argv
+                                           :owner scope
+                                           :labels (list :server (mcp-server-config-name config))
+                                           :cwd (mcp-manager-cwd manager)
+                                           :env (mcp-server-config-env config)
+                                           :restart :never
+                                           :stdio :channel)))
+                 (unless unit
+                   (error 'code-error :message "the supervisor refused the unit"))
+                 (if (not (%mcp-claim connection attempt :unit unit))
+                     (progn (%mcp-stop-unit unit) nil)
+                     (multiple-value-bind (input output) (sup:unit-channel-streams unit)
+                       (let ((client (mcp-protocol:mcp-connect
+                                      :backend (mcp-backend-stdio:make-stdio-mcp-backend)
+                                      :input input :output output
+                                      :log-handler (%mcp-unit-log-handler unit)
+                                      :on-tools-changed changed
+                                      :sampling-handler sampling
+                                      :elicitation-handler elicitation)))
+                         (if (%mcp-claim connection attempt :client client)
+                             client
+                             (progn (%mcp-dispose client unit) nil))))))
+               (let ((client (mcp-protocol:mcp-connect
+                              :backend (mcp-backend-stdio:make-stdio-mcp-backend)
+                              :command argv
+                              :env (mcp-server-config-env config) :env-mode :merge
+                              :directory (mcp-manager-cwd manager)
+                              :error-output nil
+                              :on-tools-changed changed
+                              :sampling-handler sampling
+                              :elicitation-handler elicitation)))
+                 (if (%mcp-claim connection attempt :client client)
+                     client
+                     (progn (%mcp-dispose client nil) nil))))))
+        (:http
+         (let ((client (mcp-protocol:mcp-connect
+                        :backend (mcp-backend-streamable-http:make-streamable-http-mcp-backend)
+                        :url (mcp-server-config-url config)
+                        :headers (mcp-server-config-headers config)
+                        :on-tools-changed changed
+                        :sampling-handler sampling
+                        :elicitation-handler elicitation
+                        :probe t)))
+           (and (%mcp-claim connection attempt :client client) client)))))))
 
 (defun %mcp-connect (manager connection attempt scope)
   "The connecting thread of one attempt. It never signals: a failure is the
@@ -944,7 +988,7 @@ the save): DECISION :APPROVED or :REJECTED; :REJECTED shows at once."
                          (%copy-mcp-config config :scope :sdk)))
              (name (mcp-server-config-name config))
              (old (find name (%mcp-connections manager) :key #'mcp-connection-name :test #'equal))
-             (new (%make-mcp-connection config)))
+             (new (%make-mcp-connection config :manager manager)))
         (when old
           (%mcp-close-connection manager old))
         (%mcp-hold manager config)
@@ -981,6 +1025,8 @@ keep the project directory busy)."
   (when (and manager
              (not (bt:with-lock-held ((%mcp-manager-lock manager))
                     (shiftf (mcp-manager-closed-p manager) t))))
+    ;; H3e-2b: every request still waiting is answered ("closed") first.
+    (%mcp-answer-all manager "closed")
     (dolist (c (%mcp-connections manager))
       (%mcp-close-connection manager c))
     (%mcp-wait-connecting manager +mcp-close-wait-seconds+))
@@ -1083,14 +1129,91 @@ config order, combined, without the names a deny \"*\" rule hides."))
     (call-next-method)))
 
 (defmethod agent:invoke-tool-async :around ((source %mcp-manager-source) name arguments
-                                            &key &allow-other-keys)
-  (declare (ignore name arguments))
-  (let ((http-protocol:*http-backend* (or (mcp-manager-http-backend (%source-manager source))
-                                          http-protocol:*http-backend*)))
-    (call-next-method)))
+                                            &rest keys &key context callback error-callback
+                                            &allow-other-keys)
+  (let* ((m (%source-manager source))
+         (http-protocol:*http-backend* (or (mcp-manager-http-backend m)
+                                           http-protocol:*http-backend*))
+         ;; H3e-2b: the running call of its server (a request's tool_use_id).
+         (inv (getf context :invocation))
+         (connection (and inv (stringp name)
+                          (find-if (lambda (c)
+                                     (uiop:string-prefix-p (%mcp-prefix (mcp-connection-name c)) name))
+                                   (%mcp-connections m))))
+         (entry (and connection (cons connection (agent:agent-invocation-id inv)))))
+    (if (null entry)
+        (call-next-method)
+        (flet ((done ()
+                 (bt:with-lock-held ((%mcp-manager-lock m))
+                   (setf (%mcp-running m) (remove entry (%mcp-running m) :test #'eq)))))
+          (bt:with-lock-held ((%mcp-manager-lock m))
+            (push entry (%mcp-running m)))
+          (handler-bind ((error (lambda (c) (declare (ignore c)) (done))))
+            (apply #'call-next-method source name arguments
+                   :callback (lambda (&rest values)
+                               (done)
+                               (when callback (apply callback values)))
+                   :error-callback (lambda (&rest values)
+                                     (done)
+                                     (when error-callback (apply error-callback values)))
+                   keys))))))
+
+(defun %mcp-connection-of-tool (manager name)
+  "The connection whose prefix NAME (an offered MCP tool name) carries, or NIL."
+  (find-if (lambda (c) (uiop:string-prefix-p (%mcp-prefix (mcp-connection-name c)) name))
+           (%mcp-connections manager)))
+
+(defclass %mcp-visible-source (agent:wrapper-tool-source)
+  ((manager :initarg :manager :reader %visible-manager))
+  (:documentation "H3e-2b: the deferred source's listing without the names a deny
+\"*\" rule hides (tool_search). Only the listing: a deferred tool called by
+name still reaches the deferred source (auto-load), so this is not an
+offered-only filtered source."))
+
+(defmethod agent:list-agent-tools ((source %mcp-visible-source) &key context)
+  (let ((settings (mcp-manager-settings (%visible-manager source))))
+    (remove-if (lambda (tool) (hidden-tool-names settings (list (llm:llm-tool-name tool))))
+               (call-next-method source :context context))))
 
 (defun mcp-manager-tool-source (manager)
-  (make-instance '%mcp-manager-source :manager manager :inner nil))
+  "H3e-2b: the 0.13 source wrapped once in AGENT:MAKE-DEFERRED-TOOL-SOURCE
+(src/mcp-context.lisp), its listing without the names a deny \"*\" rule
+hides (tool_search included). The same object on every call, so the loaded
+set is the session's."
+  (bt:with-lock-held ((%mcp-manager-lock manager))
+    (or (%mcp-tool-source-cache manager)
+        (multiple-value-bind (mode threshold)
+            (mcp-tool-search-settings (mcp-manager-settings manager))
+          (let* ((inner (make-instance '%mcp-manager-source :manager manager :inner nil))
+                 (deferred (agent:make-deferred-tool-source
+                            inner
+                            :mode mode :threshold threshold
+                            :keep (lambda (context tool)
+                                    (declare (ignore context))
+                                    (let ((c (%mcp-connection-of-tool manager (llm:llm-tool-name tool))))
+                                      (and c (mcp-server-config-always-load (mcp-connection-config c)))))
+                            :search-tool-name +tool-search-tool-name+
+                            :on-load (lambda (names &key via)
+                                       (declare (ignore names via))
+                                       ;; A load owes a commit (before the next model call).
+                                       (setf (%mcp-dirty manager) t)))))
+            (setf (%mcp-deferred-source manager) deferred
+                  (%mcp-tool-source-cache manager)
+                  (make-instance '%mcp-visible-source :inner deferred :manager manager)))))))
+
+(defun %mcp-loaded-names (manager)
+  "The deferred source's loaded set (prefixed names), or NIL."
+  (let ((d (%mcp-deferred-source manager)))
+    (and d (agent:deferred-tool-source-loaded d))))
+
+(defun %mcp-connection-deferred-p (manager connection)
+  "True when CONNECTION's tools are behind tool_search now."
+  (let ((d (and manager (%mcp-deferred-source manager))))
+    (and d
+         (eq :connected (mcp-connection-status connection))
+         (not (mcp-server-config-always-load (mcp-connection-config connection)))
+         (agent:deferred-tool-source-active-p d)
+         t)))
 
 ;;; Views.
 
@@ -1107,15 +1230,26 @@ config order, combined, without the names a deny \"*\" rule hides."))
 (defun mcp-connection-object (connection)
   (let* ((config (mcp-connection-config connection))
          (unit (mcp-connection-unit connection))
-         (file (mcp-server-config-file config)))
+         (file (mcp-server-config-file config))
+         (tools (mcp-connection-tools connection))
+         (manager (and (typep connection '%live-mcp-connection)
+                       (%mcp-connection-manager connection)))
+         (loaded (and manager (%mcp-loaded-names manager))))
     (%json-object "name" (mcp-server-config-name config)
                   "scope" (%lower-name (mcp-server-config-scope config))
                   "transport" (%lower-name (mcp-server-config-transport config))
                   "status" (%lower-name (mcp-connection-status connection))
-                  "tools" (coerce (mcp-connection-tools connection) 'vector)
+                  "tools" (coerce tools 'vector)
                   "error" (or (mcp-connection-error connection) :null)
                   "unit" (if unit (sup:unit-id unit) :null)
-                  "file" (if file (uiop:native-namestring file) :null))))
+                  "file" (if file (uiop:native-namestring file) :null)
+                  ;; H3e-2b (src/mcp-context.lisp, "VISIBILITY")
+                  "sampling" (and (mcp-sampling-settings config) t)
+                  "elicitation" (and (mcp-server-config-elicitation config) t)
+                  "instructions" (and (mcp-connection-instructions connection) t)
+                  "deferred" (%mcp-connection-deferred-p manager connection)
+                  "loaded" (coerce (remove-if-not (lambda (n) (member n loaded :test #'equal)) tools)
+                                   'vector))))
 
 (defun %mcp-file-text (config)
   (let ((file (mcp-server-config-file config)))
@@ -1148,7 +1282,14 @@ config order, combined, without the names a deny \"*\" rule hides."))
   (let ((status (gethash "status" object))
         (error (let ((e (gethash "error" object))) (if (stringp e) e "")))
         (n (length (gethash "tools" object))))
-    (cond ((equal status "connected") (format nil "connected · ~d tool~:p" n))
+    (cond ((equal status "connected")
+           ;; H3e-2b: the suffixes, only for keys present and true
+           (format nil "connected · ~d tool~:p~:[~; · sampling~]~:[~; · instructions~]~@[ · deferred (~d loaded)~]"
+                   n
+                   (eq t (gethash "sampling" object))
+                   (eq t (gethash "instructions" object))
+                   (and (eq t (gethash "deferred" object))
+                        (length (gethash "loaded" object #())))))
           ((equal status "failed") (format nil "failed: ~a" error))
           ((equal status "unapproved") "needs approval")
           ((equal status "unsupported") (format nil "unsupported: ~a" error))
@@ -1229,16 +1370,30 @@ config order, combined, without the names a deny \"*\" rule hides."))
           (t '()))))
 
 (defmethod component-snapshot ((c mcp-servers-component) store)
-  (loop for conn in (%mcp-connections (mcp-servers-component-manager c))
-        for config = (mcp-connection-config conn)
-        for status = (mcp-connection-status conn)
-        collect (list :name (mcp-server-config-name config)
-                      :scope (mcp-server-config-scope config)
-                      :transport (mcp-server-config-transport config)
-                      :config (%mcp-connection-hash conn)
-                      :status status
-                      :tools (and (eq status :connected) (%mcp-snapshot-tools conn store))
-                      :instructions nil)))
+  (let ((m (mcp-servers-component-manager c)))
+    (loop for conn in (%mcp-connections m)
+          for config = (mcp-connection-config conn)
+          for status = (mcp-connection-status conn)
+          for tools = (and (eq status :connected) (%mcp-snapshot-tools conn store))
+          for deferred = (%mcp-connection-deferred-p m conn)
+          collect (list :name (mcp-server-config-name config)
+                        :scope (mcp-server-config-scope config)
+                        :transport (mcp-server-config-transport config)
+                        :config (%mcp-connection-hash conn)
+                        :status status
+                        :tools tools
+                        ;; H3e-2b (src/mcp-context.lisp)
+                        :instructions (let ((text (mcp-connection-instructions conn)))
+                                        (and text (intern-instruction-text store text)))
+                        :deferred deferred
+                        :loaded (and deferred
+                                     (let ((loaded (%mcp-loaded-names m))
+                                           (server (mcp-server-config-name config)))
+                                       (loop for p in tools
+                                             for own = (getf p :name)
+                                             when (member (mcp-tool-name server own) loaded
+                                                          :test #'equal)
+                                               collect own)))))))
 
 (defun %mcp-seed-from (entry store generation)
   "Restore step 2: ENTRY's :TOOLS as a seed."
@@ -1266,7 +1421,7 @@ config order, combined, without the names a deny \"*\" rule hides."))
                               (or live
                                   (let ((held (%mcp-held-config m name hash)))
                                     (if held
-                                        (%make-mcp-connection held :lazy t)
+                                        (%make-mcp-connection held :lazy t :manager m)
                                         (%mcp-placeholder entry)))))))
          (dropped (remove-if (lambda (x) (member x new)) old)))
     ;; 1. The revision's servers, in its order.
@@ -1284,6 +1439,13 @@ config order, combined, without the names a deny \"*\" rule hides."))
                                               (and client (eq :connected (mcp-connection-status conn))
                                                    (mcp-protocol:mcp-client-tools-generation client))))
                           (instruction-set-error () nil)))))
+    ;; H3e-2b: the loaded set becomes the revision's (src/mcp-context.lisp).
+    (let ((deferred (%mcp-deferred-source m)))
+      (when deferred
+        (setf (agent:deferred-tool-source-loaded deferred)
+              (loop for entry in snapshot
+                    append (mapcar (lambda (own) (mcp-tool-name (getf entry :name) own))
+                                   (getf entry :loaded))))))
     ;; 3. Nothing is committed: the servers the revision lacks close quietly.
     (dolist (x dropped)
       (%mcp-close-connection m x :dirty nil))

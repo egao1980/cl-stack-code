@@ -1421,6 +1421,15 @@ result, then signals its failure. H5c-0: plan runs, --approve-plan,
                                                   :env (%env-lookup settings getenv) :cwd cwd
                                                   :http-backend http-protocol:*http-backend*)
                 (%report-mcp report) mcp)
+          ;; H3e-2b: -p never asks; the system events and denials go out on
+          ;; the loop thread. The sampler is the session's model.
+          (setf (mcp-manager-broker mcp)
+                (make-headless-mcp-broker
+                 :report (%headless-mcp-reporter report event-backend event-loop))
+                (%mcp-sampler mcp)
+                (%mcp-sampler-plist backend model designator
+                                    :providers providers :env (%env-lookup settings getenv)
+                                    :settings settings :secrets (%report-secrets report)))
           ;; H3e-1: the session's instruction set (:start or :resume).
           (multiple-value-setq (context discovery instruction-set)
                                (%open-session-instructions cwd settings store
@@ -1582,13 +1591,66 @@ did not fail."
     (error 'nothing-to-retry))
   (session-head store))
 
+;;; H3e-2b: the servers' requests (src/mcp-requests.lisp), shared by -p and
+;;; the SDK.
+
+(defun %mcp-sampler-plist (backend model designator &key providers env settings secrets)
+  "The manager's sampler: the session's BACKEND, MODEL and DESIGNATOR; another
+designator resolved per request through PROVIDERS (a bad one fails that
+request); the HTTP backend and event maker bound now."
+  (list :backend backend :model model :designator designator
+        :resolve (lambda (other)
+                   (let ((resolved (multiple-value-list
+                                    (resolve-model other :providers providers
+                                                         :env (or env (constantly nil))))))
+                     (values (if settings
+                                 (%apply-settings-request-timeout (first resolved) settings)
+                                 (first resolved))
+                             (third resolved))))
+        :secrets secrets
+        :http http-protocol:*http-backend*
+        :maker http-backend-async:*event-backend-maker*))
+
+(defun %emit-mcp-object (report object)
+  "OBJECT (an event object built by src/mcp-requests.lisp) through REPORT, as
+%EMIT-EVENT sends its own: the SDK's sink, or a stream-json line. Its
+\"session_id\" is the report's. → OBJECT."
+  (setf (gethash "session_id" object) (%report-session report))
+  (let ((sink (%report-sink report)))
+    (cond (sink (funcall sink object))
+          ((eq (%report-format report) :stream-json) (%write-json-line report object))))
+  object)
+
+(defun %push-mcp-denial (report request event)
+  "A denied sampling request joins -p's permission_denials."
+  (when (and (eq :sampling (mcp-request-kind request))
+             (equal "denied" (gethash "outcome" event)))
+    (push (%json-object "name" +mcp-sampling-action+
+                        "id" (mcp-request-id request)
+                        "input" (%json-object "server" (mcp-request-server request))
+                        "reason" (if (equal "headless" (gethash "reason" event)) "headless" "denied"))
+          (%report-denials report))))
+
+(defun %headless-mcp-reporter (report event-backend event-loop)
+  "-p's REPORT: the system event and the denial, on the loop thread, in order."
+  (lambda (request event)
+    (event:wake-call event-backend event-loop
+                     (lambda ()
+                       (handler-case
+                           (progn (%emit-mcp-object report event)
+                             (%push-mcp-denial report request event))
+                         (error (e)
+                           (unless (%report-failure report)
+                             (setf (%report-failure report) e))))))))
+
 (defun %system-init-keys (cwd root designator mode offered files image-settings
-                          &key context discovery instruction-set mcp-servers resilience)
+                              &key context discovery instruction-set mcp-servers resilience)
   "The \"system\" init event's keys and values (after \"type\" and
 \"session_id\"); IMAGE-SETTINGS (the settings, when the image is on) adds
 \"lisp_image\". Shared by -p and the SDK (src/client.lisp). H3e-1: CONTEXT,
 DISCOVERY and INSTRUCTION-SET give \"imports\", \"skills\", \"rules\",
-\"notes\" and \"instruction_set\" (always present)."
+\"notes\" and \"instruction_set\" (always present). H3e-2b: with servers,
+\"mcp_tool_search\" (MCP-TOOL-SEARCH-OBJECT)."
   (let ((loaded (cond (discovery (discovery-loaded-rules discovery))
                       (context (context-loaded-rules context)))))
     (list* "subtype" "init"
@@ -1627,7 +1689,12 @@ DISCOVERY and INSTRUCTION-SET give \"imports\", \"skills\", \"rules\",
             (and image-settings (list "lisp_image" (%lisp-image-object image-settings)))
             ;; H3e-2a: only with at least one server (MCP-SERVERS: the connections).
             (and mcp-servers
-                 (list "mcp_servers" (map 'vector #'mcp-connection-object mcp-servers)))))))
+                 (list "mcp_servers" (map 'vector #'mcp-connection-object mcp-servers)))
+            ;; H3e-2b: the deferral (src/mcp-context.lisp)
+            (let ((manager (and mcp-servers
+                                (typep (first mcp-servers) '%live-mcp-connection)
+                                (%mcp-connection-manager (first mcp-servers)))))
+              (and manager (list "mcp_tool_search" (mcp-tool-search-object manager))))))))
 
 (defun %plan-open-keys (plan reopened-p &optional sandbox)
   "The preview \"opened\" / \"reopened\" event's keys and values. R4d-4b: with

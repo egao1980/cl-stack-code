@@ -322,7 +322,10 @@
 
 (deftest mcp-connection-objects
   (let ((o (mcp-connection-object (%conn "lisp" :failed :error "boom" :file #p"/p/.mcp.json" :scope :project))))
-    (ok (equal '("error" "file" "name" "scope" "status" "tools" "transport" "unit") (jkeys o)))
+    ;; H3e-2b: five more keys (src/mcp-context.lisp, "VISIBILITY")
+    (ok (equal '("deferred" "elicitation" "error" "file" "instructions" "loaded" "name" "sampling"
+                 "scope" "status" "tools" "transport" "unit")
+               (jkeys o)))
     (ok (equal "lisp" (jget o "name")))
     (ok (equal "project" (jget o "scope")))
     (ok (equal "stdio" (jget o "transport")))

@@ -406,6 +406,9 @@
    ;; H3e-2a (set by MAKE-CODE-PROGRAM)
    (mcp :initarg :mcp :initform nil :reader %cp-mcp
         :documentation "The session's MCP-MANAGER.")
+   ;; H3e-2b (UI thread): the elicitation form being answered, or NIL
+   (mcp-form :initform nil :accessor %cp-mcp-form
+             :documentation "Plist (:id :fields :index :content :error :attempt) of the form asked now.")
    ;; H3f (loop thread; set by MAKE-CODE-PROGRAM)
    (window :initarg :window :initform nil :accessor %cp-window
            :documentation "The effective context window (tokens).")
@@ -576,6 +579,14 @@ configuration errors of -p signal here."
                                                             (w:text-run "" :inverse t))))))
                      (setf (car cell) program
                            (car mcp-cell) program)
+                     ;; H3e-2b: the servers' requests go to the dialogs; "always" saves to
+                     ;; settings.local.json; the sampler is the session's model.
+                     (setf (mcp-manager-broker mcp) (%program-mcp-broker mcp-cell mcp)
+                           (%mcp-sampler mcp) (%mcp-sampler-plist backend (third resolved) designator
+                                                                  :providers providers :env env
+                                                                  :settings settings
+                                                                  :secrets (%run-secrets settings getenv))
+                           (%mcp-rule-store mcp) store)
                      ;; A resumed session: its transcript and its prompts.
                      (setf (state-transcript (code-program-state program))
                            (session-entries session)
@@ -1171,6 +1182,9 @@ from the tip's (H5b), else H3c's conversation rewind."
                                             (lambda (m) (reconnect-mcp-server m name)))))
       (:mcp-approve (destructuring-bind (name choice) args
                       (%on-loop program (lambda () (%mcp-approve program name choice)))))
+      ;; H3e-2b
+      (:mcp-respond (destructuring-bind (id decision &optional content) args
+                      (%program-mcp-respond program id decision content)))
       ;; H3f
       (:compact (let ((text (first args)))
                   (%on-loop program (lambda () (%compact-effect program text)))))
@@ -1276,6 +1290,179 @@ saved for the project (SAVE-MCP-APPROVAL); Yes starts it."
        (%mcp-in-background program (lambda (m) (reconnect-mcp-server m name))))
       (:no (%mcp-decide m name :rejected)))))
 
+;;; H3e-2b: the servers' requests in the TUI (src/mcp-requests.lisp, "THE
+;;; TUI"). The broker feeds (:mcp-request OBJECT) to the core; the dialog of
+;;; the first queued request answers with (:mcp-request-reply …); the core's
+;;; (:mcp-respond …) effect answers the request (%MCP-ANSWER).
+
+(defun %program-mcp-broker (program-cell manager)
+  "The program's broker; PROGRAM-CELL's car becomes the program."
+  (%make-publishing-broker
+   manager
+   :publish (lambda (wait)
+              (let ((program (car program-cell))
+                    (request (%mcp-wait-request wait)))
+                (if (or (null program) (%cp-stopping program))
+                    (%mcp-wait-resolve wait (%mcp-withdrawn request) :cause "closed")
+                    (let ((object (mcp-request-object
+                                   request :session-id (session-id (%cp-session program)))))
+                      (setf (%mcp-wait-object wait) object)
+                      (%send program (list :mcp-request object))))))
+   :report (lambda (request event)
+             (let ((program (car program-cell)))
+               (when (and program (not (%cp-closed program)))
+                 (%send program (list :mcp-request-resolved (mcp-request-id request)))
+                 (%send program (list :notice (mcp-request-notice event))))))))
+
+(defun %program-mcp-respond (program id decision content)
+  "The core's (:mcp-respond ID DECISION CONTENT): answer the request. Content
+the schema refuses is reported and the question declined."
+  (let ((m (%cp-mcp program)))
+    (handler-case (%mcp-answer m id decision :content content)
+      (mcp-elicitation-content-error (e)
+        (%send program (list :error (%message-text e)))
+        (handler-case (%mcp-answer m id :decline)
+          (approval-not-found () nil)))
+      (approval-not-found () nil))))
+
+(defun %program-mcp-settled (program)
+  "Loop thread: the background start settled; before the first run the
+system prompt is rendered again (with the servers' instructions)."
+  (when (and (null (%cp-run program)) (null (%cp-plan program)) (%cp-render program))
+    (let ((prompt (funcall (%cp-render program))))
+      (when prompt
+        (setf (agent:ai-agent-instructions (%cp-agent program)) prompt)))))
+
+(defun %mcp-request-dialog-p (program)
+  (let ((key (%cp-dialog-invocation program)))
+    (and (consp key) (eq :mcp-request (first key)))))
+
+(defun %mcp-field-dialog-p (program)
+  (let ((key (%cp-dialog-invocation program)))
+    (and (consp key) (eq :mcp-field (first key)))))
+
+(defun %elicitation-field-label (field)
+  "\"TITLE (TYPE[, optional])\"."
+  (format nil "~a (~(~a~)~:[, optional~;~])"
+          (or (elicitation-field-title field) (elicitation-field-name field))
+          (elicitation-field-type field)
+          (elicitation-field-required field)))
+
+(defun %mcp-request-dialog (object)
+  (make-instance 'w:confirm-dialog
+                 :title "MCP server"
+                 :focused t
+                 :message (format nil "~{~a~^~%~}" (mcp-request-dialog-lines object))
+                 :choices (if (equal +mcp-sampling-action+ (gethash "kind" object))
+                              +mcp-sampling-choices+
+                              +mcp-elicitation-choices+)
+                 :feedback-choice nil))
+
+(defun %mcp-field-dialog (object form)
+  "The dialog of FORM's current field: a select dialog for a boolean or an
+enum, else an input line."
+  (let* ((field (nth (getf form :index) (getf form :fields)))
+         (error (getf form :error))
+         (description (elicitation-field-description field))
+         (label (%elicitation-field-label field)))
+    (cond ((eq :boolean (elicitation-field-type field))
+           (make-instance 'w:confirm-dialog
+                          :title label :focused t
+                          :message (format nil "~@[~a~]~@[~%~a~]" description error)
+                          :choices '((:yes "Yes") (:no "No"))
+                          :feedback-choice nil))
+          ((elicitation-field-enum field)
+           (make-instance 'w:confirm-dialog
+                          :title (or (elicitation-field-title field) (elicitation-field-name field))
+                          :focused t
+                          :message (format nil "~a~@[~%~a~]~@[~%~a~]" label description error)
+                          :choices (loop for value in (elicitation-field-enum field)
+                                         for i from 0
+                                         collect (list (intern (format nil "OPTION-~d" i) :keyword)
+                                                       (or (nth i (elicitation-field-enum-titles field))
+                                                           value)))
+                          :feedback-choice nil))
+          (t
+           (let ((dialog (make-instance 'w:confirm-dialog
+                                        :title (format nil "MCP server ~a" (gethash "server" object))
+                                        :focused t
+                                        :message (format nil "~a~@[~%~a~]~@[~%~a~]" label description error)
+                                        :choices '((:answer "Answer"))
+                                        :feedback-choice :answer
+                                        :feedback-prompt label)))
+             ;; Straight to the input line.
+             (w:widget-update dialog (tui:make-key-message :key :enter))
+             dialog)))))
+
+(defun %sync-mcp-request-dialog (program)
+  "UI thread: the dialog of the first queued request, or of its form's field. → NIL."
+  (let* ((object (first (state-mcp-requests (code-program-state program))))
+         (id (gethash "id" object))
+         (form (%cp-mcp-form program)))
+    (when (and form (not (equal id (getf form :id))))
+      (setf form nil
+            (%cp-mcp-form program) nil))
+    (let ((key (if form
+                   (list :mcp-field id (getf form :index) (getf form :attempt))
+                   (list :mcp-request id))))
+      (unless (equal key (%cp-dialog-invocation program))
+        (setf (code-program-dialog program) (if form
+                                                (%mcp-field-dialog object form)
+                                                (%mcp-request-dialog object))
+              (%cp-dialog-invocation program) key))
+      (setf (w:widget-focused-p (code-program-input program)) nil)
+      nil)))
+
+(defun %mcp-request-choice (program choice)
+  "UI thread: the request dialog's CHOICE. \"Answer\" starts the form."
+  (let* ((object (first (state-mcp-requests (code-program-state program))))
+         (id (gethash "id" object)))
+    (if (and (eq choice :accept) (equal +mcp-elicitation-action+ (gethash "kind" object)))
+        (let ((fields (handler-case (elicitation-fields
+                                     (gethash "requested_schema" (gethash "input" object)))
+                        (mcp-protocol:mcp-error () nil))))
+          (if fields
+              (setf (%cp-mcp-form program)
+                    (list :id id :fields fields :index 0
+                          :content (make-hash-table :test 'equal) :error nil :attempt 0))
+              (%apply-event program (list :mcp-request-reply id :accept
+                                          (make-hash-table :test 'equal)))))
+        (%apply-event program (list :mcp-request-reply id choice)))))
+
+(defun %mcp-field-answer (program choice feedback)
+  "UI thread: the field dialog's answer; an error keeps the field asking, an
+empty optional field is left out, the last field sends the content."
+  (let* ((form (%cp-mcp-form program))
+         (index (getf form :index))
+         (fields (getf form :fields))
+         (field (nth index fields)))
+    (multiple-value-bind (value present error)
+        (cond ((eq :boolean (elicitation-field-type field))
+               (values (eq choice :yes) t nil))
+              ((elicitation-field-enum field)
+               (let ((i (parse-integer (symbol-name choice) :start 7 :junk-allowed t)))
+                 (values (nth i (elicitation-field-enum field)) t nil)))
+              (t (parse-elicitation-input field (or feedback ""))))
+      (cond (error
+             (setf (getf (%cp-mcp-form program) :error) error)
+             (incf (getf (%cp-mcp-form program) :attempt)))
+            (t
+             (when present
+               (setf (gethash (elicitation-field-name field) (getf form :content)) value))
+             (if (< (1+ index) (length fields))
+                 (setf (getf (%cp-mcp-form program) :index) (1+ index)
+                       (getf (%cp-mcp-form program) :error) nil)
+                 (progn
+                   (setf (%cp-mcp-form program) nil)
+                   (%apply-event program (list :mcp-request-reply (getf form :id) :accept
+                                               (getf form :content))))))))))
+
+(defun %mcp-form-cancel (program)
+  "UI thread: Esc in a field cancels the request."
+  (let ((form (shiftf (%cp-mcp-form program) nil)))
+    (when form
+      (%apply-event program (list :mcp-request-reply (getf form :id) :cancel)))))
+
 (defun %mcp-dialog-p (program)
   (let ((key (%cp-dialog-invocation program)))
     (and (consp key) (eq :mcp-dialog (first key)))))
@@ -1351,6 +1538,9 @@ goes back to the input)."
           ((and (null approvals) (state-mcp-prompt state))
            ;; H3e-2a: a project server's approval.
            (%sync-mcp-dialog program))
+          ((and (null approvals) (state-mcp-requests state))
+           ;; H3e-2b: a server's sampling or elicitation request.
+           (%sync-mcp-request-dialog program))
           ((null approvals)
            (setf (code-program-dialog program) nil
                  (%cp-dialog-invocation program) nil
@@ -1403,7 +1593,10 @@ goes back to the input)."
   (let ((m (%cp-mcp program)))
     (when (and m (mcp-manager-connections m))
       (%mcp-in-background program
-                          (lambda (m) (start-mcp-servers m :approve (%mcp-ask program))))))
+                          (lambda (m)
+                            (start-mcp-servers m :approve (%mcp-ask program))
+                            ;; H3e-2b: before the first run, the prompt gets the servers' instructions.
+                            (%on-loop program (lambda () (%program-mcp-settled program)))))))
   ;; H3e-1: the instruction context's notes, once, as notices.
   (let ((context (%cp-instruction-context program)))
     (when context
@@ -1469,10 +1662,24 @@ goes back to the input)."
       ((member key '(:page-up :page-down))
        (w:widget-update (%cp-viewport program) message)
        nil)
+      ((and dialog (eq key :escape) (%mcp-field-dialog-p program))
+       ;; H3e-2b: Esc in a field (an input line too) cancels the request.
+       (%mcp-form-cancel program)
+       nil)
       (dialog
        (multiple-value-bind (widget command event) (w:widget-update dialog message)
          (declare (ignore widget))
-         (cond ((and (w:confirm-event-p event) (%ask-dialog-p program))
+         (cond ((and (w:confirm-event-p event) (%mcp-request-dialog-p program))
+                ;; H3e-2b: a server's request
+                (%mcp-request-choice program (w:confirm-event-choice event))
+                command)
+               ((and (w:confirm-event-p event) (%mcp-field-dialog-p program))
+                (%mcp-field-answer program (w:confirm-event-choice event) (w:confirm-event-feedback event))
+                command)
+               ((and (w:cancel-event-p event) (%mcp-field-dialog-p program))
+                (%mcp-form-cancel program)
+                command)
+               ((and (w:confirm-event-p event) (%ask-dialog-p program))
                 ;; H5c-0: ask_user's answer.
                 (%ask-reply program (w:confirm-event-choice event) (w:confirm-event-feedback event))
                 command)
@@ -1662,6 +1869,9 @@ goes back to the input)."
     (dolist (cell (bt:with-lock-held ((%cp-ask-lock program))
                     (shiftf (%cp-ask-cells program) '())))
       (%answer-ask cell nil))
+    ;; H3e-2b: the servers' requests still waiting are answered ("closed").
+    (when (%cp-mcp program)
+      (%mcp-answer-all (%cp-mcp program) "closed"))
     ;; H8d: the subscription and the panel's threads end first.
     (%stop-units-ui program)
     (let* ((thread (%cp-thread program))
