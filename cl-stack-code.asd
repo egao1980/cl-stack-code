@@ -44,8 +44,8 @@
                (:version "http-encoding-zstd" "0.1.1") (:version "http-encoding-brotli" "0.1.1")
                (:version "http-encoding-snappy" "0.1.1")
                ;; H4b
-               (:version "lisp-mcp" "0.7.1")
-               (:version "lisp-mcp/agent" "0.7.1")
+               (:version "lisp-mcp" "0.7.3")
+               (:version "lisp-mcp/agent" "0.7.3")
                ;; H3d
                (:version "rpc-protocol" "0.2.0")
                (:version "rpc-protocol-json" "0.1.1")
