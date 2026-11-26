@@ -1131,7 +1131,8 @@ the rewind plan changes."
   "Rewind the SESSION-STORE STORE to turn AT, per part. AT: 0 (the session's
 start), a turn number N ≥ 1 (an integer, or a string of digits) or a turn id
 or id prefix, as TURN-CHECKPOINT takes it. → the RESULT plist (see
-\"Rewind\")."
+\"Rewind\"). H5c-0: a moved conversation sets the session's plan document back
+to the revision on the new line (%REWIND-PLAN-DOCUMENT)."
   (unless (and (consp parts)
                (every (lambda (part) (member part '(:conversation :files))) parts))
     (error 'type-error :datum parts :expected-type '(cons (member :conversation :files) list)))
@@ -1153,7 +1154,10 @@ or id prefix, as TURN-CHECKPOINT takes it. → the RESULT plist (see
       (let* ((conversation (cond ((not conversation-p) :skipped)
                                  ((eq files :aborted) :unchanged)
                                  ((equal at-id (session-base store)) :unchanged)
-                                 (t (move-session-head store at-id) :moved)))
+                                 (t (move-session-head store at-id)
+                                    (%rewind-plan-document store (checkpointer-project-dir checkpointer)
+                                                           (checkpointer-data-dir checkpointer))
+                                    :moved)))
              (checkpoint (and (member files '(:applied :merged))
                               (checkpointer-enabled-p checkpointer)
                               (record-checkpoint checkpointer store :rewind

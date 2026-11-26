@@ -105,24 +105,31 @@ left out; a file named twice appears once, at its first place."
           (permission-mode-name mode)))
 
 (defun %plan-environment-sections (cwd plan settings)
-  "H5a: the sections that replace the # Environment section in a plan run:
+  "H5a: the sections that replace the # Environment section in a preview run:
   # Environment
   - Working directory: <native PLAN-TOOL-ROOT of CWD>
   - Project root: <native PLAN-ROOT, or \"none\" when CWD has no project root>
   - Platform: <as without a plan>
   - Permission mode: <mode name>
-  - Plan: <id> (<copy|git>), a copy of <native PLAN-PROJECT-DIR>
-then, as its own section, +PLAN-MODE-FEEDBACK+. → list of two strings."
-  (let ((cwd (%truename-directory cwd)))
-    (list (format nil "# Environment~%- Working directory: ~a~%- Project root: ~a~%- Platform: ~a~%- Permission mode: ~a~%- Plan: ~a (~(~a~)), a copy of ~a"
-                  (uiop:native-namestring (plan-tool-root plan cwd))
-                  (if (find-project-root cwd) (uiop:native-namestring (plan-root plan)) "none")
-                  (%platform-name)
-                  (permission-mode-name (settings-permission-mode settings))
-                  (plan-id plan)
-                  (plan-kind plan)
-                  (uiop:native-namestring (plan-project-dir plan)))
-          +plan-mode-feedback+)))
+  - Preview: <id> (<copy|git>), a copy of <native PLAN-PROJECT-DIR>
+then, as its own section, +PLAN-MODE-FEEDBACK+ (= +PREVIEW-MODE-FEEDBACK+).
+H5c-0: in plan mode PLAN is the exploration area: the environment has no
+preview line, and the second section is %PLAN-MODE-PROMPT-SECTION (the plan
+mode section and the template). → list of two strings."
+  (let* ((cwd (%truename-directory cwd))
+         (mode (settings-permission-mode settings))
+         (environment
+           (format nil "# Environment~%- Working directory: ~a~%- Project root: ~a~%- Platform: ~a~%- Permission mode: ~a"
+                   (uiop:native-namestring (plan-tool-root plan cwd))
+                   (if (find-project-root cwd) (uiop:native-namestring (plan-root plan)) "none")
+                   (%platform-name)
+                   (permission-mode-name mode))))
+    (if (eq mode :plan)
+        (list environment (%plan-mode-prompt-section settings))
+        (list (format nil "~a~%- Preview: ~a (~(~a~)), a copy of ~a" environment
+                      (plan-id plan) (plan-kind plan)
+                      (uiop:native-namestring (plan-project-dir plan)))
+              +plan-mode-feedback+))))
 
 (defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan lisp-image
                                      sandbox context instruction-set)

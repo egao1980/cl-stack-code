@@ -329,10 +329,20 @@ the rule engine's."
     (agent:permission-rules-effect +mcp-plan-mode-rules+ action resources)))
 
 (defun code-permission-policy (settings)
-  "The run's :permission-policy: SETTINGS-PERMISSION-POLICY, and in plan mode
-the MCP plan policy."
-  (or (settings-permission-policy settings)
-      (and (eq :plan (settings-permission-mode settings)) #'%mcp-plan-mode-policy)))
+  "The run's :permission-policy: SETTINGS-PERMISSION-POLICY, and in plan and
+preview mode the MCP plan policy (MCP tools act outside the area in both).
+H5c-0: in plan mode both apply; each only tightens, so the first one with an
+opinion answers."
+  (let ((mode-policy (settings-permission-policy settings))
+        (mcp-policy (and (member (settings-permission-mode settings) '(:plan :preview))
+                         #'%mcp-plan-mode-policy)))
+    (if (and mode-policy mcp-policy)
+        (lambda (action resources effect)
+          (multiple-value-bind (decided rule) (funcall mode-policy action resources effect)
+            (if decided
+                (values decided rule)
+                (funcall mcp-policy action resources effect))))
+        (or mode-policy mcp-policy))))
 
 (defparameter +mcp-statuses+
   '(:pending :connecting :connected :failed :disabled :unapproved :rejected

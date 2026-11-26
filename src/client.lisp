@@ -286,7 +286,8 @@
     "thinking_delta"
     "assistant" "tool_use" "tool_result"
     "approval_request" "approval_resolved" "steering" "image_event"
-    "plan" "rewind" "session" "result"
+    ;; H5c-0: "plan" carries plan documents; "preview" is H5a's (renamed)
+    "plan" "preview" "rewind" "session" "result"
     ;; H3e-1: lazily loaded instruction files and rules
     "instructions"
     ;; H8d: units/subscribe notifications
@@ -404,6 +405,12 @@ posted steering, committed turns, the current CODE-TURN, closed flag."))
   plan plan-sources plan-turn-p
   ;; R4d-4b
   plan-sandbox
+  ;; H5c-0: the plan document, its exploration area and the plan tools; an
+  ;; approved plan's execution turn (EXEC-DOC); the record of the turn.
+  plan-doc doc-area doc-sources doc-sandbox doc-tools doc-agent-p
+  doc-turn-p (doc-start-revision 0) doc-feedback doc-opened-p
+  exec-doc exec-tools exec-snapshots exec-before exec-turn-p
+  doc-record
   ;; the run (kept across turns: CONTINUE-AI-AGENT-ASYNC)
   run handle
   (committed (make-hash-table :test 'eq))
@@ -999,9 +1006,12 @@ close after its result), or NIL."
 ;;; Turns.
 
 (defun %tool-root (st)
-  (if (and (%s-plan st) (%s-plan-sources st))
-      (plan-tool-root (%s-plan st) (%s-cwd st))
-      (%s-cwd st)))
+  (cond ((and (%s-plan st) (%s-plan-sources st))
+         (plan-tool-root (%s-plan st) (%s-cwd st)))
+        ;; H5c-0: a plan's exploration area
+        ((and (%s-doc-agent-p st) (%s-doc-area st))
+         (plan-tool-root (%s-doc-area st) (%s-cwd st)))
+        (t (%s-cwd st))))
 
 (defun %prompt-text (prompt mentions root)
   "PROMPT with its @mentions expanded, then MENTIONS attached (skipping a path
@@ -1059,15 +1069,18 @@ attached already)."
     (let ((st (%session-state session)))
       (%finish-turn session st (%s-run st) condition))))
 
-(defun %sdk-plan-settings (st)
+(defun %sdk-plan-settings (st &optional (mode :preview))
+  "The settings of an area's tools: MODE (:PREVIEW, or :PLAN for a plan's
+exploration area), the image off."
   (merge-settings (%s-settings st)
-                  (make-settings :permission-mode :plan
+                  (make-settings :permission-mode mode
                                  :lisp-image '(:image (:off)))))
 
-(defun %sdk-plan-agent (st plan settings sandbox)
+(defun %sdk-plan-agent (st plan settings sandbox &optional extra)
   "The area's tool sources for PLAN (confined while SANDBOX is) and the
 instructions. → (values sources instructions). H8d: on the session's
-supervisor, under an :agent scope \"plan-<id8>\"."
+supervisor, under an :agent scope \"plan-<id8>\". H5c-0: EXTRA sources (the
+plan tools) come last."
   (let* ((agent (%s-agent st))
          (sup (%s-supervisor st))
          (sources (append (apply #'make-code-tools (plan-tool-root plan (%s-cwd st))
@@ -1077,7 +1090,8 @@ supervisor, under an :agent scope \"plan-<id8>\"."
                                  :skills (and (%s-context st) (context-skills (%s-context st)))
                                  (plan-sandbox-tool-keys sandbox))
                           ;; H3e-2a: the session's MCP source, last.
-                          (and (%s-mcp st) (list (mcp-manager-tool-source (%s-mcp st)))))))
+                          (and (%s-mcp st) (list (mcp-manager-tool-source (%s-mcp st))))
+                          extra)))
     (%link-skill-tools (%s-instruction-set st) (code-skill-tools sources))
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
@@ -1089,10 +1103,10 @@ supervisor, under an :agent scope \"plan-<id8>\"."
         (values sources
                 (assemble-system-prompt
                  (%s-cwd st) :tools offered :backend (agent:ai-agent-backend agent)
-                             :settings settings :user-config-dir (%s-config st)
-                             :plan plan :sandbox sandbox
-                             :context (%s-context st)
-                             :instruction-set (%s-instruction-set st)))))))
+                 :settings settings :user-config-dir (%s-config st)
+                 :plan plan :sandbox sandbox
+                 :context (%s-context st)
+                 :instruction-set (%s-instruction-set st)))))))
 
 (defun %sdk-ensure-plan (session st report)
   "H5a: open (or reopen) the session's plan and give the agent the area's
@@ -1126,7 +1140,8 @@ ask (%SDK-REFRESH-PLAN-SHELL)."
                                          (unless reopened (reject-plan plan)))))
                         (open-plan-sandbox plan settings
                                            :backend (%client-plan-backend client)))))
-        (multiple-value-bind (sources instructions) (%sdk-plan-agent st plan settings sandbox)
+        (multiple-value-bind (sources instructions) (%sdk-plan-agent st plan settings sandbox
+                                                                     (let ((x (%s-exec-tools st))) (and x (list x))))
           (setf (%s-cwd-instructions st) (agent:ai-agent-instructions agent)
                 (agent:ai-agent-tools agent) sources
                 (agent:ai-agent-instructions agent) instructions
@@ -1136,7 +1151,7 @@ ask (%SDK-REFRESH-PLAN-SHELL)."
                 (%s-plan-sandbox st) sandbox
                 (%s-run st) nil
                 (%s-handle st) nil))
-        (apply #'%emit-event report "plan" (%plan-open-keys plan reopened sandbox)))))
+        (apply #'%emit-event report "preview" (%plan-open-keys plan reopened sandbox)))))
 
 (defun %sdk-refresh-plan-shell (st)
   "R4d-4b, at a turn's start: after a refusal, the plan's shell tools again
@@ -1149,7 +1164,8 @@ the run is dropped."
       (let ((settings (%sdk-plan-settings st))
             (agent (%s-agent st)))
         (multiple-value-bind (sources instructions)
-            (%sdk-plan-agent st (%s-plan st) settings sandbox)
+            (%sdk-plan-agent st (%s-plan st) settings sandbox
+                             (let ((x (%s-exec-tools st))) (and x (list x))))
           (setf (agent:ai-agent-tools agent) sources
                 (agent:ai-agent-instructions agent) instructions
                 (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
@@ -1180,9 +1196,251 @@ again, the run dropped."
     (%close-code-units nil :unit-tools (list (code-unit-tools sources))
                            :shell-tools (list (second sources)))))
 
-(defun %start-turn (session prompt mentions on-event &key retry-of)
+;;; H5c-0: plan documents in the SDK (src/plan-docs.lisp header, SDK AND RPC).
+
+(defun %sdk-ensure-plan-doc (session st report)
+  "Plan mode, before a turn: the session's open plan document (else a new one),
+its exploration area and sandbox, the agent on the area's tools with the plan
+tools. The \"plan\" \"opened\" / \"reopened\" event."
+  (let* ((client (code-session-client session))
+         (store (code-session-store session))
+         (settings (%sdk-plan-settings st :plan))
+         (reopened t)
+         (doc (or (let ((doc (%s-plan-doc st)))
+                    (and doc (member (plan-document-status doc) '(:drafting :proposed)) doc))
+                  (multiple-value-bind (doc again)
+                      (%open-session-plan-doc store (%s-project-dir st) (%s-data-dir st) settings)
+                    (setf reopened again)
+                    (unless again (setf (%s-doc-opened-p st) t))
+                    doc))))
+    (unless (%s-doc-agent-p st)
+      (let* ((area (%plan-doc-exploration-area
+                    doc (lambda ()
+                          (open-plan (%s-project-dir st) :kind (%client-plan-area client)
+                                                         :data-dir (%s-data-dir st)
+                                                         :session-id (session-id store)))))
+             (sandbox (open-plan-sandbox area settings :backend (%client-plan-backend client)))
+             (tools (make-plan-tools doc :phase :plan))
+             (agent (%s-agent st)))
+        (multiple-value-bind (sources instructions)
+            (%sdk-plan-agent st area settings sandbox (list tools))
+          (unless (%s-plan st)
+            (setf (%s-cwd-instructions st) (agent:ai-agent-instructions agent)))
+          (setf (agent:ai-agent-tools agent) sources
+                (agent:ai-agent-instructions agent) instructions
+                (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
+                (%s-plan-doc st) doc
+                (%s-doc-area st) area
+                (%s-doc-sources st) sources
+                (%s-doc-sandbox st) sandbox
+                (%s-doc-tools st) tools
+                (%s-doc-agent-p st) t
+                (%s-run st) nil
+                (%s-handle st) nil))
+        (apply #'%emit-event report "plan"
+               (%plan-doc-opened-keys doc area reopened sandbox))))
+    doc))
+
+(defun %sdk-leave-plan-doc (st)
+  "Not in plan mode: the working directory's tools again (plus update_plan
+while an approved plan runs); the exploration area's sources closed."
+  (let ((agent (%s-agent st))
+        (exec (%s-exec-tools st)))
+    (when (%s-doc-agent-p st)
+      (let ((sources (%s-doc-sources st)))
+        (when (%s-cwd-instructions st)
+          (setf (agent:ai-agent-instructions agent) (%s-cwd-instructions st)))
+        (setf (%s-doc-agent-p st) nil
+              (%s-doc-sources st) nil
+              (%s-doc-sandbox st) nil
+              (agent:ai-agent-tools agent) (%s-sources st)
+              (agent:ai-agent-permissions agent) (%agent-permissions (%s-settings st))
+              (%s-run st) nil
+              (%s-handle st) nil)
+        (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                               :shell-tools (list (second sources)))))
+    (unless (%s-plan st)
+      (let ((want (append (%s-sources st) (and exec (list exec)))))
+        (unless (equal want (agent:ai-agent-tools agent))
+          (setf (agent:ai-agent-tools agent) want
+                (%s-run st) nil
+                (%s-handle st) nil))))))
+
+(defun %sdk-plan-doc-finish (st report failure interrupted reason)
+  "Loop thread, a turn ends, before its commit: a plan turn's \"plan\" in the
+result (null when it proposed nothing) and its record; an execution turn's
+plan versus diff, the \"executed\" event and its record."
+  (when (%s-doc-turn-p st)
+    (let* ((doc (%s-plan-doc st))
+           (proposed (> (plan-document-revision doc) (%s-doc-start-revision st))))
+      (setf (%report-plan-doc-p report) t
+            (%report-plan-doc-object report) (and proposed (plan-document-object doc))
+            (%s-doc-record st) (and (or proposed (%s-doc-opened-p st))
+                                    (plan-document-record doc :feedback (and proposed (%s-doc-feedback st))))
+            (%s-doc-opened-p st) nil)))
+  (when (%s-exec-turn-p st)
+    (let* ((doc (%s-exec-doc st))
+           (preview (%s-plan st))
+           (bad (or failure interrupted (member reason '(:canceled :max-steps :approval :deferred)))))
+      (multiple-value-bind (changes diff)
+          (handler-case
+              (if preview
+                  (values (plan-changes preview) (plan-diff-text preview))
+                  (%execution-changes (%s-exec-snapshots st) (%s-exec-before st)
+                                      (%execution-snapshot (%s-project-dir st) (%s-exec-snapshots st))))
+            (error () (values '() "")))
+        (%plan-doc-execution-finish report doc changes diff bad preview)
+        (setf (%s-doc-record st) (plan-document-record doc)
+              (%s-exec-doc st) nil
+              (%s-exec-tools st) nil
+              (%s-exec-snapshots st) nil
+              (%s-exec-before st) nil
+              (%s-exec-turn-p st) nil)
+        (unless preview
+          (setf (agent:ai-agent-tools (%s-agent st)) (%s-sources st)
+                (%s-run st) nil
+                (%s-handle st) nil))))))
+
+(defun %session-plan-doc-of (session st)
+  "The session's plan document (loaded from its head line when not yet), or
+PLAN-DOCUMENT-NOT-FOUND."
+  (or (%s-plan-doc st)
+      (let ((doc (%session-plan-doc (code-session-store session) (%s-project-dir st) (%s-data-dir st))))
+        (when doc (setf (%s-plan-doc st) doc))
+        doc)
+      (error 'plan-document-not-found
+             :designator (code-session-id session)
+             :message (format nil "session ~a has no plan" (code-session-id session)))))
+
+(defun %plan-doc-object-with-markdown (doc)
+  (let ((object (plan-document-object doc)))
+    (setf (gethash "markdown" object) (or (plan-document-markdown doc) ""))
+    object))
+
+(defun %client-plan-target (session)
+  "H5c-0, for the RPC aliases: :DOCUMENT when the session has a plan document
+waiting (:DRAFTING :PROPOSED :INTERRUPTED), else :PREVIEW when it has an open
+preview, else :DOCUMENT when it has a document at all (its status refuses),
+else NIL."
+  (%on-client-loop ((code-session-client session))
+    (let* ((st (%live session))
+           (doc (handler-case (%session-plan-doc-of session st)
+                  (plan-document-not-found () nil))))
+      (cond ((and doc (member (plan-document-status doc) '(:drafting :proposed :interrupted)))
+             :document)
+            ((%s-plan st) :preview)
+            (doc :document)
+            (t nil)))))
+
+(defun client-plan-document (session)
+  "→ the session's plan document object with \"markdown\", or NIL."
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (let ((doc (handler-case (%session-plan-doc-of session st)
+                   (plan-document-not-found () nil))))
+        (and doc
+             (progn (handler-case (sync-plan-document-edits doc)
+                      (plan-format-error () nil))
+               (%plan-doc-object-with-markdown doc)))))))
+
+(defun %sdk-set-mode (session st mode)
+  "As CLIENT-SET-PERMISSION-MODE, on the loop thread."
+  (let* ((settings (merge-settings (%s-settings st) (make-settings :permission-mode mode)))
+         (agent (%s-agent st)))
+    (when (and (%s-plan st) (not (eq mode :preview)))
+      (%restore-cwd-tools st))
+    (setf (%s-settings st) settings
+          (%s-mode st) mode
+          (code-session-permission-mode session) mode
+          (agent:ai-agent-settings agent) (%agent-settings (%s-cwd st) settings
+                                                           :discovery (%s-discovery st)
+                                                           :backend (agent:ai-agent-backend agent)
+                                                           :designator (%s-designator st))
+          (%s-run st) nil
+          (%s-handle st) nil)
+    (unless (eq mode :plan)
+      (%sdk-leave-plan-doc st))
+    (unless (or (%s-plan st) (%s-doc-agent-p st))
+      (setf (agent:ai-agent-permissions agent) (%agent-permissions settings)))
+    mode))
+
+(defun client-approve-plan-document (session &key (mode :accept-edits) prompt on-drift)
+  "Approve the session's plan document under MODE and start its execution
+turn. → (values object turn)."
+  (declare (ignore on-drift))
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (%check-idle session st)
+      (let ((doc (%session-plan-doc-of session st)))
+        (approve-plan-document doc :mode mode)
+        (setf (%s-doc-area st) nil
+              (%s-exec-doc st) doc
+              (%s-exec-tools st) (make-plan-tools doc :phase :execute))
+        (%sdk-set-mode session st mode)
+        (unless (eq mode :preview)
+          (let ((store (p:make-memory-snapshot-store)))
+            (setf (%s-exec-snapshots st) store
+                  (%s-exec-before st) (%execution-snapshot (%s-project-dir st) store))))
+        (let* ((object (plan-document-object doc))
+               (turn (%start-turn session (plan-execution-prompt doc prompt) nil nil
+                                  :approved-doc doc)))
+          (values object turn))))))
+
+(defun client-reject-plan-document (session)
+  "Reject the session's plan document. → its object."
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (%check-idle session st)
+      (let ((doc (%session-plan-doc-of session st)))
+        (reject-plan-document doc)
+        (when (%s-doc-agent-p st)
+          (%sdk-leave-plan-doc st))
+        (setf (%s-plan-doc st) nil (%s-doc-area st) nil (%s-doc-tools st) nil)
+        (%emit-event (%session-report session) "plan" "subtype" "rejected"
+                     "plan_id" (plan-document-id doc))
+        (plan-document-object doc)))))
+
+(defun client-revise-plan-document (session feedback)
+  "The plan turn that revises the proposed plan with FEEDBACK. → its CODE-TURN."
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (%check-idle session st)
+      (let ((doc (%session-plan-doc-of session st)))
+        (unless (member (plan-document-status doc) '(:drafting :proposed))
+          (%plan-doc-state-fail doc "revised"))
+        (unless (eq :plan (%s-mode st))
+          (%sdk-set-mode session st :plan))
+        (%start-turn session feedback nil nil)))))
+
+(defun client-update-plan-document (session markdown)
+  "MARKDOWN as the plan's next revision, by the user. → the object."
+  (%on-client-loop ((code-session-client session))
+    (let ((st (%live session)))
+      (%check-idle session st)
+      (let ((doc (%session-plan-doc-of session st)))
+        (unless (member (plan-document-status doc) '(:drafting :proposed :interrupted))
+          (%plan-doc-state-fail doc "updated"))
+        (let ((status (plan-document-status doc)))
+          (propose-plan-revision doc markdown :author :user)
+          (when (eq status :interrupted)
+            (setf (plan-document-status doc) :interrupted)
+            (%write-plan-doc-meta doc)))
+        (%plan-doc-object-with-markdown doc)))))
+
+(defun client-save-plan-document (session &key directory)
+  "Save the plan under the project. → the native path."
+  (%on-client-loop ((code-session-client session))
+    (let* ((st (%live session))
+           (doc (%session-plan-doc-of session st)))
+      (uiop:native-namestring
+       (save-plan-to-workspace doc :directory (or directory
+                                                  (settings-plan-save-directory (%s-settings st))))))))
+
+(defun %start-turn (session prompt mentions on-event &key retry-of approved-doc)
   "Start a turn. H3f: RETRY-OF (a failed revision id) starts a new run from the
-recorded conversation, adding no user turn."
+recorded conversation, adding no user turn. H5c-0: in plan mode the plan
+document and its exploration area first; APPROVED-DOC makes it the execution
+turn of that approved plan (PROMPT is its execution prompt)."
   (let ((st (%live session)))
     (unless (eq :idle (%s-state st))
       (error 'turn-busy :session-id (code-session-id session)))
@@ -1210,15 +1468,34 @@ recorded conversation, adding no user turn."
             (%s-interrupted st) nil
             (%s-pending st) '()
             (%s-start st) (get-internal-real-time)
-            (%s-plan-turn-p st) nil)
+            (%s-plan-turn-p st) nil
+            (%s-doc-turn-p st) nil
+            (%s-exec-turn-p st) (and approved-doc t))
       (handler-case
           (progn
-            (when (eq :plan (%s-mode st))
+            (when (eq :preview (%s-mode st))
               (%sdk-ensure-plan session st report))
+            (cond ((eq :plan (%s-mode st))
+                   (let ((doc (%sdk-ensure-plan-doc session st report)))
+                     (setf (%s-doc-turn-p st) t
+                           (%s-doc-start-revision st) (plan-document-revision doc)
+                           (%s-doc-feedback st) (and (eq :proposed (plan-document-status doc)) prompt)
+                           (%plan-tools-feedback (%s-doc-tools st)) (%s-doc-feedback st)
+                           (%report-plan-doc report) doc)))
+                  (t (%sdk-leave-plan-doc st)
+                     (when approved-doc
+                       (setf (%report-plan-doc report) approved-doc)
+                       (%emit-event report "plan" "subtype" "approved"
+                                    "plan_id" (plan-document-id approved-doc)
+                                    "revision" (plan-document-revision approved-doc)
+                                    "mode" (permission-mode-name
+                                            (plan-document-execution-mode approved-doc))))))
             (setf (%s-plan-turn-p st) (and (%s-plan st) t)
                   (%s-pre st) (handler-case (begin-checkpoint-turn (%s-checkpointer st) store)
                                 (error () nil)))
-            (let ((text (%prompt-text prompt mentions (%tool-root st)))
+            (let ((text (if approved-doc
+                            prompt
+                            (%prompt-text prompt mentions (%tool-root st))))
                   (run (%s-run st)))
               (if run
                   (progn
@@ -1451,27 +1728,13 @@ on the loop thread. The watcher only reads the session's state."
       (permission-mode-name mode)        ; another keyword → CODE-USAGE-ERROR
       (%check-idle session st)
       (let* ((mode (or mode :default))
-             (settings (merge-settings (%s-settings st) (make-settings :permission-mode mode)))
-             (agent (%s-agent st)))
+             (settings (merge-settings (%s-settings st) (make-settings :permission-mode mode))))
         (when (settings-lisp-image settings)
           (check-lisp-image-settings settings mode))
-        ;; Leaving plan mode: the working directory's tools again; the plan
-        ;; stays open on disk (the next plan-mode turn reopens it).
-        (when (and (%s-plan st) (not (eq mode :plan)))
-          (%restore-cwd-tools st))
-        (setf (%s-settings st) settings
-              (%s-mode st) mode
-              (code-session-permission-mode session) mode
-              (agent:ai-agent-settings agent) (%agent-settings (%s-cwd st) settings
-                                                               :discovery (%s-discovery st)
-                                                               :backend (agent:ai-agent-backend agent)
-                                                               :designator (%s-designator st))
-              ;; The next turn starts a new run on SESSION-TURNS.
-              (%s-run st) nil
-              (%s-handle st) nil)
-        (unless (%s-plan st)
-          (setf (agent:ai-agent-permissions agent) (%agent-permissions settings)))
-        mode))))
+        ;; Leaving preview mode: the working directory's tools again; the
+        ;; preview stays open on disk (the next preview turn reopens it).
+        ;; H5c-0: leaving plan mode likewise; a proposed plan waits.
+        (%sdk-set-mode session st mode)))))
 
 (defun client-export-session (session &key (format :json))
   (%on-client-loop ((code-session-client session))
@@ -1627,6 +1890,9 @@ store) or NIL."
                                                            (and set (instruction-set-current set)))
                                            ;; H3f
                                            :compactions (reverse (%report-markers report))
+                                           ;; H5c-0
+                                           :plan-document
+                                           (shiftf (%s-doc-record st) nil)
                                            :retry-of (%report-retry-of report))))
             (multiple-value-bind (revision store) (%commit-forking old record)
               (dolist (turn new) (setf (gethash turn committed) t))
@@ -1682,6 +1948,9 @@ result; then the session is idle and CLIENT-WAIT answers."
                                    run nil nil (make-broadcast-stream))
             (setf (%report-plan report)
                   (%plan-object plan :open (plan-changes plan) (plan-diff-text plan) '())))))
+    ;; H5c-0: the plan document's part of the result, and its record.
+    (handler-case (%sdk-plan-doc-finish st report failure interrupted reason)
+      (error (e) (unless failure (setf failure e))))
     (multiple-value-bind (revision store)
         (and run (%sdk-commit session st run report
                               (%run-finish run (or failure (%report-timeout report)) interrupted)))
@@ -1739,7 +2008,7 @@ queued for the next turn."
 (defun %open-plan-of (session st)
   (or (%s-plan st)
       (error 'plan-not-found
-             :message (format nil "session ~a has no open plan" (code-session-id session)))))
+             :message (format nil "session ~a has no open preview" (code-session-id session)))))
 
 (defun client-approve-plan (session &key (on-drift :abort))
   (%on-client-loop ((code-session-client session))
@@ -1769,8 +2038,8 @@ queued for the next turn."
       (%check-idle session st)
       (let ((plan (%open-plan-of session st)))
         (reject-plan plan)
-        (prog1 (%emit-event (%session-report session) "plan" "subtype" "discarded"
-                            "plan_id" (plan-id plan))
+        (prog1 (%emit-event (%session-report session) "preview" "subtype" "discarded"
+                            "preview_id" (plan-id plan))
           (%restore-cwd-tools st))))))
 
 (defun %checkpoint-object (k)

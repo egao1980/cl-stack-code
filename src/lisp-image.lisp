@@ -108,15 +108,21 @@
   "--lisp-image is not available in plan mode yet (the image would not see the plan area)"
   "The CODE-USAGE-ERROR message of the image in plan mode.")
 
+(defparameter +image-not-in-preview+
+  "--lisp-image is not available in preview mode yet (the image would not see the preview area)"
+  "H5c-0: the CODE-USAGE-ERROR message of the image in preview mode.")
+
 (defun check-lisp-image-settings (settings mode)
   "→ T when SETTINGS's lispImage goes with permission MODE; otherwise
-CODE-USAGE-ERROR (see the file header)."
+CODE-USAGE-ERROR (see the file header). H5c-0: refused in plan mode and in
+preview mode, each with its own text."
   (multiple-value-bind (image backend observe) (lisp-image-settings settings)
     (declare (ignore backend))
     (cond ((and observe (not (eq :attach (first image))))
            (error 'code-usage-error :message +observe-needs-attach+))
-          ((and (eq mode :plan) (lisp-image-enabled-p settings))
-           (error 'code-usage-error :message +image-not-in-plan+))
+          ((and (member mode '(:plan :preview)) (lisp-image-enabled-p settings))
+           (error 'code-usage-error
+                  :message (if (eq mode :plan) +image-not-in-plan+ +image-not-in-preview+)))
           (t t))))
 
 (defun %condition-text (condition)

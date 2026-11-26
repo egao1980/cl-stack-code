@@ -168,7 +168,9 @@
     "session/new" "session/resume" "session/list" "session/fork" "session/close"
     "turn/start" "turn/steer" "turn/interrupt"
     "approval/respond"
-    "plan/approve" "plan/reject"
+    ;; H5c-0: plan documents; preview/* are H5a's plan/approve and plan/reject
+    "plan/approve" "plan/reject" "plan/revise" "plan/get" "plan/update" "plan/save"
+    "preview/apply" "preview/reject"
     "checkpoint/list" "rewind"
     "settings/get" "tools/list"
     ;; H8d
@@ -203,6 +205,10 @@
     (unit-control-failed . -32019)
     ;; H3e-2a
     (mcp-server-not-found . -32020)
+    ;; H5c-0 (the brief's codes)
+    (plan-document-not-found . -32030)
+    (plan-document-state-error . -32031)
+    (plan-format-error . -32602)
     ;; H3f
     (nothing-to-retry . -32031)
     (model-error . -32030)
@@ -227,6 +233,10 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
 (defun %null (value)
   (if (null value) :null value))
 
+(defun %plan-doc-error-id (condition)
+  (let ((doc (plan-document-error-document condition)))
+    (if doc (plan-document-id doc) :null)))
+
 (defun %condition-fields (condition)
   "The per-condition keys and values of the error data (see the header)."
   (typecase condition
@@ -241,6 +251,16 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
      (list "designator" (%null (session-turn-not-found-designator condition))))
     (plan-error (list "plan_id" (let ((plan (plan-error-plan condition)))
                                   (if plan (plan-id plan) :null))))
+    ;; H5c-0
+    (plan-document-not-found
+     (list "designator" (%null (plan-document-not-found-designator condition))))
+    (plan-document-state-error
+     (list "plan_id" (%plan-doc-error-id condition)
+           "status" (let ((status (plan-document-state-error-status condition)))
+                      (if status (%status-name status) :null))))
+    (plan-format-error
+     (list "plan_id" (%plan-doc-error-id condition)
+           "missing" (coerce (plan-format-error-missing condition) 'vector)))
     (checkpoint-not-found
      (list "designator" (%null (checkpoint-not-found-designator condition))))
     (settings-error (list "file" (let ((file (settings-error-file condition)))
@@ -334,7 +354,15 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
          (make-hash-table :test 'equal))
         (t (%bad-param method "params" :object))))
 
-(defparameter +rpc-mode-names+ '("default" "acceptEdits" "bypassPermissions" "plan"))
+(defparameter +rpc-mode-names+ '("default" "acceptEdits" "bypassPermissions" "plan" "preview"))
+
+(defparameter +rpc-plan-execution-names+ '("default" "acceptEdits" "bypassPermissions" "preview")
+  "H5c-0: plan/approve's mode values (+PLAN-EXECUTION-MODES+ as names).")
+
+(defun %deprecated (object text)
+  "OBJECT (a JSON object) with \"deprecated\": TEXT."
+  (setf (gethash "deprecated" object) text)
+  object)
 (defparameter +rpc-drift-names+ '("abort" "rebase" "overwrite"))
 (defparameter +rpc-rewind-mode-names+ '("both" "conversation" "files"))
 
@@ -456,12 +484,55 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
                                    'vector)))))
    (cons "plan/approve"
          (lambda (client method params)
-           (let ((on-drift (%param method params "on_drift" (cons :member +rpc-drift-names+))))
-             (client-approve-plan (%session-param client method params)
-                                  :on-drift (or (%keyword on-drift) :abort)))))
+           (let ((session (%session-param client method params))
+                 (on-drift (%param method params "on_drift" (cons :member +rpc-drift-names+))))
+             (if (eq :preview (%client-plan-target session))
+                 ;; 0.15.x: the H5a alias on an open preview.
+                 (%deprecated (client-apply-preview session :on-drift (or (%keyword on-drift) :abort))
+                              "plan/approve on a preview is preview/apply; the alias goes in 0.16.0")
+                 (let ((mode (%param method params "mode" (cons :member +rpc-plan-execution-names+)))
+                       (prompt (%param method params "prompt" :string)))
+                   (%json-object "plan" (client-approve-plan-document
+                                         session :mode (if mode (parse-permission-mode mode) :accept-edits)
+                                         :prompt prompt
+                                         :on-drift (%keyword on-drift))
+                                 "session_id" (code-session-id session)))))))
    (cons "plan/reject"
          (lambda (client method params)
-           (client-reject-plan (%session-param client method params))))
+           (let ((session (%session-param client method params)))
+             (if (eq :preview (%client-plan-target session))
+                 ;; 0.15.x: the H5a alias on an open preview.
+                 (%deprecated (client-reject-preview session)
+                              "plan/reject on a preview is preview/reject; the alias goes in 0.16.0")
+                 (%json-object "plan" (client-reject-plan-document session))))))
+   (cons "plan/revise"
+         (lambda (client method params)
+           (let ((session (%session-param client method params))
+                 (feedback (%param method params "feedback" :string :required t)))
+             (client-revise-plan-document session feedback)
+             (%json-object "session_id" (code-session-id session)))))
+   (cons "plan/get"
+         (lambda (client method params)
+           (%json-object "plan" (or (client-plan-document (%session-param client method params))
+                                    :null))))
+   (cons "plan/update"
+         (lambda (client method params)
+           (let ((session (%session-param client method params))
+                 (markdown (%param method params "markdown" :string :required t)))
+             (%json-object "plan" (client-update-plan-document session markdown)))))
+   (cons "plan/save"
+         (lambda (client method params)
+           (let ((session (%session-param client method params))
+                 (directory (%param method params "directory" :string)))
+             (%json-object "path" (client-save-plan-document session :directory directory)))))
+   (cons "preview/apply"
+         (lambda (client method params)
+           (let ((on-drift (%param method params "on_drift" (cons :member +rpc-drift-names+))))
+             (client-apply-preview (%session-param client method params)
+                                   :on-drift (or (%keyword on-drift) :abort)))))
+   (cons "preview/reject"
+         (lambda (client method params)
+           (client-reject-preview (%session-param client method params))))
    (cons "checkpoint/list"
          (lambda (client method params)
            (%json-object "checkpoints"

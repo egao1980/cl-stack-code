@@ -299,16 +299,17 @@ kept). An :UNAVAILABLE sandbox is left as it is (→ NIL)."
 
 (defun plan-sandbox-notice (sandbox)
   "→ the notice for SANDBOX, or NIL while :CONFINED:
-  :UNAVAILABLE \"plan <id8>: no sandbox (<reason>); bash and job_input ask before each command\"
-  :REFUSED     \"plan <id8>: the sandbox refused a command (<reason>); bash and job_input ask before each command from the next turn\"
-<id8> = the first 8 characters of the plan id."
+  :UNAVAILABLE \"preview <id8>: no sandbox (<reason>); bash and job_input ask before each command\"
+  :REFUSED     \"preview <id8>: the sandbox refused a command (<reason>); bash and job_input ask before each command from the next turn\"
+<id8> = the first 8 characters of the area's id (H5c-0: \"preview\", H5a's
+plan renamed; a plan's exploration area says the same)."
   (ecase (plan-sandbox-status sandbox)
     (:confined nil)
     (:unavailable
-     (format nil "plan ~a: no sandbox (~a); bash and job_input ask before each command"
+     (format nil "preview ~a: no sandbox (~a); bash and job_input ask before each command"
              (%plan-sandbox-id8 sandbox) (plan-sandbox-reason sandbox)))
     (:refused
-     (format nil "plan ~a: the sandbox refused a command (~a); bash and job_input ask before each command from the next turn"
+     (format nil "preview ~a: the sandbox refused a command (~a); bash and job_input ask before each command from the next turn"
              (%plan-sandbox-id8 sandbox) (plan-sandbox-reason sandbox)))))
 
 (defun plan-sandbox-section (sandbox)

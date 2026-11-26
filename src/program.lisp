@@ -345,6 +345,29 @@
               :documentation "True when the running turn runs in the plan.")
    (cwd-instructions :initform nil :accessor %cp-cwd-instructions
                      :documentation "The agent's working-directory instructions while a plan is open.")
+   ;; H5c-0, loop thread only: the plan document and its exploration area.
+   (plan-doc :initform nil :accessor %cp-plan-doc :documentation "The session's PLAN-DOCUMENT, or NIL.")
+   (doc-area :initform nil :accessor %cp-doc-area :documentation "Its exploration area (an H5a PLAN), or NIL.")
+   (doc-sources :initform nil :accessor %cp-doc-sources
+                :documentation "The tool sources rooted in the exploration area, or NIL.")
+   (doc-sandbox :initform nil :accessor %cp-doc-sandbox
+                :documentation "The exploration area's PLAN-SANDBOX, or NIL.")
+   (doc-tools :initform nil :accessor %cp-doc-tools :documentation "The plan turns' PLAN-TOOLS, or NIL.")
+   (doc-agent-p :initform nil :accessor %cp-doc-agent-p
+                :documentation "True while the agent has the exploration area's tools.")
+   (turn-doc :initform nil :accessor %cp-turn-doc :documentation "The document of the running plan turn, or NIL.")
+   (doc-start-revision :initform 0 :accessor %cp-doc-start-revision)
+   (exec-doc :initform nil :accessor %cp-exec-doc :documentation "The document an execution turn runs, or NIL.")
+   (exec-tools :initform nil :accessor %cp-exec-tools :documentation "Its update_plan PLAN-TOOLS, or NIL.")
+   (exec-snapshots :initform nil :accessor %cp-exec-snapshots)
+   (exec-before :initform nil :accessor %cp-exec-before)
+   (turn-doc-record :initform nil :accessor %cp-turn-doc-record
+                    :documentation "The PLAN-DOCUMENT-RECORD of the turn being committed, or NIL.")
+   ;; H5c-0, UI thread only: ask_user's question.
+   (ask :initform nil :accessor %cp-ask :documentation "NIL, or (question options cell).")
+   ;; H5c-0, any thread: the ask_user answers still waited for.
+   (ask-cells :initform '() :accessor %cp-ask-cells)
+   (ask-lock :initform (bt:make-lock "cl-stack-code ask_user") :reader %cp-ask-lock)
    (user-config-dir :initarg :user-config-dir :initform nil :reader %cp-user-config-dir
                     :documentation "The user config directory (for ASSEMBLE-SYSTEM-PROMPT).")
    ;; R4d-4b
@@ -682,6 +705,9 @@ revision store), or NIL when nothing was committed."
                                                           (and set (instruction-set-current set)))
                                           ;; H3f
                                           :compactions (reverse (%cp-turn-markers program))
+                                          ;; H5c-0
+                                          :plan-document
+                                          (shiftf (%cp-turn-doc-record program) nil)
                                           :retry-of (%cp-turn-retry-of program))))
             (multiple-value-bind (revision store) (%commit-forking old record)
               (dolist (turn new) (setf (gethash turn committed) t))
@@ -714,6 +740,8 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
     (let ((reason (agent:agent-run-finish-reason run)))
       (unless (member reason '(:approval :deferred))
         (%end-steering program run)
+        ;; H5c-0: the plan document's turn end, before the commit (its record).
+        (%plan-doc-turn-end program (not (member reason '(:stop :tool-end))))
         (multiple-value-bind (revision store)
             (%commit-run program run (case reason
                                        (:max-steps :max-steps)
@@ -733,8 +761,8 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
                       :message (format nil "reached max turns (~d)" (%cp-max-turns program))))
                (:canceled (list :turn-end :reason :canceled))
                (t (list :turn-end :reason :stop))))
-      ;; H5a: the projection follows the turn end of a plan turn.
-      (when (and (%cp-turn-plan program) (member reason '(:stop :max-steps)))
+      ;; H5a: the projection follows the turn end of a preview turn.
+      (when (and (%cp-turn-plan program) (member reason '(:stop :max-steps :tool-end)))
         (%plan-turn-end program)))))
 
 (defun %turn-error-callback (program)
@@ -746,14 +774,16 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
                                               :attempts (%cp-turn-attempts program)
                                               :secrets (%cp-secrets program))))
       (%end-steering program run)
+      ;; H5c-0: a failed execution leaves the plan interrupted.
+      (%plan-doc-turn-end program t)
       (multiple-value-bind (revision store) (and run (%commit-run program run :failed))
         (%end-checkpoint-turn program revision store))
       ;; The next turn (or /retry) starts from the recorded conversation.
       (when classified
         (%drop-run program))
       (%send program (list :turn-end :reason :failed
-                                     :message (%message-text (or classified condition))
-                                     :retryable (and classified t))))))
+                           :message (%message-text (or classified condition))
+                           :retryable (and classified t))))))
 
 (defun %on-inbox (program turns)
   "The run took TURNS from its inbox: the steering among them, as typed."
@@ -786,10 +816,17 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
                                                           (fourth counts))
                                               (%cp-window program))))))
           (:inbox (%on-inbox program payload))
-          (:invocation (%send program (list :invocation payload)))
+          (:invocation (%send program (list :invocation payload))
+                       ;; H5c-0: the checklist follows update_plan.
+                       (let ((doc (%cp-exec-doc program)))
+                         (when (and doc (equal "update_plan" (agent:agent-invocation-name payload))
+                                    (eq :done (agent:agent-invocation-status payload))
+                                    (not (agent:agent-invocation-error-p payload)))
+                           (%send program (list :plan-step :id (plan-document-id doc)
+                                                :steps (%plan-doc-step-plists doc))))))
           ;; H3e-2a: before the model call.
           (:step (setf (%cp-turn-attempts program) 1)
-           (%mcp-before-model-call (%cp-mcp program)))
+                 (%mcp-before-model-call (%cp-mcp program)))
           ;; H3f
           (:retry (when (getf payload :max-attempts)
                     (setf (%cp-turn-attempts program) (1+ (or (getf payload :attempt) 0))))
@@ -802,11 +839,12 @@ REVISION in STORE (nothing without a commit). A checkpoint error is an
           ((:continuation :truncated) (%send program (list kind payload))))
       (error (e) (%send program (list :error (%message-text e)))))))
 
-(defun %loop-start-turn (program text &key message more retry-of)
+(defun %loop-start-turn (program text &key message more retry-of mode)
   "Loop thread: send TEXT (mentions expanded) as the next user message. A new
 run starts on the session's conversation. H4b: MESSAGE (an LLM-TURN) is sent
 instead, as it is, with TEXT as the record's prompt, and the turns MORE are
-posted right after it; then the queued image events are posted."
+posted right after it; then the queued image events are posted. H5c-0: MODE
+(the core's permission mode, when given) is taken first when it changed."
   (let ((ok (%turn-callback program))
         (err (%turn-error-callback program)))
     (setf (%cp-turn-prompt program) text
@@ -814,11 +852,23 @@ posted right after it; then the queued image events are posted."
     (when retry-of (%drop-run program))
     (handler-case
         (let* ((root (progn
-                       ;; H5a: plan mode opens (or reopens) the plan first;
+                       (when (and mode (not (eq mode (%cp-mode program))))
+                         (%set-permission-mode program mode))
+                       ;; H5a: preview mode opens (or reopens) the preview first;
                        ;; mentions then read the area.
-                       (when (eq :plan (%cp-mode program))
+                       (when (eq :preview (%cp-mode program))
                          (%ensure-plan program))
-                       (setf (%cp-turn-plan program) (and (%cp-plan program) t))
+                       ;; H5c-0: plan mode opens (or reopens) the plan document and
+                       ;; its exploration area.
+                       (if (eq :plan (%cp-mode program))
+                           (%ensure-plan-doc program)
+                           (%leave-plan-doc-agent program))
+                       (setf (%cp-turn-plan program) (and (%cp-plan program) t)
+                             (%cp-turn-doc program) (and (eq :plan (%cp-mode program))
+                                                         (%cp-plan-doc program)))
+                       (when (%cp-turn-doc program)
+                         (setf (%cp-doc-start-revision program)
+                               (plan-document-revision (%cp-plan-doc program))))
                        ;; H5b: the files before the turn (after the plan).
                        (setf (%cp-turn-pre program)
                              (handler-case (begin-checkpoint-turn (%cp-checkpointer program)
@@ -826,11 +876,18 @@ posted right after it; then the queued image events are posted."
                                (error (e)
                                  (%send program (list :error (%message-text e)))
                                  nil)))
-                       (if (%cp-plan program)
-                           (plan-tool-root (%cp-plan program) (%cp-cwd program))
-                           (%cp-cwd program))))
+                       (cond ((%cp-plan program)
+                              (plan-tool-root (%cp-plan program) (%cp-cwd program)))
+                             ((and (%cp-turn-doc program) (%cp-doc-area program))
+                              (plan-tool-root (%cp-doc-area program) (%cp-cwd program)))
+                             (t (%cp-cwd program)))))
                (prompt (or message (expand-mentions text root)))
                (run (%cp-run program)))
+          ;; H5c-0: a revision turn's prompt is the revision's feedback.
+          (let ((tools (%cp-doc-tools program)))
+            (when (and tools (%cp-turn-doc program))
+              (setf (%plan-tools-feedback tools)
+                    (and (eq :proposed (plan-document-status (%cp-plan-doc program))) text))))
           (setf (%cp-handle program)
                 (if run
                     (agent:continue-ai-agent-async run prompt
@@ -932,16 +989,20 @@ notices (lisp-mcp/agent has no way to queue them again)."
          (agent (%cp-agent program))
          (agent-settings (agent:ai-agent-settings agent)))
     (setf (%cp-mode program) mode
-          ;; R4d-4b: while a plan's sandbox is open its rules hold (the shell
-          ;; allows only while confined).
-          (agent:ai-agent-permissions agent) (let ((sandbox (%cp-plan-sandbox program)))
-                                               (if (and sandbox (eq mode :plan))
+          ;; R4d-4b: while a preview's sandbox is open its rules hold (the shell
+          ;; allows only while confined). H5c-0: likewise a plan's exploration area.
+          (agent:ai-agent-permissions agent) (let ((sandbox (case mode
+                                                              (:preview (%cp-plan-sandbox program))
+                                                              (:plan (and (%cp-doc-agent-p program)
+                                                                          (%cp-doc-sandbox program))))))
+                                               (if sandbox
                                                    (%plan-permissions settings sandbox)
                                                    (%agent-permissions settings)))
           (getf (agent:agent-settings-extra agent-settings) :permission-policy)
           ;; The run's settings are this object (RUN-AI-AGENT-ASYNC without
           ;; :settings uses the agent's), read on every permission check.
-          ;; H3e-2a: plan mode's MCP policy.
+          ;; H3e-2a: the MCP policy in preview and plan mode; H5c-0: plan mode's
+          ;; tool policy.
           (code-permission-policy settings))))
 
 ;;; H3c session effects (loop thread).
@@ -1042,9 +1103,11 @@ from the tip's (H5b), else H3c's conversation rewind."
   (destructuring-bind (kind &rest args) effect
     (ecase kind
       (:run (setf (%cp-interrupted program) nil)
-       (%on-loop program (lambda () (%loop-start-turn program (first args)))))
+            ;; H5c-0: the core's mode (it may have changed without an effect).
+            (let ((mode (state-permission-mode (code-program-state program))))
+              (%on-loop program (lambda () (%loop-start-turn program (first args) :mode mode)))))
       (:cancel (setf (%cp-interrupted program) t)
-       (%on-loop program (lambda () (%cancel program))))
+               (%on-loop program (lambda () (%cancel program))))
       (:approve (destructuring-bind (inv &key always) args
                   (%on-loop program (lambda () (%approve program inv always)))))
       (:deny (destructuring-bind (inv &key feedback all) args
@@ -1087,11 +1150,19 @@ from the tip's (H5b), else H3c's conversation rewind."
       (:approve-plan (destructuring-bind (&key on-drift) args
                        (%on-loop program (lambda () (%approve-plan-effect program on-drift)))))
       (:reject-plan (%on-loop program (lambda () (%reject-plan-effect program))))
+      ;; H5c-0
+      (:approve-plan-document (destructuring-bind (&key mode) args
+                                (setf (%cp-interrupted program) nil)
+                                (%on-loop program (lambda () (%approve-plan-doc-effect program mode)))))
+      (:reject-plan-document (%on-loop program (lambda () (%reject-plan-doc-effect program))))
+      (:save-plan-document (%on-loop program (lambda () (%save-plan-doc-effect program))))
+      (:show-plan-document (%apply-event program '(:plan-doc-show)))
+      (:edit-plan-document (%on-loop program (lambda () (%edit-plan-doc-effect program))))
       ;; H4b
       (:post-image-events
        (%on-loop program (lambda () (%post-if-going (%cp-lisp-tools program) (%cp-run program)))))
       (:image-turn (setf (%cp-interrupted program) nil)
-       (%on-loop program (lambda () (%loop-start-image-turn program))))
+                   (%on-loop program (lambda () (%loop-start-image-turn program))))
       ;; H8d
       (:units-panel (%panel-open program))
       ;; H3e-2a
@@ -1104,7 +1175,7 @@ from the tip's (H5b), else H3c's conversation rewind."
       (:compact (let ((text (first args)))
                   (%on-loop program (lambda () (%compact-effect program text)))))
       (:retry-turn (setf (%cp-interrupted program) nil)
-       (%on-loop program (lambda () (%retry-turn-effect program))))
+                   (%on-loop program (lambda () (%retry-turn-effect program))))
       (:quit nil))))
 
 ;;; H3f: /compact and /retry (loop thread).
@@ -1265,9 +1336,15 @@ goes back to the input)."
          (input (code-program-input program))
          (approvals (state-approvals state))
          (spinner (%cp-spinner program)))
-    (cond ((and (null approvals) (state-plan-prompt state))
-           ;; H5a: the plan or drift dialog.
+    (cond ((and (null approvals) (%cp-ask program))
+           ;; H5c-0: ask_user waits for its answer.
+           (%sync-ask-dialog program))
+          ((and (null approvals) (state-plan-prompt state))
+           ;; H5a: the preview or drift dialog.
            (%sync-plan-dialog program))
+          ((and (null approvals) (state-plan-document-prompt state))
+           ;; H5c-0: the plan document or its result.
+           (%sync-plan-doc-dialog program))
           ((and (null approvals) (state-rewind-prompt state))
            ;; H5b: the rewind or its drift dialog.
            (%sync-rewind-dialog program))
@@ -1339,6 +1416,10 @@ goes back to the input)."
                     (list :notice
                           (format nil "note: checkpoints are off: ~a is not a project (no .git at or above it); set checkpoints.kind to \"copy\" to snapshot it"
                                   (uiop:native-namestring (checkpointer-project-dir cp)))))))
+  ;; H5c-0: the first plan run on this data directory says what changed.
+  (when (and (eq :plan (%cp-mode program))
+             (%plan-migration-notice-p (%program-data-dir program)))
+    (%apply-event program (list :notice +plan-mode-migration-notice+)))
   (let ((prompt (%cp-prompt program)))
     (when prompt
       (%apply-event program (list :submit prompt))))
@@ -1391,7 +1472,14 @@ goes back to the input)."
       (dialog
        (multiple-value-bind (widget command event) (w:widget-update dialog message)
          (declare (ignore widget))
-         (cond ((and (w:confirm-event-p event) (%mcp-dialog-p program))
+         (cond ((and (w:confirm-event-p event) (%ask-dialog-p program))
+                ;; H5c-0: ask_user's answer.
+                (%ask-reply program (w:confirm-event-choice event) (w:confirm-event-feedback event))
+                command)
+               ((and (w:cancel-event-p event) (%ask-dialog-p program))
+                (%ask-reply program nil nil)
+                command)
+               ((and (w:confirm-event-p event) (%mcp-dialog-p program))
                 ;; H3e-2a
                 (%apply-event program (list :mcp-reply (w:confirm-event-choice event)))
                 command)
@@ -1423,9 +1511,12 @@ goes back to the input)."
                  (case (first message)
                    (:%cp-files (when (second message)
                                  (setf (%cp-files program) (second message)))
-                    nil)
+                               nil)
                    ;; H8d: supervisor events and the panel's threads.
                    (:%units (%units-message program (rest message)))
+                   ;; H5c-0: ask_user's question (its thread waits).
+                   (:%ask (setf (%cp-ask program) (rest message))
+                          nil)
                    (t (%apply-event program message))))
                 ((tui:key-message-p message) (%key-event program message))
                 ((tui:mouse-message-p message)
@@ -1470,7 +1561,9 @@ goes back to the input)."
       0))
 
 (defun %dialog-rows (dialog width)
+  ;; 7 rows hold the frame and four choices; H5c-0: the plan dialog has seven.
   (+ 7
+     (max 0 (- (length (w:confirm-dialog-choices dialog)) 4))
      (length (w:wrap-runs (w:confirm-dialog-message dialog) (max 1 (- width 4))))
      ;; The feedback prompt and its input row.
      (if (eq :feedback (w:confirm-dialog-mode dialog)) 2 0)))
@@ -1565,6 +1658,10 @@ goes back to the input)."
   "Close PROGRAM's shell tools, lisp tools and event loop. Idempotent. → NIL."
   (unless (%cp-closed program)
     (setf (%cp-stopping program) t)
+    ;; H5c-0: an ask_user still waiting gets no answer, so its tool returns.
+    (dolist (cell (bt:with-lock-held ((%cp-ask-lock program))
+                    (shiftf (%cp-ask-cells program) '())))
+      (%answer-ask cell nil))
     ;; H8d: the subscription and the panel's threads end first.
     (%stop-units-ui program)
     (let* ((thread (%cp-thread program))
@@ -1584,12 +1681,15 @@ goes back to the input)."
       ;; H3e-2a: the MCP clients and units, before the supervisor.
       (close-mcp-manager (%cp-mcp program))
       ;; H8d: the unit tools (the working directory's and, H5a, the open
-      ;; plan area's), the shell tools, then the supervisor.
+      ;; preview area's; H5c-0, a plan's exploration area's), the shell
+      ;; tools, then the supervisor.
       (%close-code-units (code-program-supervisor program)
                          :unit-tools (list (code-program-unit-tools program)
-                                           (code-unit-tools (%cp-plan-sources program)))
+                                           (code-unit-tools (%cp-plan-sources program))
+                                           (code-unit-tools (%cp-doc-sources program)))
                          :shell-tools (list (second (%cp-sources program))
-                                            (second (%cp-plan-sources program))))
+                                            (second (%cp-plan-sources program))
+                                            (second (%cp-doc-sources program))))
       ;; H5b
       (when (%cp-checkpointer program)
         (close-checkpointer (%cp-checkpointer program)))
@@ -1629,18 +1729,19 @@ goes back to the input)."
    (uiop:pathname-parent-directory-pathname
     (uiop:ensure-directory-pathname (%cp-sessions-dir program)))))
 
-(defun %program-plan-settings (program)
-  "The settings the plan's tools and rules use: mode :PLAN, the image off."
+(defun %program-plan-settings (program &optional (mode :preview))
+  "The settings the area's tools and rules use: MODE (:PREVIEW, or :PLAN for a
+plan's exploration area), the image off."
   (merge-settings (%cp-settings program)
-                  (make-settings :permission-mode :plan
+                  (make-settings :permission-mode mode
                                  ;; H4b: the image stays with the working
                                  ;; directory's sources.
                                  :lisp-image '(:image (:off)))))
 
-(defun %program-plan-agent (program plan settings sandbox)
+(defun %program-plan-agent (program plan settings sandbox &optional extra)
   "Make the area's tool sources for PLAN (confined while SANDBOX is), and
 → (values sources instructions). H8d: on the program's supervisor, under an
-:agent scope \"plan-<id8>\"."
+:agent scope \"plan-<id8>\". H5c-0: EXTRA sources (the plan tools) come last."
   (let* ((agent (%cp-agent program))
          (sup (code-program-supervisor program))
          (sources (append (apply #'make-code-tools (plan-tool-root plan (%cp-cwd program))
@@ -1651,7 +1752,8 @@ goes back to the input)."
                                            (and ctx (context-skills ctx)))
                                  (plan-sandbox-tool-keys sandbox))
                           ;; H3e-2a: the session's MCP source, last.
-                          (and (%cp-mcp program) (list (mcp-manager-tool-source (%cp-mcp program)))))))
+                          (and (%cp-mcp program) (list (mcp-manager-tool-source (%cp-mcp program))))
+                          extra)))
     (%link-skill-tools (%cp-instruction-set program) (code-skill-tools sources))
     (handler-bind ((error (lambda (e)
                             (declare (ignore e))
@@ -1663,11 +1765,11 @@ goes back to the input)."
         (values sources
                 (assemble-system-prompt
                  (%cp-cwd program) :tools offered :backend (agent:ai-agent-backend agent)
-                                   :settings settings
-                                   :user-config-dir (%cp-user-config-dir program)
-                                   :plan plan :sandbox sandbox
-                                   :context (%cp-instruction-context program)
-                                   :instruction-set (%cp-instruction-set program)))))))
+                 :settings settings
+                 :user-config-dir (%cp-user-config-dir program)
+                 :plan plan :sandbox sandbox
+                 :context (%cp-instruction-context program)
+                 :instruction-set (%cp-instruction-set program)))))))
 
 (defun %ensure-plan (program)
   "Open or reopen the plan when none is open; swap the agent's tools and
@@ -1697,7 +1799,8 @@ shell tools that ask (%REFRESH-PLAN-SHELL)."
                                          (unless reopened (reject-plan plan)))))
                         (open-plan-sandbox plan settings :backend (%cp-plan-backend program)))))
         (multiple-value-bind (sources instructions)
-            (%program-plan-agent program plan settings sandbox)
+            (%program-plan-agent program plan settings sandbox
+                                 (let ((x (%cp-exec-tools program))) (and x (list x))))
           (setf (%cp-cwd-instructions program) (agent:ai-agent-instructions agent)
                 (agent:ai-agent-tools agent) sources
                 (agent:ai-agent-instructions agent) instructions
@@ -1723,7 +1826,8 @@ the run is dropped (the agent sees the new tools)."
       (let ((settings (%program-plan-settings program))
             (agent (%cp-agent program)))
         (multiple-value-bind (sources instructions)
-            (%program-plan-agent program (%cp-plan program) settings sandbox)
+            (%program-plan-agent program (%cp-plan program) settings sandbox
+                                 (let ((x (%cp-exec-tools program))) (and x (list x))))
           (setf (agent:ai-agent-tools agent) sources
                 (agent:ai-agent-instructions agent) instructions
                 (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
@@ -1764,13 +1868,13 @@ instructions back, the run is dropped."
 (defun %show-plan (program)
   (if (%cp-plan program)
       (%plan-turn-end program)
-      (%send program (list :error "no open plan"))))
+      (%send program (list :error "no open preview"))))
 
 (defun %approve-plan-effect (program on-drift)
   (let ((plan (%cp-plan program))
         (drifted nil))
     (unless plan
-      (%send program (list :error "no open plan"))
+      (%send program (list :error "no open preview"))
       (return-from %approve-plan-effect nil))
     (multiple-value-bind (result status pre)
         (handler-bind ((plan-drift
@@ -1804,10 +1908,303 @@ instructions back, the run is dropped."
 
 (defun %reject-plan-effect (program)
   (let ((plan (%cp-plan program)))
-    (cond ((null plan) (%send program (list :error "no open plan")))
+    (cond ((null plan) (%send program (list :error "no open preview")))
           (t (reject-plan plan)
              (%send program (list :plan-closed :status :discarded))
              (%restore-cwd-agent program)))))
+
+;;; H5c-0: plan documents (src/plan-docs.lisp header, INTERACTIVE). Loop
+;;; thread unless said otherwise.
+
+(defun %doc-id8 (doc)
+  (subseq (plan-document-id doc) 0 8))
+
+(defun %plan-doc-proposed-message (doc)
+  (list :plan-proposed :id (plan-document-id doc)
+        :revision (plan-document-revision doc)
+        :title (plan-document-title doc)
+        :markdown (or (plan-document-markdown doc) "")
+        :steps (%plan-doc-step-plists doc)))
+
+(defun %program-ask (program)
+  "ask_user's answerer: a dialog on the UI thread; the tool's thread waits
+(CLOSE-CODE-PROGRAM answers NIL). → (lambda (question options)) → the
+answer or NIL."
+  (lambda (question options)
+    (let ((cell (list :waiting nil (bt:make-lock "ask_user") (bt:make-condition-variable))))
+      (bt:with-lock-held ((%cp-ask-lock program))
+        (push cell (%cp-ask-cells program)))
+      (if (%cp-stopping program)
+          (%answer-ask cell nil)
+          (%send program (list :%ask question options cell)))
+      (bt:with-lock-held ((third cell))
+        (loop while (eq :waiting (first cell))
+              do (bt:condition-wait (fourth cell) (third cell))))
+      (bt:with-lock-held ((%cp-ask-lock program))
+        (setf (%cp-ask-cells program) (remove cell (%cp-ask-cells program))))
+      (second cell))))
+
+(defun %answer-ask (cell answer)
+  (bt:with-lock-held ((third cell))
+    (setf (first cell) :answered
+          (second cell) answer)
+    (bt:condition-notify (fourth cell))))
+
+(defun %ensure-plan-doc (program)
+  "Plan mode, before a turn: the session's open plan document (else a new
+one), its exploration area and sandbox, and the agent on the area's tools with
+the plan tools; (:plan-doc-opened …) when it opens."
+  (unless (%cp-doc-agent-p program)
+    (let* ((data-dir (%program-data-dir program))
+           (session (%cp-session program))
+           (settings (%program-plan-settings program :plan))
+           (doc (or (let ((doc (%cp-plan-doc program)))
+                      (and doc (member (plan-document-status doc) '(:drafting :proposed)) doc))
+                    (multiple-value-bind (doc reopened)
+                        (%open-session-plan-doc session (%cp-project-dir program) data-dir settings)
+                      (unless reopened
+                        ;; The opening is the next turn's record.
+                        (setf (%cp-turn-doc-record program) (plan-document-record doc)))
+                      doc)))
+           (area (%plan-doc-exploration-area
+                  doc (lambda ()
+                        (open-plan (%cp-project-dir program) :kind :auto :data-dir data-dir
+                                                             :session-id (session-id session)))))
+           (sandbox (open-plan-sandbox area settings :backend (%cp-plan-backend program)))
+           (tools (make-plan-tools doc :phase :plan :ask (%program-ask program)))
+           (agent (%cp-agent program))
+           (new (not (eq doc (%cp-plan-doc program)))))
+      (multiple-value-bind (sources instructions)
+          (%program-plan-agent program area settings sandbox (list tools))
+        (unless (%cp-plan program)
+          (setf (%cp-cwd-instructions program) (agent:ai-agent-instructions agent)))
+        (setf (agent:ai-agent-tools agent) sources
+              (agent:ai-agent-instructions agent) instructions
+              (agent:ai-agent-permissions agent) (%plan-permissions settings sandbox)
+              (%cp-plan-doc program) doc
+              (%cp-doc-area program) area
+              (%cp-doc-sources program) sources
+              (%cp-doc-sandbox program) sandbox
+              (%cp-doc-tools program) tools
+              (%cp-doc-agent-p program) t))
+      (%drop-run program)
+      (when new
+        (%send program (list :plan-doc-opened :id (plan-document-id doc)
+                             :path (uiop:native-namestring (plan-document-path doc))
+                             :area (uiop:native-namestring (plan-root area)))))
+      (let ((notice (plan-sandbox-notice sandbox)))
+        (when (and notice new)
+          (%send program (list :notice notice)))))))
+
+(defun %leave-plan-doc-agent (program)
+  "Not in plan mode: the agent has the working directory's tools again (plus
+update_plan while an approved plan runs); the area's sources are closed."
+  (let ((agent (%cp-agent program))
+        (exec (%cp-exec-tools program)))
+    (when (%cp-doc-agent-p program)
+      (let ((sources (%cp-doc-sources program)))
+        (when (%cp-cwd-instructions program)
+          (setf (agent:ai-agent-instructions agent) (%cp-cwd-instructions program)))
+        (setf (agent:ai-agent-tools agent) (%cp-sources program)
+              (%cp-doc-agent-p program) nil
+              (%cp-doc-sources program) nil
+              (%cp-doc-sandbox program) nil)
+        (setf (agent:ai-agent-permissions agent)
+              (%agent-permissions (merge-settings (%cp-settings program)
+                                                  (make-settings :permission-mode (%cp-mode program)))))
+        (%close-code-units nil :unit-tools (list (code-unit-tools sources))
+                               :shell-tools (list (second sources)))
+        (%drop-run program)))
+    (unless (%cp-plan program)
+      (let ((want (append (%cp-sources program) (and exec (list exec)))))
+        (unless (equal want (agent:ai-agent-tools agent))
+          (setf (agent:ai-agent-tools agent) want)
+          (%drop-run program))))))
+
+(defun %plan-doc-turn-end (program failed)
+  "Loop thread, a turn ended: a plan turn that proposed sends (:plan-proposed …)
+and records the revision; an execution turn records plan versus diff and
+ends the plan (:EXECUTED, or :INTERRUPTED when FAILED)."
+  (let ((doc (shiftf (%cp-turn-doc program) nil)))
+    (when (and doc (> (plan-document-revision doc) (%cp-doc-start-revision program)))
+      (setf (%cp-turn-doc-record program)
+            (plan-document-record doc :feedback (%plan-tools-feedback (%cp-doc-tools program))))
+      (%send program (%plan-doc-proposed-message doc))))
+  (let ((doc (%cp-exec-doc program)))
+    (when doc
+      (let ((preview (%cp-plan program)))
+        (multiple-value-bind (changes diff)
+            (handler-case
+                (if preview
+                    (values (plan-changes preview) (plan-diff-text preview))
+                    (%execution-changes (%cp-exec-snapshots program) (%cp-exec-before program)
+                                        (%execution-snapshot (%cp-project-dir program)
+                                                             (%cp-exec-snapshots program))))
+              (error (e)
+                (%send program (list :error (%message-text e)))
+                (values '() "")))
+          (finish-plan-execution doc :changes changes :interrupted failed)
+          (setf (%cp-turn-doc-record program) (plan-document-record doc)
+                (%cp-exec-doc program) nil
+                (%cp-exec-tools program) nil
+                (%cp-exec-snapshots program) nil
+                (%cp-exec-before program) nil)
+          (%send program (list :plan-executed :id (plan-document-id doc)
+                               :status (plan-document-status doc)
+                               :lines (plan-versus-diff-lines doc changes)
+                               :diff (if preview "" diff)
+                               :preview (and preview t)))
+          (when failed
+            (%send program (list :plan-doc-closed :id (plan-document-id doc) :status :interrupted)))
+          ;; The plan's checklist tools go with the turn.
+          (unless preview
+            (let ((agent (%cp-agent program)))
+              (setf (agent:ai-agent-tools agent) (%cp-sources program))
+              (%drop-run program))))))))
+
+(defun %approve-plan-doc-effect (program mode)
+  "(:approve-plan-document :mode M): approve the document, leave the
+exploration area, switch to M and run the execution turn."
+  (let ((doc (%cp-plan-doc program)))
+    (handler-case
+        (progn
+          (unless doc
+            (error 'plan-document-not-found :designator nil :message "no plan yet"))
+          (approve-plan-document doc :mode mode)
+          (setf (%cp-doc-area program) nil
+                (%cp-exec-doc program) doc
+                (%cp-exec-tools program) (make-plan-tools doc :phase :execute))
+          (%set-permission-mode program mode)
+          (%leave-plan-doc-agent program)
+          (unless (eq mode :preview)
+            (let ((store (p:make-memory-snapshot-store)))
+              (setf (%cp-exec-snapshots program) store
+                    (%cp-exec-before program) (%execution-snapshot (%cp-project-dir program) store))))
+          (let ((text (format nil "execute plan ~a r~d" (%doc-id8 doc) (plan-document-revision doc))))
+            (%send program (list :plan-execution :text text))
+            (%loop-start-turn program text
+                              :message (llm:user-turn (plan-execution-prompt doc)))))
+      (error (e)
+        (setf (%cp-exec-doc program) nil (%cp-exec-tools program) nil)
+        (%send program (list :error (%message-text e)))))))
+
+(defun %reject-plan-doc-effect (program)
+  (let ((doc (%cp-plan-doc program)))
+    (handler-case
+        (progn
+          (reject-plan-document doc)
+          (%leave-plan-doc-agent program)
+          (setf (%cp-plan-doc program) nil
+                (%cp-doc-area program) nil
+                (%cp-doc-tools program) nil)
+          (%send program (list :plan-doc-closed :id (plan-document-id doc) :status :rejected)))
+      (error (e) (%send program (list :error (%message-text e)))))))
+
+(defun %save-plan-doc-effect (program)
+  (let ((doc (%cp-plan-doc program)))
+    (handler-case
+        (let ((path (save-plan-to-workspace
+                     doc :directory (settings-plan-save-directory (%cp-settings program)))))
+          (%send program (list :plan-doc-saved :path (uiop:native-namestring path))))
+      (error (e) (%send program (list :error (%message-text e)))))))
+
+(defun %program-editor (program)
+  "$VISUAL, else $EDITOR, else \"vi\"."
+  (let ((env (%cp-env program)))
+    (flet ((var (name)
+             (let ((v (and env (funcall env name))))
+               (and (stringp v) (plusp (length v)) v))))
+      (or (var "VISUAL") (var "EDITOR") "vi"))))
+
+(defun %edit-plan-doc-effect (program)
+  "(:edit-plan-document): the editor on plan.md (process-protocol), then
+SYNC-PLAN-DOCUMENT-EDITS and the dialog again. (The terminal is not handed
+over yet: tui-protocol has no suspend and process-protocol no inherited
+stdio; a follow-up.)"
+  (let ((doc (%cp-plan-doc program)))
+    (handler-case
+        (progn
+          (pp:run (append (uiop:split-string (%program-editor program) :separator '(#\Space))
+                          (list (uiop:native-namestring (plan-document-path doc))))
+                  :output nil :error-output nil)
+          (let ((n (sync-plan-document-edits doc)))
+            (cond (n
+                   (setf (%cp-turn-doc-record program) (plan-document-record doc))
+                   (%send program (%plan-doc-proposed-message doc)))
+                  (t (%send program '(:plan-doc-show))))))
+      (error (e)
+        (%send program (list :error (%message-text e)))
+        (%send program '(:plan-doc-show))))))
+
+(defun %ask-dialog-p (program)
+  "UI thread: true while the dialog is ask_user's."
+  (and (%cp-ask program)
+       (equal (list :ask (third (%cp-ask program))) (%cp-dialog-invocation program))))
+
+(defun %sync-ask-dialog (program)
+  "UI thread: the ask_user dialog: one choice per option (keys :OPTION-0 …)
+and \"Other…\" (typed)."
+  (destructuring-bind (question options cell) (%cp-ask program)
+    (let ((key (list :ask cell)))
+      (unless (equal key (%cp-dialog-invocation program))
+        (setf (code-program-dialog program)
+              (make-instance 'w:confirm-dialog
+                             :title "Question"
+                             :message question
+                             :choices (append (loop for o in options for i from 0
+                                                    collect (list (intern (format nil "OPTION-~d" i)
+                                                                          :keyword)
+                                                                  o))
+                                              (list (list :other "Other…")))
+                             :feedback-choice :other
+                             :feedback-prompt "Your answer:")
+              (%cp-dialog-invocation program) key))
+      (setf (w:widget-focused-p (code-program-input program)) nil)
+      nil)))
+
+(defun %ask-reply (program choice feedback)
+  "UI thread: answer ask_user with CHOICE (:OPTION-I, :OTHER with FEEDBACK, or
+NIL for Esc)."
+  (destructuring-bind (question options cell) (shiftf (%cp-ask program) nil)
+    (declare (ignore question))
+    (setf (code-program-dialog program) nil
+          (%cp-dialog-invocation program) nil)
+    (%answer-ask cell (cond ((eq choice :other) (and feedback (plusp (length feedback)) feedback))
+                            (choice
+                             ;; :OPTION-I → option I
+                             (let ((i (parse-integer (symbol-name choice) :start 7 :junk-allowed t)))
+                               (and i (nth i options))))
+                            (t nil)))))
+
+(defun %sync-plan-doc-dialog (program)
+  "UI thread: the plan document dialog (its steps; the markdown is the
+transcript's :plan-document entry) or the result dialog (plan versus diff) of
+STATE-PLAN-DOCUMENT-PROMPT."
+  (let* ((state (code-program-state program))
+         (prompt (state-plan-document-prompt state))
+         (doc (state-plan-document state))
+         (id (or (getf doc :id) ""))
+         (id8 (subseq id 0 (min 8 (length id))))
+         (key (list :plan-doc-dialog prompt id (getf doc :revision))))
+    (unless (equal key (%cp-dialog-invocation program))
+      (setf (code-program-dialog program)
+            (ecase prompt
+              (:plan-doc
+               (make-instance 'w:confirm-dialog
+                              :title (format nil "Plan ~a r~d: ~a" id8 (or (getf doc :revision) 0)
+                                             (or (getf doc :title) ""))
+                              :message (%plan-steps-text (getf doc :steps))
+                              :choices +plan-document-choices+))
+              (:plan-result
+               (make-instance 'w:confirm-dialog
+                              :title (format nil "Plan ~a done" id8)
+                              :message (let ((entry (find :plan-result (state-transcript state)
+                                                          :key #'entry-kind :from-end t)))
+                                         (if entry (entry-text entry) ""))
+                              :choices +plan-result-choices+)))
+            (%cp-dialog-invocation program) key))
+    (setf (w:widget-focused-p (code-program-input program)) nil)
+    nil))
 
 (defun %sync-plan-dialog (program)
   "UI thread: make CODE-PROGRAM-DIALOG the plan or drift dialog of
@@ -1823,13 +2220,13 @@ STATE-PLAN-PROMPT (made once per prompt), focus it. → NIL."
             (ecase prompt
               (:plan
                (make-instance 'w:confirm-dialog
-                              :title (format nil "Plan ~a" id8)
+                              :title (format nil "Preview ~a" id8)
                               :message (format nil "~d file~:p changed. Approve to apply them to the project."
                                                (length (getf plan :changes)))
                               :choices +plan-choices+))
               (:drift
                (make-instance 'w:confirm-dialog
-                              :title (format nil "Plan ~a: the working copy changed" id8)
+                              :title (format nil "Preview ~a: the working copy changed" id8)
                               :message (format nil "Changed in both: ~{~a~^, ~}"
                                                (%cp-drift-paths program))
                               :choices +drift-choices+)))

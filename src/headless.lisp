@@ -226,6 +226,11 @@ count is 0."
   (plan-failure nil)                          ; a condition that fails a finished run
   ;; H5b
   (plan-pre nil)                              ; --apply: APPROVE-PLAN's PRE, recorded after the commit
+  ;; H5c-0: plan documents
+  (plan-doc nil)                              ; the run's PLAN-DOCUMENT, or NIL
+  (plan-doc-p nil)                            ; the result has "plan" (plan document runs)
+  (plan-doc-object nil)                       ; the result's "plan" object, or NIL (null)
+  (plan-doc-text nil)                         ; text mode: after the answer
   (rewind nil)                                ; the result's "rewind" object, or NIL
   ;; H4b
   (image-tools nil)                           ; the LISP-TOOLS, or NIL
@@ -343,17 +348,44 @@ ai-agent-protocol 0.13), :DENY a rule or policy (or a tool's own refusal)."
                (not (gethash id (%report-seen report))))
       (setf (gethash id (%report-seen report)) t)
       (apply #'%emit-event report "tool_result"
-                   "step" (gethash id (%report-call-steps report) (%report-step report))
-                   "id" id
-                   "name" (agent:agent-invocation-name inv)
-                   "status" (string-downcase (string status))
-                   "is_error" (and (agent:agent-invocation-error-p inv) t)
-                   "content" (let ((result (agent:agent-invocation-result inv)))
-                               (cond ((null result) "")
-                                     ((stringp result) result)
-                                     (t (princ-to-string result))))
-                   ;; H3e-2a: rich tool output (MCP), only when there is any.
-                   (%invocation-output-keys inv)))))
+             "step" (gethash id (%report-call-steps report) (%report-step report))
+             "id" id
+             "name" (agent:agent-invocation-name inv)
+             "status" (string-downcase (string status))
+             "is_error" (and (agent:agent-invocation-error-p inv) t)
+             "content" (let ((result (agent:agent-invocation-result inv)))
+                         (cond ((null result) "")
+                               ((stringp result) result)
+                               (t (princ-to-string result))))
+             ;; H3e-2a: rich tool output (MCP), only when there is any.
+             (%invocation-output-keys inv))
+      ;; H5c-0: the plan document's own events.
+      (when (and (%report-plan-doc report) (eq status :done)
+                 (not (agent:agent-invocation-error-p inv)))
+        (%plan-doc-invocation-event report inv)))))
+
+(defun %plan-doc-invocation-event (report inv)
+  "H5c-0: a done propose_plan → the \"proposed\" event; a done update_plan →
+\"step\"."
+  (let ((doc (%report-plan-doc report))
+        (name (agent:agent-invocation-name inv)))
+    (cond ((equal name "propose_plan")
+           (%emit-event report "plan" "subtype" "proposed"
+                        "plan_id" (plan-document-id doc)
+                        "revision" (plan-document-revision doc)
+                        "title" (or (plan-document-title doc) :null)
+                        "path" (uiop:native-namestring (plan-document-path doc))
+                        "steps" (%steps-json doc)
+                        "files" (coerce (plan-document-files doc) 'vector)
+                        "markdown" (or (plan-document-markdown doc) "")))
+          ((equal name "update_plan")
+           (let ((args (handler-case (json:decode (agent:agent-invocation-arguments inv))
+                         (error () nil))))
+             (%emit-event report "plan" "subtype" "step"
+                          "plan_id" (plan-document-id doc)
+                          "step" (if (hash-table-p args) (gethash "step" args :null) :null)
+                          "status" (if (hash-table-p args) (gethash "status" args :null) :null)
+                          "steps" (%steps-json doc)))))))
 
 (defun %invocation-output-keys (inv)
   "H3e-2a: \"images\" [{media_type, data}] and \"structured\" of INV's rich
@@ -562,35 +594,41 @@ failure (+MODEL-ERROR-SUBTYPES+), else %OUTCOME."
 
 (defun %result-object (report subtype text error-message duration-ms &optional condition)
   (apply #'%json-object "type" "result"
-                "subtype" subtype
-                "is_error" (not (string= subtype "success"))
-                "result" text
-                "error" (or error-message :null)
-                "num_turns" (%report-turns report)
-                "duration_ms" duration-ms
-                "usage" (%usage-object (%report-usage report))
-                "permission_denials" (coerce (reverse (%report-denials report)) 'vector)
-                "session_id" (%report-session report)
-                ;; H5a: only in plan mode, so the other shapes are unchanged.
-                (append
-                 ;; H3f: the counters once the turn retried, compacted or
-                 ;; continued (all three together), so a plain turn's result
-                 ;; keeps its shape; "error_class" on a model failure only.
-                 (when (or (plusp (%report-retries report))
-                           (plusp (%report-compactions report))
-                           (plusp (%report-continuations report)))
-                   (list "retries" (%report-retries report)
-                         "compactions" (%report-compactions report)
-                         "continuations" (%report-continuations report)))
-                 (let ((class (%error-class condition)))
-                   (and class (list "error_class" class)))
-                 (if (%report-plan report)
-                     (list "plan" (%report-plan report))
-                     '())
-                 ;; H5b: only in rewind actions.
-                 (if (%report-rewind report)
-                     (list "rewind" (%report-rewind report))
-                     '()))))
+         "subtype" subtype
+         "is_error" (not (string= subtype "success"))
+         "result" text
+         "error" (or error-message :null)
+         "num_turns" (%report-turns report)
+         "duration_ms" duration-ms
+         "usage" (%usage-object (%report-usage report))
+         "permission_denials" (coerce (reverse (%report-denials report)) 'vector)
+         "session_id" (%report-session report)
+         ;; H5a: only in preview mode, so the other shapes are unchanged.
+         (append
+          ;; H3f: the counters once the turn retried, compacted or
+          ;; continued (all three together), so a plain turn's result
+          ;; keeps its shape; "error_class" on a model failure only.
+          (when (or (plusp (%report-retries report))
+                    (plusp (%report-compactions report))
+                    (plusp (%report-continuations report)))
+            (list "retries" (%report-retries report)
+                  "compactions" (%report-compactions report)
+                  "continuations" (%report-continuations report)))
+          (let ((class (%error-class condition)))
+            (and class (list "error_class" class)))
+          ;; H5c-0: H5a's object is the preview's.
+          (if (%report-plan report)
+              (list "preview" (%report-plan report))
+              '())
+          ;; H5c-0: "plan" in plan document runs only (null when
+          ;; nothing was proposed).
+          (if (%report-plan-doc-p report)
+              (list "plan" (or (%report-plan-doc-object report) :null))
+              '())
+          ;; H5b: only in rewind actions.
+          (if (%report-rewind report)
+              (list "rewind" (%report-rewind report))
+              '()))))
 
 ;;; Working directory, environment, HTTP.
 
@@ -775,11 +813,13 @@ on success."
   "Write the run's result to the report's output; signal the failure, if any.
 H3f: a model failure or a turn timeout is classified (%TURN-OUTCOME); in json
 and stream-json it is written into the result only, and its exit code is
-returned."
+returned. H5c-0: in text mode the plan document's text (the proposed
+markdown, or the plan next to the diff) follows the answer after one empty
+line."
   (%disarm-turn-timer report)
   (multiple-value-bind (subtype condition)
       (%turn-outcome report run (or (%report-failure report) failure) interrupted max-turns)
-    ;; H5a: a plan step that failed after a good run (--apply on drift) fails it.
+    ;; H5a: a preview step that failed after a good run (--apply on drift) fails it.
     (when (and (null condition) (%report-plan-failure report))
       (setf subtype "error_during_execution"
             condition (%report-plan-failure report)))
@@ -795,6 +835,12 @@ returned."
            (let ((out (%report-output report)))
              (write-string text out)
              (terpri out)
+             ;; H5c-0: the plan document's text (an empty answer is the empty line).
+             (let ((doc-text (%report-plan-doc-text report)))
+               (when (plusp (length doc-text))
+                 (when (plusp (length text))
+                   (terpri out))
+                 (write-string doc-text out)))
              ;; H5a: the projected diff, after one empty line.
              (let ((diff (%report-plan-text report)))
                (when (plusp (length diff))
@@ -822,11 +868,12 @@ returned."
     prompt))
 
 (defun %commit-headless-turn (report store prompt history failure interrupted
-                              designator mode error-output &optional plan)
+                                     designator mode error-output &optional plan plan-document)
   "Commit the turn of the run REPORT saw start, before its result is written.
 A conflict forks the turn into a new session: one stderr line, and the
-report's session id becomes the new one. → (values revision store-it-went-to),
-or NIL when no run started."
+report's session id becomes the new one. H5c-0: PLAN-DOCUMENT is the record's
+PLAN-DOCUMENT-RECORD plist, or NIL. → (values revision store-it-went-to), or
+NIL when no run started."
   (let ((run (%report-run report)))
     (when run
       (let ((record (make-turn-record :prompt prompt
@@ -841,6 +888,7 @@ or NIL when no run started."
                                       :permission-mode mode
                                       :usage (copy-list (%report-usage report))
                                       :plan (and plan (plan-record plan))
+                                      :plan-document plan-document
                                       ;; H3e-1
                                       :instructions (let ((set (%report-instruction-set report)))
                                                       (and set (instruction-set-current set))))))
@@ -864,12 +912,15 @@ act on the session's open plan, no run, INPUT not read."
        t))
 
 (defun %plan-run-p (inv mode)
-  "True when the run is a plan run (MODE :PLAN) or a plan flag was given
-(CHECK-PLAN-FLAGS then refuses the combination)."
-  (and (or (eq mode :plan)
+  "True when the run is a preview run (MODE :PREVIEW, H5a's plan mode) or a
+preview flag was given outside plan mode (CHECK-PLAN-FLAGS then refuses the
+combination). H5c-0: plan mode's exploration area is opened by the plan
+document path instead (%PLAN-DOC-RUN-P)."
+  (and (not (eq mode :plan))
+       (or (eq mode :preview)
            (invocation-apply-p inv) (invocation-reject-p inv)
-           (invocation-on-drift inv) (invocation-plan-area inv)
-           ;; R4d-4b: CHECK-PLAN-FLAGS refuses it outside plan mode.
+           (invocation-on-drift inv) (invocation-preview-area inv)
+           ;; R4d-4b: CHECK-PLAN-FLAGS refuses it outside preview mode.
            (invocation-allow-network-p inv))
        t))
 
@@ -904,13 +955,13 @@ act on the session's open plan, no run, INPUT not read."
   (format nil "~d file~:p" n))
 
 (defun %rebase-line (plan conflicts)
-  (format nil "plan ~a: rebased onto the working copy (~:[no conflicts~;conflicts in ~:*~{~a~^, ~}~]); review it and --apply again"
+  (format nil "preview ~a: rebased onto the working copy (~:[no conflicts~;conflicts in ~:*~{~a~^, ~}~]); review it and --apply again"
           (plan-id plan) conflicts))
 
 (defun %headless-approve (report plan inv &optional checkpointer)
   "--apply: APPROVE-PLAN with PLAN-DRIFT answered per --on-drift; the
-applied / rebased / drift event; a failure for the report unless the plan
-was applied. H5b: with CHECKPOINTER, APPROVE-PLAN :CHECKPOINTER, its PRE kept
+applied / rebased / drift preview event; a failure for the report unless the
+preview was applied. H5b: with CHECKPOINTER, APPROVE-PLAN :CHECKPOINTER, its PRE kept
 in the report for RECORD-PLAN-CHECKPOINTS. → (values status result)."
   (let ((on-drift (or (invocation-on-drift inv) :abort))
         (drift '()))
@@ -930,22 +981,22 @@ in the report for RECORD-PLAN-CHECKPOINTS. → (values status result)."
         (ecase status
           ((:applied :empty)
            (setf event
-                 (%emit-event report "plan" "subtype" "applied" "plan_id" (plan-id plan)
-                                            "changes" (%changes-json result))))
+                 (%emit-event report "preview" "subtype" "applied" "preview_id" (plan-id plan)
+                              "changes" (%changes-json result))))
           (:rebased
            (setf event
-                 (%emit-event report "plan" "subtype" "rebased" "plan_id" (plan-id plan)
-                                            "conflicts" (coerce result 'vector)))
+                 (%emit-event report "preview" "subtype" "rebased" "preview_id" (plan-id plan)
+                              "conflicts" (coerce result 'vector)))
            (setf (%report-plan-failure report)
                  (make-condition 'plan-error :plan plan :message (%rebase-line plan result))))
           (:aborted
            (setf event
-                 (%emit-event report "plan" "subtype" "drift" "plan_id" (plan-id plan)
-                                            "paths" (coerce drift 'vector)))
+                 (%emit-event report "preview" "subtype" "drift" "preview_id" (plan-id plan)
+                              "paths" (coerce drift 'vector)))
            (setf (%report-plan-failure report)
                  (make-condition 'plan-drift
                                  :plan plan :paths drift
-                                 :message (format nil "plan ~a: the working copy changed at ~{~a~^, ~}; nothing applied (use --on-drift rebase or --on-drift overwrite)"
+                                 :message (format nil "preview ~a: the working copy changed at ~{~a~^, ~}; nothing applied (use --on-drift rebase or --on-drift overwrite)"
                                                   (plan-id plan) drift)))))
         ;; H3d: the event object too (the SDK returns it).
         (values status result event)))))
@@ -954,9 +1005,25 @@ in the report for RECORD-PLAN-CHECKPOINTS. → (values status result)."
   (format error-output "cl-stack-code: ~?~%" control args)
   (force-output error-output))
 
+(defun %open-area (inv cwd store data-dir getenv)
+  "A new H5a area (a preview, or a plan's exploration area) on the project of
+CWD with --preview-area's kind. A git kind outside a worktree →
+CODE-USAGE-ERROR \"--preview-area git: DIR is not a git worktree\"."
+  (let ((project (or (find-project-root cwd) cwd))
+        (kind (or (invocation-preview-area inv) :auto)))
+    (handler-case
+        (open-plan project :kind kind
+                           :data-dir (or data-dir (user-data-directory :getenv getenv))
+                           :session-id (session-id store))
+      (plan-error (e)
+        (if (eq kind :git)
+            (%usage-fail "--preview-area git: ~a is not a git worktree"
+                         (uiop:native-namestring project))
+            (error e))))))
+
 (defun %headless-plan (inv mode cwd store source sessions-dir data-dir getenv error-output)
-  "Before a plan run: CHECK-PLAN-FLAGS, then the plan. → (values plan
-reopened-p)."
+  "Before a preview run: CHECK-PLAN-FLAGS, then the preview area. → (values
+plan reopened-p)."
   (declare (ignore sessions-dir))
   (check-plan-flags inv mode)
   (let ((plans-dir (%plans-dir cwd data-dir getenv))
@@ -967,33 +1034,23 @@ reopened-p)."
           (return-from %headless-plan (values (reopen-plan plans-dir (getf entry :id)) t))
         (plan-not-found ()
           (setf lost (getf entry :id)))))
-    (let* ((project (or (find-project-root cwd) cwd))
-           (kind (or (invocation-plan-area inv) :auto))
-           (plan (handler-case
-                     (open-plan project :kind kind
-                                        :data-dir (or data-dir (user-data-directory :getenv getenv))
-                                        :session-id (session-id store))
-                   (plan-error (e)
-                     (if (eq kind :git)
-                         (%usage-fail "--plan-area git: ~a is not a git worktree"
-                                      (uiop:native-namestring project))
-                         (error e))))))
+    (let ((plan (%open-area inv cwd store data-dir getenv)))
       (when lost
-        (%plan-stderr-line error-output "plan ~a is no longer open; opened plan ~a"
+        (%plan-stderr-line error-output "preview ~a is no longer open; opened preview ~a"
                            lost (plan-id plan)))
       (values plan nil))))
 
 (defun %headless-plan-finish (report plan inv run failure interrupted error-output
-                              &optional checkpointer)
-  "After a plan run, before its turn is committed: the projection, --apply,
-the plan events, the result's plan object, the text-mode diff and the
+                                     &optional checkpointer)
+  "After a preview run, before its turn is committed: the projection, --apply,
+the preview events, the result's preview object, the text-mode diff and the
 stderr line (see the file header)."
   (let* ((changes (plan-changes plan))
          (diff (plan-diff-text plan))
          (status :open)
          (conflicts '()))
-    (%emit-event report "plan" "subtype" "projected" "plan_id" (plan-id plan)
-                               "changes" (%changes-json changes) "diff" diff)
+    (%emit-event report "preview" "subtype" "projected" "preview_id" (plan-id plan)
+                 "changes" (%changes-json changes) "diff" diff)
     (when (and (invocation-apply-p inv)
                (string= "success" (%outcome run failure interrupted 0)))
       (multiple-value-bind (result-status result) (%headless-approve report plan inv checkpointer)
@@ -1008,21 +1065,21 @@ stderr line (see the file header)."
     (case status
       (:applied
        (if changes
-           (%plan-stderr-line error-output "plan ~a: applied ~a" (plan-id plan)
+           (%plan-stderr-line error-output "preview ~a: applied ~a" (plan-id plan)
                               (%files-count (length changes)))
-           (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))
+           (%plan-stderr-line error-output "preview ~a: no changes" (plan-id plan))))
       (:open
        (unless (%report-plan-failure report)
          (if changes
              (%plan-stderr-line error-output
-                                "plan ~a: ~a changed, not applied (cl-stack-code -p --resume ~a --apply applies it)"
+                                "preview ~a: ~a changed, not applied (cl-stack-code -p --resume ~a --apply applies it)"
                                 (plan-id plan) (%files-count (length changes))
                                 (%report-session report))
-             (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))))
+             (%plan-stderr-line error-output "preview ~a: no changes" (plan-id plan))))))
     plan))
 
 (defun %run-plan-action (inv &key output getenv data-dir user-config-dir error-output start)
-  "--apply / --reject on the resumed session's open plan, without a run.
+  "--apply / --reject on the resumed session's open preview, without a run.
 → exit code."
   (let* ((getenv (or getenv #'uiop:getenv))
          (cwd (%resolve-cwd (invocation-cwd inv)))
@@ -1031,7 +1088,7 @@ stderr line (see the file header)."
          (mode (or (settings-permission-mode settings) :default))
          (sessions-dir (%sessions-dir cwd data-dir getenv))
          (source (progn (check-plan-flags inv mode)
-                        (%session-source inv sessions-dir)))
+                   (%session-source inv sessions-dir)))
          (entry (%head-plan-entry source))
          (plan (and entry (eq :open (getf entry :status))
                     (handler-case (reopen-plan (%plans-dir cwd data-dir getenv) (getf entry :id))
@@ -1039,11 +1096,11 @@ stderr line (see the file header)."
          (report (make-%report :format (invocation-output-format inv) :output output
                                :session (session-id source))))
     (unless plan
-      (%usage-fail "session ~a has no open plan" (session-id source)))
-    ;; H5b: the approval's checkpoints belong to the head (the plan's turn).
+      (%usage-fail "session ~a has no open preview" (session-id source)))
+    ;; H5b: the approval's checkpoints belong to the head (the preview's turn).
     (let ((checkpointer (%make-run-checkpointer settings cwd data-dir getenv)))
       (unwind-protect
-           (%run-plan-action-1 inv report plan source checkpointer output error-output start)
+          (%run-plan-action-1 inv report plan source checkpointer output error-output start)
         (close-checkpointer checkpointer)))))
 
 (defun %run-plan-action-1 (inv report plan source checkpointer output error-output start)
@@ -1055,8 +1112,8 @@ stderr line (see the file header)."
                diff (plan-diff-text plan))
          (reject-plan plan)
          (setf status :discarded)
-         (%emit-event report "plan" "subtype" "discarded" "plan_id" (plan-id plan))
-         (%plan-stderr-line error-output "plan ~a: discarded" (plan-id plan)))
+         (%emit-event report "preview" "subtype" "discarded" "preview_id" (plan-id plan))
+         (%plan-stderr-line error-output "preview ~a: discarded" (plan-id plan)))
         (t
          (setf changes (plan-changes plan)
                diff (plan-diff-text plan))
@@ -1067,9 +1124,9 @@ stderr line (see the file header)."
              ((:applied :empty)
               (setf status :applied)
               (if changes
-                  (%plan-stderr-line error-output "plan ~a: applied ~a" (plan-id plan)
+                  (%plan-stderr-line error-output "preview ~a: applied ~a" (plan-id plan)
                                      (%files-count (length changes)))
-                  (%plan-stderr-line error-output "plan ~a: no changes" (plan-id plan))))
+                  (%plan-stderr-line error-output "preview ~a: no changes" (plan-id plan))))
              (:rebased (setf status :rebased conflicts result))))))
       (setf (%report-plan report) (%plan-object plan status changes diff conflicts))
       (let ((failure (%report-plan-failure report))
@@ -1090,6 +1147,98 @@ stderr line (see the file header)."
           (error failure))
         0))))
 
+;;; H5c-0: plan documents in -p (src/plan-docs.lisp header, HEADLESS).
+
+(defun %plan-doc-run-p (mode)
+  "A plan run: the effective mode is :PLAN (--permission-mode plan,
+--propose-only or permissionMode \"plan\")."
+  (eq mode :plan))
+
+(defun %plan-doc-data-dir (data-dir getenv)
+  (or data-dir (user-data-directory :getenv getenv)))
+
+(defun %plan-doc-approvable (source cwd data-dir getenv)
+  "--approve-plan: the resumed session's :PROPOSED or :INTERRUPTED document,
+else CODE-USAGE-ERROR \"session ID has no plan to approve\" (exit 2)."
+  (let ((doc (%session-plan-doc source (or (find-project-root cwd) cwd)
+                                (%plan-doc-data-dir data-dir getenv))))
+    (unless (and doc (member (plan-document-status doc) '(:proposed :interrupted)))
+      (%usage-fail "session ~a has no plan to approve" (session-id source)))
+    doc))
+
+(defun %plan-doc-opened-keys (doc area reopened-p sandbox)
+  (list "subtype" (if reopened-p "reopened" "opened")
+        "plan_id" (plan-document-id doc)
+        "revision" (plan-document-revision doc)
+        "path" (uiop:native-namestring (plan-document-path doc))
+        "area" (uiop:native-namestring (plan-root area))
+        "sandbox" (if sandbox (plan-sandbox-object sandbox) :null)))
+
+(defun %plan-doc-proposed-line (doc session)
+  (if (plusp (plan-document-revision doc))
+      (format nil "plan ~a r~d: proposed; review ~a, then cl-stack-code -p --resume ~a --approve-plan (or --reject-plan; or --resume ~a --permission-mode plan \"…\" to revise)"
+              (plan-document-id doc) (plan-document-revision doc)
+              (uiop:native-namestring (plan-document-path doc)) session session)
+      (format nil "plan ~a: no plan proposed yet" (plan-document-id doc))))
+
+(defun %plan-doc-run-finish (report doc start-revision error-output)
+  "After a plan run: the result's \"plan\", the text-mode markdown and the
+stderr line. → T when the run proposed."
+  (let ((proposed (> (plan-document-revision doc) start-revision)))
+    (setf (%report-plan-doc-p report) t
+          (%report-plan-doc-object report) (and proposed (plan-document-object doc))
+          (%report-plan-doc-text report) (and proposed (plan-document-markdown doc)))
+    (%plan-stderr-line error-output "~a" (%plan-doc-proposed-line doc (%report-session report)))
+    proposed))
+
+(defun %plan-doc-execution-finish (report doc changes diff interrupted preview-p)
+  "After an execution turn: the document :EXECUTED or :INTERRUPTED, the
+\"executed\" event, the result's \"plan\" and the text-mode lines."
+  (finish-plan-execution doc :changes changes :interrupted interrupted)
+  (apply #'%emit-event report "plan" "subtype" "executed" (%plan-executed-keys doc changes diff))
+  (setf (%report-plan-doc-p report) t
+        (%report-plan-doc-object report) (plan-document-object doc)
+        (%report-plan-doc-text report)
+        (format nil "~{~a~%~}~:[~;~%~a~]" (plan-versus-diff-lines doc changes)
+                (and (not preview-p) (plusp (length diff))) diff)))
+
+(defun %run-plan-doc-action (inv &key output getenv data-dir user-config-dir error-output start)
+  "--reject-plan / --save-plan on the resumed session's plan document, without
+a run. → exit code."
+  (let* ((getenv (or getenv #'uiop:getenv))
+         (cwd (%resolve-cwd (invocation-cwd inv)))
+         (config (or user-config-dir (user-config-directory :getenv getenv)))
+         (settings (load-settings cwd :user-config-dir config :cli (invocation-settings inv)))
+         (mode (or (settings-permission-mode settings) :default))
+         (sessions-dir (%sessions-dir cwd data-dir getenv))
+         (source (progn (check-plan-flags inv mode)
+                   (%session-source inv sessions-dir)))
+         (doc (%session-plan-doc source (or (find-project-root cwd) cwd)
+                                 (%plan-doc-data-dir data-dir getenv)))
+         (report (make-%report :format (invocation-output-format inv) :output output
+                               :session (session-id source))))
+    (unless doc
+      (error 'plan-document-not-found :designator (session-id source)
+                                      :message (format nil "session ~a has no plan" (session-id source))))
+    (cond ((invocation-reject-plan-p inv)
+           (reject-plan-document doc)
+           (%emit-event report "plan" "subtype" "rejected" "plan_id" (plan-document-id doc))
+           (%plan-stderr-line error-output "plan ~a: rejected" (plan-document-id doc))
+           (setf (%report-plan-doc-p report) t
+                 (%report-plan-doc-object report) (plan-document-object doc)))
+          (t
+           (let ((path (save-plan-to-workspace doc :directory (settings-plan-save-directory settings))))
+             (when (eq :text (%report-format report))
+               (format output "~a~%" (uiop:native-namestring path))
+               (force-output output)))))
+    (unless (eq :text (%report-format report))
+      (%write-json-line report
+                        (%result-object report "success" "" nil
+                                        (round (* 1000 (- (get-internal-real-time)
+                                                          (or start (get-internal-real-time))))
+                                               internal-time-units-per-second))))
+    0))
+
 (defun %make-run-checkpointer (settings cwd data-dir getenv)
   "H5b: the run's CHECKPOINTER: the project directory (project root, else CWD),
 CHECKPOINT-SETTINGS and the data directory. An explicit checkpoints.kind that
@@ -1100,37 +1249,62 @@ does not fit → CHECKPOINT-ERROR."
                        :data-dir (or data-dir (user-data-directory :getenv getenv)))))
 
 (defun %run-headless (inv &key output input providers user-config-dir getenv start data-dir
-                               (error-output *error-output*))
+                          (error-output *error-output*))
   "The -p run of INV. Configuration errors signal before anything is written
 to OUTPUT; a run that started is committed to its session, writes its
-result, then signals its failure."
+result, then signals its failure. H5c-0: plan runs, --approve-plan,
+--reject-plan and --save-plan (src/plan-docs.lisp header, HEADLESS)."
   (unless (invocation-print-p inv)
     (error 'code-usage-error
            :message "-p (--print) is required: cl-stack-code 0.1 runs headless only (the interactive mode arrives in H3b)"))
   (check-session-flags inv)
+  ;; H5c-0: the deprecated alias, once per run.
+  (when (invocation-plan-area-deprecated-p inv)
+    (%plan-stderr-line error-output "--plan-area is deprecated; use --preview-area"))
   ;; H5b: --rewind is an action of its own.
   (when (or (invocation-rewind inv) (invocation-rewind-mode inv))
     (return-from %run-headless
       (%run-rewind-action inv :output output :getenv getenv :data-dir data-dir
                               :user-config-dir user-config-dir :error-output error-output
                               :start start)))
-  (when (%plan-action-only-p inv)
+  ;; H5c-0: --reject-plan / --save-plan act on the plan document.
+  (when (or (invocation-reject-plan-p inv) (invocation-save-plan-p inv))
+    (return-from %run-headless
+      (%run-plan-doc-action inv :output output :getenv getenv :data-dir data-dir
+                                :user-config-dir user-config-dir :error-output error-output
+                                :start start)))
+  (when (and (%plan-action-only-p inv) (not (invocation-approve-plan-p inv)))
     (return-from %run-headless
       (%run-plan-action inv :output output :getenv getenv :data-dir data-dir
                             :user-config-dir user-config-dir :error-output error-output
                             :start start)))
   (let* ((retry-p (invocation-retry-p inv))
-         ;; H3f: --retry re-sends the failed turn's prompt; none is read.
-         (prompt (if retry-p "" (%read-prompt inv input)))
+         (approve-p (invocation-approve-plan-p inv))
          (cwd (%resolve-cwd (invocation-cwd inv)))
          (config (or user-config-dir (user-config-directory :getenv getenv)))
-         (settings (load-settings cwd :user-config-dir config
-                                      :cli (invocation-settings inv)))
+         (loaded (load-settings cwd :user-config-dir config
+                                    :cli (invocation-settings inv)))
+         ;; H5c-0: the flags first, before anything opens or is read.
+         (checked (check-plan-flags inv (or (settings-permission-mode loaded) :default)))
+         ;; H5c-0: --approve-plan runs under --permission-mode, else acceptEdits.
+         (execution-mode (and approve-p
+                              (or (settings-permission-mode (invocation-settings inv))
+                                  :accept-edits)))
+         (settings (if approve-p
+                       (merge-settings loaded (make-settings :permission-mode execution-mode))
+                       loaded))
+         ;; H3f: --retry re-sends the failed turn's prompt; none is read.
+         ;; H5c-0: --approve-plan's prompt is extra instructions (optional).
+         (prompt (cond (retry-p "")
+                       (approve-p (or (invocation-prompt inv) ""))
+                       (t (%read-prompt inv input))))
          ;; H3e-2a: the servers' configuration errors (exit 2) before anything is written.
          (mcp-configs (effective-mcp-servers cwd settings :user-config-dir config
                                                           :env (%env-lookup settings getenv)))
          (sessions-dir (%sessions-dir cwd data-dir getenv))
          (source (%session-source inv sessions-dir))
+         ;; H5c-0: the plan to run, before the model is resolved.
+         (approved-doc (and approve-p (%plan-doc-approvable source cwd data-dir getenv)))
          (designator (%session-model inv source settings))
          (resolved (multiple-value-list
                     (resolve-model designator :providers providers
@@ -1138,12 +1312,14 @@ result, then signals its failure."
          (backend (%apply-settings-request-timeout (first resolved) settings))
          (model (third resolved))
          (mode (or (settings-permission-mode settings) :default))
+         (plan-doc-p (%plan-doc-run-p mode))
          ;; H4b: the checks, before the session is written.
          (link (when (settings-lisp-image settings)
                  (check-lisp-image-settings settings mode)
                  (and (lisp-image-enabled-p settings) (%make-image-link))))
          (max-turns (or (settings-max-turns settings) +default-max-turns+))
-         (store (%session-for-run inv source sessions-dir (or (find-project-root cwd) cwd)))
+         (project (or (find-project-root cwd) cwd))
+         (store (%session-for-run inv source sessions-dir project))
          ;; H5b: after the session, before anything is written to OUTPUT.
          (checkpointer (%make-run-checkpointer settings cwd data-dir getenv))
          (history (session-turns store))
@@ -1163,7 +1339,36 @@ result, then signals its failure."
                                          :turn-timeout-ms)
                                    "--turn-timeout"
                                    "turnTimeoutMs")))))
-         ;; H5a: plan mode (or a plan flag) opens or reopens the session's plan.
+         ;; H5c-0: the plan document of a plan run (opened or reopened) and its
+         ;; exploration area; an approved plan's document, its execution prompt.
+         (doc-and-reopened
+           (handler-bind ((error (lambda (e)
+                                   (declare (ignore e))
+                                   (close-checkpointer checkpointer))))
+             (cond (plan-doc-p
+                    (when (%plan-migration-notice-p (%plan-doc-data-dir data-dir getenv))
+                      (%plan-stderr-line error-output "~a" +plan-mode-migration-notice+))
+                    (multiple-value-list
+                     (%open-session-plan-doc store project (%plan-doc-data-dir data-dir getenv)
+                                             settings)))
+                   (approved-doc
+                    (approve-plan-document approved-doc :mode execution-mode)
+                    (list approved-doc nil)))))
+         (doc (first doc-and-reopened))
+         (doc-start-revision (and doc (plan-document-revision doc)))
+         (doc-feedback (and plan-doc-p (second doc-and-reopened)
+                            (eq :proposed (plan-document-status doc))
+                            prompt))
+         (prompt (if approved-doc
+                     (plan-execution-prompt approved-doc prompt)
+                     prompt))
+         (area (when plan-doc-p
+                 (handler-bind ((error (lambda (e)
+                                         (declare (ignore e))
+                                         (close-checkpointer checkpointer))))
+                   (%plan-doc-exploration-area
+                    doc (lambda () (%open-area inv cwd store data-dir getenv))))))
+         ;; H5a: preview mode (or a preview flag) opens or reopens the session's preview.
          (plan-and-reopened
            (when (%plan-run-p inv mode)
              (handler-bind ((error (lambda (e)
@@ -1173,18 +1378,20 @@ result, then signals its failure."
                 (%headless-plan inv mode cwd store source sessions-dir data-dir getenv
                                 error-output)))))
          (plan (first plan-and-reopened))
-         ;; R4d-4b: the plan's sandbox, probed through the backend resolved
+         ;; H5c-0: the copy the tools work in (a preview, or the exploration area).
+         (copy (or plan area))
+         ;; R4d-4b: the copy's sandbox, probed through the backend resolved
          ;; here (this thread). failIfUnavailable (exit 1) and a bad
          ;; extraWritable (exit 2) signal before the model is called.
          (sandbox
-           (when plan
+           (when copy
              (handler-bind ((error (lambda (e)
                                      (close-checkpointer checkpointer)
-                                     ;; A fresh plan does not stay open behind it.
-                                     (when (and (typep e 'plan-sandbox-unavailable)
+                                     ;; A fresh preview does not stay open behind it.
+                                     (when (and plan (typep e 'plan-sandbox-unavailable)
                                                 (not (second plan-and-reopened)))
                                        (reject-plan plan)))))
-               (open-plan-sandbox plan settings :backend (plan-compute-backend)))))
+               (open-plan-sandbox copy settings :backend (plan-compute-backend)))))
          (event-backend (event-backend-libuv:make-libuv-backend))
          (event-loop (event:make-event-loop event-backend))
          (supervisor nil)
@@ -1193,120 +1400,161 @@ result, then signals its failure."
          (context nil)
          (discovery nil)
          (instruction-set nil))
+    (declare (ignore checked))
+    (setf (%report-plan-doc report) doc)
     (unwind-protect
-         (let ((event:*event-backend* event-backend)
-               (event:*event-loop* event-loop)
-               (http-protocol:*http-backend*
-                 (or http-protocol:*http-backend* (http-backend-async:make-async-backend)))
-               (http-backend-async:*event-backend-maker*
-                 (or http-backend-async:*event-backend-maker*
-                     #'event-backend-libuv:make-libuv-backend))
-               (agent:*off-loop-specials*
-                 (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
-                        agent:*off-loop-specials*)))
-           ;; H8d: the run's supervisor, before the tools; H3e-2a: then the
-           ;; MCP manager, before the instruction set opens.
-           (setf supervisor (make-code-supervisor cwd :data-dir data-dir
-                                                      :getenv (or getenv #'uiop:getenv))
-                 mcp (make-mcp-manager mcp-configs :supervisor supervisor :settings settings
-                                                   :env (%env-lookup settings getenv) :cwd cwd
-                                                   :http-backend http-protocol:*http-backend*)
-                 (%report-mcp report) mcp)
-           ;; H3e-1: the session's instruction set (:start or :resume).
-           (multiple-value-setq (context discovery instruction-set)
-             (%open-session-instructions cwd settings store
-                                         :user-config-dir config
-                                         :components (list (mcp-manager-component mcp))))
-           (setf (mcp-manager-instruction-set mcp) instruction-set
-                 (%report-instruction-set report) instruction-set)
-           (setf sources (append (apply #'make-code-tools (if plan (plan-tool-root plan cwd) cwd)
-                                        :settings settings
-                                        :on-image-event (and link (%link-callback link))
-                                        :supervisor supervisor
-                                        :scope (and plan (%plan-unit-scope supervisor plan))
-                                        :skills (context-skills context)
-                                        (plan-sandbox-tool-keys sandbox))
-                                 ;; H3e-2a: the MCP source, last.
-                                 (list (mcp-manager-tool-source mcp))))
-           (%link-skill-tools instruction-set (code-skill-tools sources))
-           ;; H4b: the image starts before the system event; its events are
-           ;; written and posted on the loop thread.
-           (when link
-             (setf (%link-tools link) (third sources)
-                   (%report-image-tools report) (third sources))
-             (%link-attach link (lambda (event)
-                                  (event:wake-call event-backend event-loop
-                                                   (lambda ()
-                                                     (%headless-image-event report event)))))
-             (start-lisp-image (third sources) settings))
-           ;; H3e-2a: the servers before the first model call (committed once
-           ;; they settled); a notice per server that did not connect.
-           (start-mcp-servers mcp)
-           (dolist (c (mcp-manager-connections mcp))
-             (let ((notice (mcp-status-notice c :user-config-dir config)))
-               (when notice
-                 (format error-output "~a~%" notice))))
-           (force-output error-output)
-           (let ((offered (loop for source in sources
-                                append (mapcar #'llm:llm-tool-name
-                                               (agent:list-agent-tools source)))))
-             (dolist (notice (%take-mcp-notices mcp))
-               (format error-output "~a~%" notice)
-               (force-output error-output))
-             (multiple-value-bind (instructions files)
-                 (assemble-system-prompt cwd :tools offered :backend backend
-                                             :settings settings :user-config-dir config
-                                             :plan plan :sandbox sandbox
-                                             :lisp-image (%sources-lisp-tools sources)
-                                             :context context :instruction-set instruction-set)
-               (let ((agent (agent:make-ai-agent
-                             :name "cl-stack-code"
-                             :backend backend
-                             :model model
-                             :instructions instructions
-                             :tools (%capped-sources sources settings (%tool-output-dir store))
-                             :permissions (if sandbox
-                                              (%plan-permissions settings sandbox)
-                                              (%agent-permissions settings))
-                             :settings (%agent-settings cwd settings :discovery discovery
-                                                                     :backend backend
-                                                                     :designator designator)))
-                     (root (find-project-root cwd)))
-                 (apply #'%emit-event report "system"
-                        (%system-init-keys cwd root designator mode offered files
-                                           (and link settings)
-                                           :context context :discovery discovery
-                                           :instruction-set instruction-set
-                                           :mcp-servers (mcp-manager-connections mcp)
-                                           :resilience (apply #'%resilience-init-keys settings
-                                                              window-and-source)))
-                 (when plan
-                   (apply #'%emit-event report "plan"
-                          (%plan-open-keys plan (second plan-and-reopened) sandbox)))
-                 ;; R4d-4b: once, after the plan opened, before the model.
-                 (let ((notice (and sandbox (plan-sandbox-notice sandbox))))
-                   (when notice (%plan-stderr-line error-output "~a" notice)))
-                 (let ((pre (begin-checkpoint-turn checkpointer store)))
-                   (multiple-value-bind (run failure interrupted)
-                       (%drive agent (if retried
-                                         history
-                                         (append history (list (llm:user-turn prompt))))
-                               report mode
-                               :sandbox sandbox :error-output error-output)
-                     (when plan
-                       (%headless-plan-finish report plan inv run
-                                              (or (%report-failure report) failure)
-                                              interrupted error-output checkpointer))
-                     (multiple-value-bind (revision went-to)
-                         (%commit-headless-turn report store prompt history failure interrupted
-                                                designator mode error-output plan)
-                       ;; H5b: --apply's checkpoints belong to this turn; then
-                       ;; the turn's own (none after an approved plan).
-                       (when revision
-                         (record-plan-checkpoints checkpointer went-to (%report-plan-pre report)
-                                                  revision)
-                         (end-checkpoint-turn checkpointer went-to pre revision)))
-                     (%report-run-end report run failure interrupted max-turns start)))))))
+        (let ((event:*event-backend* event-backend)
+              (event:*event-loop* event-loop)
+              (http-protocol:*http-backend*
+                (or http-protocol:*http-backend* (http-backend-async:make-async-backend)))
+              (http-backend-async:*event-backend-maker*
+                (or http-backend-async:*event-backend-maker*
+                    #'event-backend-libuv:make-libuv-backend))
+              (agent:*off-loop-specials*
+                (union '(http-protocol:*http-backend* http-backend-async:*event-backend-maker*)
+                       agent:*off-loop-specials*)))
+          ;; H8d: the run's supervisor, before the tools; H3e-2a: then the
+          ;; MCP manager, before the instruction set opens.
+          (setf supervisor (make-code-supervisor cwd :data-dir data-dir
+                                                     :getenv (or getenv #'uiop:getenv))
+                mcp (make-mcp-manager mcp-configs :supervisor supervisor :settings settings
+                                                  :env (%env-lookup settings getenv) :cwd cwd
+                                                  :http-backend http-protocol:*http-backend*)
+                (%report-mcp report) mcp)
+          ;; H3e-1: the session's instruction set (:start or :resume).
+          (multiple-value-setq (context discovery instruction-set)
+                               (%open-session-instructions cwd settings store
+                                                           :user-config-dir config
+                                                           :components (list (mcp-manager-component mcp))))
+          (setf (mcp-manager-instruction-set mcp) instruction-set
+                (%report-instruction-set report) instruction-set)
+          (setf sources (append (apply #'make-code-tools (if copy (plan-tool-root copy cwd) cwd)
+                                       :settings settings
+                                       :on-image-event (and link (%link-callback link))
+                                       :supervisor supervisor
+                                       :scope (and copy (%plan-unit-scope supervisor copy))
+                                       :skills (context-skills context)
+                                       (plan-sandbox-tool-keys sandbox))
+                                ;; H3e-2a: the MCP source, last.
+                                (list (mcp-manager-tool-source mcp))
+                                ;; H5c-0: then the plan tools.
+                                (cond (plan-doc-p
+                                       (let ((tools (make-plan-tools doc :phase :plan)))
+                                         (setf (%plan-tools-feedback tools) doc-feedback)
+                                         (list tools)))
+                                      (approved-doc
+                                       (list (make-plan-tools doc :phase :execute))))))
+          (%link-skill-tools instruction-set (code-skill-tools sources))
+          ;; H4b: the image starts before the system event; its events are
+          ;; written and posted on the loop thread.
+          (when link
+            (setf (%link-tools link) (third sources)
+                  (%report-image-tools report) (third sources))
+            (%link-attach link (lambda (event)
+                                 (event:wake-call event-backend event-loop
+                                                  (lambda ()
+                                                    (%headless-image-event report event)))))
+            (start-lisp-image (third sources) settings))
+          ;; H3e-2a: the servers before the first model call (committed once
+          ;; they settled); a notice per server that did not connect.
+          (start-mcp-servers mcp)
+          (dolist (c (mcp-manager-connections mcp))
+            (let ((notice (mcp-status-notice c :user-config-dir config)))
+              (when notice
+                (format error-output "~a~%" notice))))
+          (force-output error-output)
+          (let ((offered (loop for source in sources
+                               append (mapcar #'llm:llm-tool-name
+                                              (agent:list-agent-tools source)))))
+            (dolist (notice (%take-mcp-notices mcp))
+              (format error-output "~a~%" notice)
+              (force-output error-output))
+            (multiple-value-bind (instructions files)
+                (assemble-system-prompt cwd :tools offered :backend backend
+                                            :settings settings :user-config-dir config
+                                            :plan copy :sandbox sandbox
+                                            :lisp-image (%sources-lisp-tools sources)
+                                            :context context :instruction-set instruction-set)
+              (let ((agent (agent:make-ai-agent
+                            :name "cl-stack-code"
+                            :backend backend
+                            :model model
+                            :instructions instructions
+                            :tools (%capped-sources sources settings (%tool-output-dir store))
+                            :permissions (if sandbox
+                                             (%plan-permissions settings sandbox)
+                                             (%agent-permissions settings))
+                            :settings (%agent-settings cwd settings :discovery discovery
+                                                                    :backend backend
+                                                                    :designator designator)))
+                    (root (find-project-root cwd)))
+                (apply #'%emit-event report "system"
+                       (%system-init-keys cwd root designator mode offered files
+                                          (and link settings)
+                                          :context context :discovery discovery
+                                          :instruction-set instruction-set
+                                          :mcp-servers (mcp-manager-connections mcp)
+                                          :resilience (apply #'%resilience-init-keys settings
+                                                             window-and-source)))
+                ;; H5c-0: the plan document's opening, or its approval.
+                (cond (plan-doc-p
+                       (apply #'%emit-event report "plan"
+                              (%plan-doc-opened-keys doc area (second doc-and-reopened) sandbox)))
+                      (approved-doc
+                       (%emit-event report "plan" "subtype" "approved"
+                                    "plan_id" (plan-document-id doc)
+                                    "revision" (plan-document-revision doc)
+                                    "mode" (permission-mode-name execution-mode))))
+                (when plan
+                  (apply #'%emit-event report "preview"
+                         (%plan-open-keys plan (second plan-and-reopened) sandbox)))
+                ;; R4d-4b: once, after the copy opened, before the model.
+                (let ((notice (and sandbox (plan-sandbox-notice sandbox))))
+                  (when notice (%plan-stderr-line error-output "~a" notice)))
+                (let* ((pre (begin-checkpoint-turn checkpointer store))
+                       ;; H5c-0: the files before an execution in the project.
+                       (snapshots (and approved-doc (not plan) (p:make-memory-snapshot-store)))
+                       (before (and snapshots (%execution-snapshot project snapshots))))
+                  (multiple-value-bind (run failure interrupted)
+                      (%drive agent (if retried
+                                        history
+                                        (append history (list (llm:user-turn prompt))))
+                              report mode
+                              :sandbox sandbox :error-output error-output)
+                    ;; H5c-0: plan versus diff (a preview: its projection).
+                    (when approved-doc
+                      (multiple-value-bind (changes diff)
+                          (if plan
+                              (values (plan-changes plan) (plan-diff-text plan))
+                              (%execution-changes snapshots before
+                                                  (%execution-snapshot project snapshots)))
+                        (%plan-doc-execution-finish
+                         report doc changes diff
+                         (not (string= "success"
+                                       (%outcome run (or (%report-failure report) failure)
+                                                 interrupted max-turns)))
+                         plan)))
+                    (when plan
+                      (%headless-plan-finish report plan inv run
+                                             (or (%report-failure report) failure)
+                                             interrupted error-output checkpointer))
+                    (let ((proposed (and plan-doc-p
+                                         (%plan-doc-run-finish report doc doc-start-revision
+                                                               error-output))))
+                      (multiple-value-bind (revision went-to)
+                          (%commit-headless-turn
+                           report store prompt history failure interrupted
+                           designator mode error-output plan
+                           ;; H5c-0: only turns that changed the document.
+                           (and doc (or approved-doc proposed (not (second doc-and-reopened)))
+                                (plan-document-record doc :feedback (and proposed doc-feedback))))
+                        ;; H5b: --apply's checkpoints belong to this turn; then
+                        ;; the turn's own (none after an approved preview).
+                        (when revision
+                          (record-plan-checkpoints checkpointer went-to (%report-plan-pre report)
+                                                   revision)
+                          (end-checkpoint-turn checkpointer went-to pre revision))))
+                    (%report-run-end report run failure interrupted max-turns start)))))))
       ;; H4b: no event reaches the loop after this; -p never waits for
       ;; events after the run (the queue goes with the tools).
       (%link-close link)
@@ -1382,10 +1630,10 @@ DISCOVERY and INSTRUCTION-SET give \"imports\", \"skills\", \"rules\",
                  (list "mcp_servers" (map 'vector #'mcp-connection-object mcp-servers)))))))
 
 (defun %plan-open-keys (plan reopened-p &optional sandbox)
-  "The plan \"opened\" / \"reopened\" event's keys and values. R4d-4b: with
+  "The preview \"opened\" / \"reopened\" event's keys and values. R4d-4b: with
 a SANDBOX, \"sandbox\" is its PLAN-SANDBOX-OBJECT."
   (list* "subtype" (if reopened-p "reopened" "opened")
-         "plan_id" (plan-id plan)
+         "preview_id" (plan-id plan)
          "kind" (string-downcase (string (plan-kind plan)))
          "area" (uiop:native-namestring (plan-root plan))
          "base" (plan-base plan)

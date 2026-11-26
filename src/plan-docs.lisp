@@ -694,87 +694,6 @@ defaults to USER-DATA-DIRECTORY). Given: PLANS-DIRECTORY's rule."
 
 ;;; Stubs. Every function below signals %H5C0-PENDING until implemented.
 
-(defun open-plan-document (project-dir &key data-dir session-id id (template :default))
-  (declare (ignore project-dir data-dir session-id id template))
-  (%h5c0-pending 'open-plan-document))
-
-(defun reopen-plan-document (directory id)
-  (declare (ignore directory id))
-  (%h5c0-pending 'reopen-plan-document))
-
-(defun list-plan-documents (directory)
-  (declare (ignore directory))
-  (%h5c0-pending 'list-plan-documents))
-
-(defun plan-document-markdown (doc)
-  (declare (ignore doc))
-  (%h5c0-pending 'plan-document-markdown))
-
-(defun parse-plan-markdown (text &key (template :default))
-  "→ (values title steps files), see the header."
-  (declare (ignore text template))
-  (%h5c0-pending 'parse-plan-markdown))
-
-(defun plan-template-text (template)
-  (declare (ignore template))
-  (%h5c0-pending 'plan-template-text))
-
-(defun propose-plan-revision (doc markdown &key (author :model) feedback)
-  (declare (ignore doc markdown author feedback))
-  (%h5c0-pending 'propose-plan-revision))
-
-(defun sync-plan-document-edits (doc)
-  (declare (ignore doc))
-  (%h5c0-pending 'sync-plan-document-edits))
-
-(defun plan-document-revisions (doc)
-  (declare (ignore doc))
-  (%h5c0-pending 'plan-document-revisions))
-
-(defun approve-plan-document (doc &key (mode :accept-edits))
-  (declare (ignore doc mode))
-  (%h5c0-pending 'approve-plan-document))
-
-(defun reject-plan-document (doc)
-  (declare (ignore doc))
-  (%h5c0-pending 'reject-plan-document))
-
-(defun plan-execution-prompt (doc &optional extra)
-  (declare (ignore doc extra))
-  (%h5c0-pending 'plan-execution-prompt))
-
-(defun set-plan-step (doc index status)
-  (declare (ignore doc index status))
-  (%h5c0-pending 'set-plan-step))
-
-(defun finish-plan-execution (doc &key changes interrupted)
-  (declare (ignore doc changes interrupted))
-  (%h5c0-pending 'finish-plan-execution))
-
-(defun plan-steps-lines (doc)
-  (declare (ignore doc))
-  (%h5c0-pending 'plan-steps-lines))
-
-(defun plan-versus-diff (doc changes)
-  (declare (ignore doc changes))
-  (%h5c0-pending 'plan-versus-diff))
-
-(defun plan-versus-diff-lines (doc changes)
-  (declare (ignore doc changes))
-  (%h5c0-pending 'plan-versus-diff-lines))
-
-(defun save-plan-to-workspace (doc &key directory)
-  (declare (ignore doc directory))
-  (%h5c0-pending 'save-plan-to-workspace))
-
-(defun plan-document-object (doc)
-  (declare (ignore doc))
-  (%h5c0-pending 'plan-document-object))
-
-(defun plan-document-record (doc &key feedback)
-  (declare (ignore doc feedback))
-  (%h5c0-pending 'plan-document-record))
-
 (defclass plan-tools ()
   ((document :initarg :document :reader plan-tools-document)
    (phase :initarg :phase :reader plan-tools-phase)
@@ -786,13 +705,844 @@ source (superclass and methods)."))
 (defun plan-tools-p (x)
   (typep x 'plan-tools))
 
-(defun make-plan-tools (doc &key (phase :plan) ask)
-  (declare (ignore doc phase ask))
-  (%h5c0-pending 'make-plan-tools))
-
 (defun plan-mode-permission-policy (&key (policy 'plan-mode-tools))
-  (declare (ignore policy))
-  (%h5c0-pending 'plan-mode-permission-policy))
+  "→ (lambda (action resources effect)) for ai-agent-protocol's
+:permission-policy: POLICY (policy-protocol) decides on (:action ACTION
+:resources RESOURCES :context ((mode plan))). :FORBID → (values :deny RULE),
+:ASK → (values :ask RULE), RULE naming the deciding resource and carrying the
+decision's feedback; no opinion otherwise (a policy only tightens)."
+  (lambda (action resources effect)
+    (declare (ignore effect))
+    (let* ((decision (stack-policy:evaluate-policy
+                      policy (list :action action :resources (or resources '("*"))
+                                   :context '((mode plan)))))
+           (verdict (stack-policy:decision-effect decision)))
+      (flet ((rule (effect)
+               (agent:make-permission-rule
+                action (or (stack-policy:decision-resource decision) (first resources) "*") effect
+                :feedback (stack-policy:decision-feedback decision))))
+        (case verdict
+          (:forbid (values :deny (rule :deny)))
+          (:ask (values :ask (rule :ask)))
+          (t nil))))))
+
+;;; ------------------------------------------------------------------
+;;; Implementation (H5c-0). Internal helpers are %-prefixed.
+
+;;; meta.sexp
+
+(defun %plan-doc-subdir (doc name)
+  (uiop:merge-pathnames* name (uiop:ensure-directory-pathname (plan-document-directory doc))))
+
+(defun %plan-doc-meta-file (directory)
+  (uiop:merge-pathnames* "meta.sexp" (uiop:ensure-directory-pathname directory)))
+
+(defun %plan-doc-revision-file (doc n)
+  (%plan-doc-subdir doc (format nil "revisions/~d.md" n)))
+
+(defun %plan-doc-now-us ()
+  "Microseconds since 1900 (orders documents opened in the same second)."
+  #+sbcl (multiple-value-bind (sec usec) (sb-ext:get-time-of-day)
+           ;; 2208988800: seconds from 1900 to the Unix epoch
+           (+ (* (+ sec 2208988800) 1000000) usec))
+  #-sbcl (* (get-universal-time) 1000000))
+
+;;; Per-document state that is not in the given slots: the revision history,
+;;; the ordering key. Kept in an EQ table, written to meta.sexp.
+
+(defvar *plan-doc-extra* (make-hash-table :test 'eq #+sbcl :weakness #+sbcl :key
+                                          #+sbcl :synchronized #+sbcl t)
+  "PLAN-DOCUMENT → plist (:revisions (plist …) :opened-us N :data-dir D).")
+
+(defun %doc-extra (doc key)
+  (getf (gethash doc *plan-doc-extra*) key))
+
+(defun (setf %doc-extra) (value doc key)
+  (let ((plist (gethash doc *plan-doc-extra*)))
+    (setf (getf plist key) value
+          (gethash doc *plan-doc-extra*) plist)
+    value))
+
+(defun %step-plist (step)
+  (list :index (plan-step-index step) :text (plan-step-text step) :status (plan-step-status step)))
+
+(defun %plist-step (plist)
+  (make-plan-step :index (getf plist :index) :text (getf plist :text)
+                  :status (or (getf plist :status) :pending)))
+
+(defun %write-plan-doc-meta (doc)
+  "Write DOC's meta.sexp atomically (format 1; extra keys :OPENED-US,
+:REVISIONS, :APPROVED-FROM)."
+  (let ((form (list :format +plan-document-format+
+                    :id (plan-document-id doc)
+                    :project-dir (uiop:native-namestring (plan-document-project-dir doc))
+                    :session (plan-document-session-id doc)
+                    :status (plan-document-status doc)
+                    :revision (plan-document-revision doc)
+                    :template (plan-document-template doc)
+                    :title (plan-document-title doc)
+                    :steps (mapcar #'%step-plist (plan-document-steps doc))
+                    :files (copy-list (plan-document-files doc))
+                    :area (plan-document-area-id doc)
+                    :mode (plan-document-execution-mode doc)
+                    :opened-at (plan-document-opened-at doc)
+                    :opened-us (%doc-extra doc :opened-us)
+                    :revisions (copy-list (%doc-extra doc :revisions))
+                    :approved-from (%doc-extra doc :approved-from)
+                    :version +version+)))
+    (ensure-directories-exist (plan-document-directory doc))
+    (p:write-text (%plan-doc-meta-file (plan-document-directory doc))
+                  (with-standard-io-syntax
+                      (let ((*package* (find-package :keyword)))
+                        (format nil "~s~%" form)))
+                  :atomic t)
+    doc))
+
+(defun %read-plan-doc-meta (directory id)
+  "The PLAN-DOCUMENT in DIRECTORY (its own <id>/ directory), or
+PLAN-DOCUMENT-NOT-FOUND :DESIGNATOR ID when it is missing or unreadable."
+  (let ((file (%plan-doc-meta-file directory)))
+    (flet ((lost ()
+             (error 'plan-document-not-found :designator id)))
+      (unless (probe-file file)
+        (lost))
+      (let ((form (handler-case
+                      (with-standard-io-syntax
+                          (let ((*package* (find-package :keyword))
+                                (*read-eval* nil))
+                            (read-from-string (uiop:read-file-string file :external-format :utf-8))))
+                    (error () (lost)))))
+        (unless (%plist-p form) (lost))
+        (destructuring-bind (&key format ((:id file-id)) project-dir session status revision template
+                                  title steps files area mode opened-at opened-us revisions
+                                  approved-from
+                                  &allow-other-keys)
+            form
+          (unless (and (eql format +plan-document-format+)
+                       (stringp file-id) (stringp project-dir)
+                       (member status +plan-document-statuses+)
+                       (integerp revision) (member template +plan-templates+)
+                       (listp steps) (listp files) (listp revisions))
+            (lost))
+          (let ((doc (make-instance 'plan-document
+                                    :id file-id
+                                    :project-dir (uiop:parse-native-namestring project-dir
+                                                                               :ensure-directory t)
+                                    :directory (uiop:ensure-directory-pathname directory)
+                                    :session-id session :status status :revision revision
+                                    :template template :title title
+                                    :steps (mapcar #'%plist-step steps)
+                                    :files files :area-id area :execution-mode mode
+                                    :opened-at opened-at)))
+            (setf (%doc-extra doc :opened-us) (or opened-us (* (or opened-at 0) 1000000))
+                  (%doc-extra doc :revisions) revisions
+                  (%doc-extra doc :approved-from) approved-from)
+            doc))))))
+
+;;; Opening, reading back.
+
+(defun open-plan-document (project-dir &key data-dir session-id id (template :default))
+  "→ a new :DRAFTING PLAN-DOCUMENT for PROJECT-DIR, meta.sexp written."
+  (unless (member template +plan-templates+)
+    (error 'code-usage-error
+           :message (format nil "unknown plan template ~s: use ~{~(~a~)~^, ~}" template
+                            +plan-templates+)))
+  (let* ((project (%truename-directory project-dir))
+         (dir (plan-documents-directory project :data-dir data-dir))
+         (id (cond ((null id) (%session-id))
+                   ((normalize-session-id id))
+                   (t (error 'plan-document-error
+                             :message (format nil "bad plan id ~s: use 32 hex digits" id)))))
+         (directory (uiop:merge-pathnames* (format nil "~a/" id) dir)))
+    (when (uiop:directory-exists-p directory)
+      (error 'plan-document-error :message (format nil "plan ~a already exists" id)))
+    (let ((doc (make-instance 'plan-document :id id :project-dir project :directory directory
+                                             :session-id session-id :status :drafting
+                                             :revision 0 :template template
+                                             :opened-at (get-universal-time))))
+      (setf (%doc-extra doc :opened-us) (%plan-doc-now-us)
+            (%doc-extra doc :revisions) '())
+      (%write-plan-doc-meta doc))))
+
+(defun reopen-plan-document (directory id)
+  "→ the PLAN-DOCUMENT ID under DIRECTORY (PLAN-DOCUMENTS-DIRECTORY), or
+PLAN-DOCUMENT-NOT-FOUND."
+  (let ((normal (and (stringp id) (normalize-session-id id))))
+    (unless normal
+      (error 'plan-document-not-found :designator id))
+    (let ((sub (uiop:merge-pathnames* (format nil "~a/" normal)
+                                      (uiop:ensure-directory-pathname directory))))
+      (unless (uiop:directory-exists-p sub)
+        (error 'plan-document-not-found :designator id))
+      (%read-plan-doc-meta sub id))))
+
+(defun list-plan-documents (directory)
+  "→ every readable PLAN-DOCUMENT under DIRECTORY, oldest first."
+  (let ((dir (uiop:directory-exists-p directory)))
+    (and dir
+         (sort (loop for sub in (uiop:subdirectories dir)
+                     for id = (car (last (pathname-directory sub)))
+                     for doc = (handler-case (%read-plan-doc-meta sub id)
+                                 (plan-document-not-found () nil))
+                     when doc collect doc)
+               (lambda (a b)
+                 (let ((x (%doc-extra a :opened-us)) (y (%doc-extra b :opened-us)))
+                   (or (< x y)
+                       (and (= x y) (string< (plan-document-id a) (plan-document-id b))))))))))
+
+(defun plan-document-markdown (doc)
+  "→ plan.md's text, or NIL before the first proposal."
+  (let ((path (plan-document-path doc)))
+    (and (probe-file path)
+         (uiop:read-file-string path :external-format :utf-8))))
+
+;;; The format (markdown-protocol's AST).
+
+(defun %md-inline-text (inlines)
+  "The plain text of INLINES: code spans as their text, breaks as spaces."
+  (with-output-to-string (s)
+    (labels ((walk (xs)
+               (dolist (x xs)
+                 (cond ((stringp x) (write-string x s))
+                       ((consp x)
+                        (case (first x)
+                          ((:soft-break :hard-break) (write-char #\Space s))
+                          (:code (write-string (second x) s))
+                          ((:link :image) (walk (third x)))
+                          (t (walk (second x)))))))))
+      (walk inlines))))
+
+(defun %md-trim (string)
+  (string-trim '(#\Space #\Tab #\Newline #\Return) string))
+
+(defun %md-list-items (block)
+  (case (first block)
+    (:bullet-list (third block))
+    (:ordered-list (fifth block))))
+
+(defun %md-item-text (blocks)
+  "An item's text: its paragraphs (nested lists are not part of it)."
+  (%md-trim (format nil "~{~a~^ ~}"
+                    (loop for b in blocks
+                          when (eq (first b) :paragraph)
+                            collect (%md-trim (%md-inline-text (second b)))))))
+
+(defun %md-first-code (blocks)
+  "The text of the first code span in an item's paragraphs, or NIL."
+  (labels ((walk (xs)
+             (dolist (x xs)
+               (when (consp x)
+                 (case (first x)
+                   (:code (return-from %md-first-code (second x)))
+                   ((:soft-break :hard-break))
+                   ((:link :image) (walk (third x)))
+                   (t (walk (second x))))))))
+    (dolist (b blocks)
+      (when (eq (first b) :paragraph)
+        (walk (second b))))
+    nil))
+
+(defun %md-section (blocks name)
+  "→ (values items found-p): the items of the first list after the level ≥ 2
+heading NAME, before the next heading of the same or a higher level."
+  (loop for (b . rest) on blocks
+        when (and (eq (first b) :heading) (>= (second b) 2)
+                  (string-equal (%md-trim (%md-inline-text (third b))) name))
+          do (let ((level (second b)))
+               (return (values (loop for x in rest
+                                     until (and (eq (first x) :heading) (<= (second x) level))
+                                     thereis (%md-list-items x))
+                               t)))
+        finally (return (values nil nil))))
+
+(defun %template-headings (template)
+  "→ (values required steps-heading) of TEMPLATE."
+  (ecase template
+    (:default (values '("Goal" "Steps") "Steps"))
+    (:spec (values '("Requirements" "Design" "Tasks") "Tasks"))))
+
+(defun %parse-plan-markdown (text template doc)
+  (check-type text string)
+  (let ((blocks (mdp:parse-markdown text)))
+    (multiple-value-bind (required steps-heading) (%template-headings template)
+      (let ((missing (loop for name in required
+                           unless (multiple-value-bind (items found) (%md-section blocks name)
+                                    (and found (or (not (string= name steps-heading)) items)))
+                             collect name)))
+        (when missing
+          (error 'plan-format-error :document doc :missing missing)))
+      (let ((title (loop for b in blocks
+                         when (and (eq (first b) :heading) (eql 1 (second b)))
+                           return (%md-trim (%md-inline-text (third b)))))
+            (steps (mapcar #'%md-item-text (%md-section blocks steps-heading)))
+            (files (mapcar (lambda (item)
+                             (or (%md-first-code item)
+                                 (let ((text (%md-item-text item)))
+                                   (subseq text 0 (or (position-if (lambda (c) (member c '(#\Space #\Tab)))
+                                                                   text)
+                                                      (length text))))))
+                           (%md-section blocks "Files to change"))))
+        (values title steps (remove "" files :test #'string=))))))
+
+(defun parse-plan-markdown (text &key (template :default))
+  "→ (values title steps files), see the header."
+  (%parse-plan-markdown text template nil))
+
+(defun plan-template-text (template)
+  (ecase template
+    (:default +default-plan-template+)
+    (:spec +spec-plan-template+)))
+
+(defun %plan-mode-prompt-section (settings)
+  "H5c-0: the plan run's system prompt section: +PLAN-MODE-SECTION+, LF, the
+template of planTemplate."
+  (format nil "~a~%~a" +plan-mode-section+
+          (plan-template-text (or (settings-plan-template settings) :default))))
+
+;;; Revisions.
+
+(defun %write-utf-8 (path text)
+  (ensure-directories-exist path)
+  (p:write-text path text :atomic t))
+
+(defun %set-doc-content (doc text)
+  "Title, steps (all :PENDING) and files from TEXT (already parsed fine)."
+  (multiple-value-bind (title steps files)
+      (%parse-plan-markdown text (plan-document-template doc) doc)
+    (setf (plan-document-title doc) title
+          (plan-document-steps doc) (loop for s in steps for i from 1
+                                          collect (make-plan-step :index i :text s))
+          (plan-document-files doc) files)))
+
+(defun propose-plan-revision (doc markdown &key (author :model) feedback)
+  "→ N, the new revision (see the header)."
+  (check-type author (member :model :user))
+  (%parse-plan-markdown markdown (plan-document-template doc) doc)
+  (let ((n (1+ (plan-document-revision doc))))
+    (%write-utf-8 (%plan-doc-revision-file doc n) markdown)
+    (%write-utf-8 (plan-document-path doc) markdown)
+    (%set-doc-content doc markdown)
+    (setf (plan-document-revision doc) n
+          (plan-document-status doc) :proposed
+          (%doc-extra doc :revisions)
+          (append (%doc-extra doc :revisions)
+                  (list (list :index n :author author :feedback feedback
+                              :recorded-at (get-universal-time)))))
+    (%write-plan-doc-meta doc)
+    n))
+
+(defun %file-octets (path)
+  (with-open-file (s path :element-type '(unsigned-byte 8))
+    (let ((v (make-array (file-length s) :element-type '(unsigned-byte 8))))
+      (read-sequence v s)
+      v)))
+
+(defun sync-plan-document-edits (doc)
+  "→ NIL, or N+1 when plan.md differs from revisions/N.md (a :USER revision)."
+  (let ((n (plan-document-revision doc))
+        (path (plan-document-path doc)))
+    (when (and (plusp n) (probe-file path))
+      (let ((rev (%plan-doc-revision-file doc n)))
+        (unless (and (probe-file rev) (equalp (%file-octets path) (%file-octets rev)))
+          (let ((status (plan-document-status doc))
+                (n2 (propose-plan-revision doc (uiop:read-file-string path :external-format :utf-8)
+                                           :author :user)))
+            ;; an edit of an interrupted plan keeps it approvable
+            (unless (member status '(:drafting :proposed))
+              (setf (plan-document-status doc) status)
+              (%write-plan-doc-meta doc))
+            n2))))))
+
+(defun plan-document-revisions (doc)
+  "→ PLAN-REVISION structs, oldest first."
+  (loop for plist in (%doc-extra doc :revisions)
+        for n = (getf plist :index)
+        for file = (%plan-doc-revision-file doc n)
+        collect (%make-plan-revision
+                 :index n :author (or (getf plist :author) :model)
+                 :markdown (if (probe-file file) (uiop:read-file-string file :external-format :utf-8) "")
+                 :feedback (getf plist :feedback)
+                 :recorded-at (getf plist :recorded-at))))
+
+;;; Approval and execution.
+
+(defun %doc-data-dir (doc)
+  "The data directory DOC lives under (<data>/plan-docs/<key>/<id>/)."
+  (let ((dir (pathname-directory (uiop:ensure-directory-pathname (plan-document-directory doc)))))
+    (make-pathname :directory (butlast dir 3) :name nil :type nil
+                   :defaults (plan-document-directory doc))))
+
+(defun %doc-area (doc)
+  "The exploration area (an open H5a PLAN) of DOC, or NIL when it is gone."
+  (let ((id (plan-document-area-id doc)))
+    (and id
+         (handler-case (reopen-plan (plans-directory (plan-document-project-dir doc)
+                                                     :data-dir (%doc-data-dir doc))
+                                    id)
+           (plan-error () nil)))))
+
+(defun %plan-doc-state-fail (doc action)
+  (error 'plan-document-state-error
+         :document doc :status (plan-document-status doc)
+         :message (format nil "plan ~a is ~(~a~): it cannot be ~a"
+                          (subseq (plan-document-id doc) 0 8) (plan-document-status doc) action)))
+
+(defun %copy-tree (from to)
+  "Copy the files under directory FROM into directory TO."
+  (dolist (file (uiop:directory-files from))
+    (let ((target (uiop:merge-pathnames* (file-namestring file) to)))
+      (ensure-directories-exist target)
+      (uiop:copy-file file target)))
+  (dolist (sub (uiop:subdirectories from))
+    (%copy-tree sub (uiop:merge-pathnames* (format nil "~a/" (car (last (pathname-directory sub))))
+                                           to))))
+
+(defun %discard-doc-area (doc &key keep-scratch)
+  "Copy the area's scratch (KEEP-SCRATCH), reject the area and remove its
+directory (an exploration area is never applied, so nothing of it stays among
+the previews); a lost area is skipped. DOC forgets the area."
+  (let ((area (%doc-area doc)))
+    (when area
+      (when keep-scratch
+        (let ((scratch (uiop:directory-exists-p
+                        (uiop:merge-pathnames* (format nil "~a/" +plan-scratch-directory-name+)
+                                               (plan-root area)))))
+          (when scratch
+            (%copy-tree scratch (%plan-doc-subdir doc "scratch/")))))
+      (reject-plan area)
+      (uiop:delete-directory-tree (uiop:ensure-directory-pathname (plan-directory area))
+                                  :validate t :if-does-not-exist :ignore))
+    (setf (plan-document-area-id doc) nil)))
+
+(defun approve-plan-document (doc &key (mode :accept-edits))
+  "→ DOC, :APPROVED under MODE (see the header)."
+  (unless (member (plan-document-status doc) '(:proposed :interrupted))
+    (%plan-doc-state-fail doc "approved"))
+  (unless (member mode +plan-execution-modes+)
+    (error 'code-usage-error
+           :message (format nil "a plan runs in ~{~a~^, ~}, not ~a"
+                            (mapcar #'permission-mode-name +plan-execution-modes+)
+                            (if (member mode +permission-mode-keywords+)
+                                (permission-mode-name mode)
+                                mode))))
+  (let ((status (plan-document-status doc)))
+    (sync-plan-document-edits doc)
+    (%discard-doc-area doc :keep-scratch t)
+    (setf (plan-document-status doc) :approved
+          (plan-document-execution-mode doc) mode
+          (%doc-extra doc :approved-from) status)
+    (%write-plan-doc-meta doc)
+    doc))
+
+(defun reject-plan-document (doc)
+  "→ :REJECTED, the area discarded."
+  (unless (member (plan-document-status doc) '(:drafting :proposed))
+    (%plan-doc-state-fail doc "rejected"))
+  (%discard-doc-area doc)
+  (setf (plan-document-status doc) :rejected)
+  (%write-plan-doc-meta doc)
+  :rejected)
+
+(defun %doc-scratch-files-p (doc)
+  (let ((dir (uiop:directory-exists-p (%plan-doc-subdir doc "scratch/"))))
+    (and dir (or (uiop:directory-files dir) (uiop:subdirectories dir)) dir)))
+
+(defun plan-execution-prompt (doc &optional extra)
+  "→ the execution turn's user text (see the header)."
+  (with-output-to-string (s)
+    (format s "~a~%~%<plan id=\"~a\" revision=\"~d\">~%~a~%</plan>"
+            +plan-execution-preamble+ (plan-document-id doc) (plan-document-revision doc)
+            (or (plan-document-markdown doc) ""))
+    (let ((scratch (%doc-scratch-files-p doc)))
+      (when scratch
+        (format s "~%~%Scratch files from planning: ~a" (uiop:native-namestring scratch))))
+    (let ((done (loop for step in (plan-document-steps doc)
+                      when (eq :done (plan-step-status step)) collect (plan-step-index step))))
+      (when (and done (or (eq :interrupted (plan-document-status doc))
+                          (eq :interrupted (%doc-extra doc :approved-from))))
+        (format s "~%~%Steps already done: ~{~d~^, ~}" done)))
+    (when (and extra (plusp (length extra)))
+      (format s "~%~%~a" extra))))
+
+(defun set-plan-step (doc index status)
+  "→ the steps, step INDEX (from 1) set to STATUS."
+  (unless (member status +plan-step-statuses+)
+    (error 'plan-document-error :document doc
+                                :message (format nil "bad step status ~s: use pending, in_progress or done"
+                                                 status)))
+  (let* ((steps (plan-document-steps doc))
+         (step (and (integerp index) (find index steps :key #'plan-step-index))))
+    (unless step
+      (error 'plan-document-error :document doc
+                                  :message (format nil "plan has no step ~a (1–~d)" index (length steps))))
+    (setf (plan-step-status step) status)
+    (%write-plan-doc-meta doc)
+    steps))
+
+(defun finish-plan-execution (doc &key changes interrupted)
+  "→ :EXECUTED, or :INTERRUPTED with INTERRUPTED."
+  (declare (ignore changes))
+  (setf (plan-document-status doc) (if interrupted :interrupted :executed))
+  (%write-plan-doc-meta doc)
+  (plan-document-status doc))
+
+(defun %step-mark (status)
+  (ecase status (:pending "☐") (:in-progress "◐") (:done "☑")))
+
+(defun plan-steps-lines (doc)
+  (loop for step in (plan-document-steps doc)
+        collect (format nil "~a ~d. ~a" (%step-mark (plan-step-status step))
+                        (plan-step-index step) (plan-step-text step))))
+
+;;; Plan versus diff.
+
+(defun plan-versus-diff (doc changes)
+  "→ ((path change planned) …) sorted by path."
+  (let ((planned (plan-document-files doc))
+        (rows '()))
+    (dolist (c changes)
+      (push (list (second c) (first c) (and (member (second c) planned :test #'string=) t)) rows))
+    (dolist (path planned)
+      (unless (find path rows :key #'first :test #'string=)
+        (push (list path nil t) rows)))
+    (sort rows #'string< :key #'first)))
+
+(defun %change-letter (kind)
+  (case kind (:added "A") (:removed "D") (:modified "M") (:mode-changed "T") (t " ")))
+
+(defun plan-versus-diff-lines (doc changes)
+  (let ((rows (plan-versus-diff doc changes))
+        (steps (plan-document-steps doc)))
+    (append
+     (list (format nil "plan ~a r~d: ~d of ~d steps done" (subseq (plan-document-id doc) 0 8)
+                   (plan-document-revision doc)
+                   (count :done steps :key #'plan-step-status) (length steps)))
+     (plan-steps-lines doc)
+     (list (format nil "files: ~d planned, ~d changed"
+                   (length (plan-document-files doc)) (length changes)))
+     (loop for (path change planned) in rows
+           collect (format nil "  ~a ~a  ~a" (%change-letter change) path
+                           (cond ((and change planned) "planned")
+                                 (change "not in the plan")
+                                 (t "planned, unchanged")))))))
+
+;;; Save to workspace.
+
+(defun %plan-slug (doc)
+  (let* ((title (string-downcase (or (plan-document-title doc) "")))
+         (slug (with-output-to-string (s)
+                 (let ((dash nil))
+                   (loop for c across title
+                         do (if (or (char<= #\a c #\z) (char<= #\0 c #\9))
+                                (progn (when dash (write-char #\- s)) (setf dash nil)
+                                  (write-char c s))
+                                (setf dash t))))))
+         (slug (string-left-trim "-" slug)))
+    (when (> (length slug) 60)
+      (setf slug (string-right-trim "-" (subseq slug 0 60))))
+    (if (plusp (length slug))
+        slug
+        (format nil "plan-~a" (subseq (plan-document-id doc) 0 8)))))
+
+(defun save-plan-to-workspace (doc &key directory)
+  "→ the pathname written under the project (see the header). DIRECTORY: the
+caller's planSaveDirectory (else +DEFAULT-PLAN-SAVE-DIRECTORY+)."
+  (let* ((rel (or directory +default-plan-save-directory+))
+         (dir (uiop:merge-pathnames* (uiop:parse-unix-namestring rel :ensure-directory t)
+                                     (uiop:ensure-directory-pathname (plan-document-project-dir doc))))
+         (date (multiple-value-bind (sec min hour day month year) (get-decoded-time)
+                 (declare (ignore sec min hour))
+                 (format nil "~4,'0d-~2,'0d-~2,'0d" year month day)))
+         (base (format nil "~a-~a" date (%plan-slug doc)))
+         (text (or (plan-document-markdown doc)
+                   (error 'plan-document-state-error :document doc
+                                                     :status (plan-document-status doc)
+                                                     :message "no plan yet"))))
+    (ensure-directories-exist dir)
+    (loop for i from 1
+          for name = (if (= i 1) (format nil "~a.md" base) (format nil "~a-~d.md" base i))
+          for path = (uiop:merge-pathnames* name dir)
+          unless (probe-file path)
+            do (%write-utf-8 path text)
+               (return path))))
+
+;;; Objects and records.
+
+(defun %status-name (keyword)
+  (substitute #\_ #\- (string-downcase (string keyword))))
+
+(defun %steps-json (doc)
+  (map 'vector (lambda (s)
+                 (%json-object "index" (plan-step-index s) "text" (plan-step-text s)
+                               "status" (%status-name (plan-step-status s))))
+       (plan-document-steps doc)))
+
+(defun plan-document-object (doc)
+  "→ the JSON object of DOC (stream-json, the result's \"plan\", SDK, RPC)."
+  (%json-object "id" (plan-document-id doc)
+                "revision" (plan-document-revision doc)
+                "status" (%status-name (plan-document-status doc))
+                "title" (or (plan-document-title doc) :null)
+                "path" (uiop:native-namestring (plan-document-path doc))
+                "template" (%status-name (plan-document-template doc))
+                "mode" (if (plan-document-execution-mode doc)
+                           (permission-mode-name (plan-document-execution-mode doc))
+                           :null)
+                "steps" (%steps-json doc)
+                "files" (coerce (plan-document-files doc) 'vector)))
+
+(defun plan-document-record (doc &key feedback)
+  "→ (:id :revision :status :author :markdown :feedback) for a turn record."
+  (let ((last (car (last (%doc-extra doc :revisions)))))
+    (list :id (plan-document-id doc)
+          :revision (plan-document-revision doc)
+          :status (plan-document-status doc)
+          :author (or (getf last :author) :model)
+          :markdown (or (plan-document-markdown doc) "")
+          :feedback (or feedback (getf last :feedback)))))
+
+;;; The tools.
+
+(defclass %code-plan-tools (plan-tools)
+  ((feedback :initform nil :accessor %plan-tools-feedback
+             :documentation "The run's prompt when it revises a proposed plan."))
+  (:documentation "The PLAN-TOOLS MAKE-PLAN-TOOLS returns."))
+
+(defparameter +propose-plan-parameters+
+  "{\"type\":\"object\",\"properties\":{\"markdown\":{\"type\":\"string\",\"description\":\"The whole plan as markdown, in the template's form\"}},\"required\":[\"markdown\"]}")
+
+(defparameter +ask-user-parameters+
+  "{\"type\":\"object\",\"properties\":{\"question\":{\"type\":\"string\"},\"options\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"Answers to offer (optional)\"}},\"required\":[\"question\"]}")
+
+(defparameter +update-plan-parameters+
+  "{\"type\":\"object\",\"properties\":{\"step\":{\"type\":\"integer\",\"description\":\"The step number, from 1\"},\"status\":{\"type\":\"string\",\"enum\":[\"pending\",\"in_progress\",\"done\"]}},\"required\":[\"step\",\"status\"]}")
+
+(defun %plan-tool-descriptors (source)
+  (flet ((tool (name description parameters)
+           (llm:make-llm-tool :name name :description description
+                              :parameters (json:decode parameters))))
+    (ecase (plan-tools-phase source)
+      (:plan (list (tool "propose_plan"
+                         "Propose the plan to the user as markdown (the template in the system prompt). The run ends here: the user reviews the plan."
+                         +propose-plan-parameters+)
+                   (tool "ask_user"
+                         "Ask the user a question only they can answer; options are answers to offer."
+                         +ask-user-parameters+)))
+      (:execute (list (tool "update_plan"
+                            "Mark a step of the approved plan: in_progress when you start it, done when it is finished."
+                            +update-plan-parameters+))))))
+
+(defun make-plan-tools (doc &key (phase :plan) ask)
+  (check-type phase (member :plan :execute))
+  (make-instance '%code-plan-tools :document doc :phase phase :ask ask))
+
+(defun %plan-tool-args (arguments)
+  (let ((table (typecase arguments
+                 (string (handler-case (json:decode arguments)
+                           (error () (%tool-input-fail "the arguments are not a JSON object"))))
+                 (t arguments))))
+    (unless (hash-table-p table)
+      (%tool-input-fail "the arguments are not a JSON object"))
+    table))
+
+(defun %propose-plan-call (source arguments)
+  (let* ((doc (plan-tools-document source))
+         (markdown (gethash "markdown" (%plan-tool-args arguments))))
+    (unless (stringp markdown)
+      (%tool-input-fail "propose_plan needs markdown: the plan as a string"))
+    (let ((n (propose-plan-revision doc markdown :feedback (%plan-tools-feedback source))))
+      (agent:make-agent-tool-output
+       :text (format nil "Plan ~a revision ~d saved to ~a. Stop here: the user reviews it now."
+                     (subseq (plan-document-id doc) 0 8) n
+                     (uiop:native-namestring (plan-document-path doc)))
+       :end-run t))))
+
+(defun %ask-user-call (source arguments)
+  (let* ((args (%plan-tool-args arguments))
+         (question (gethash "question" args))
+         (options (gethash "options" args))
+         (options (remove-if-not #'stringp
+                                 (cond ((stringp options) '())
+                                       ((listp options) options)
+                                       ((vectorp options) (coerce options 'list))
+                                       (t '())))))
+    (unless (stringp question)
+      (%tool-input-fail "ask_user needs question: a string"))
+    (let* ((ask (plan-tools-ask source))
+           (answer (and ask (funcall ask question options))))
+      (if (and (stringp answer) (plusp (length answer)))
+          (format nil "The user answered: ~a" answer)
+          +ask-user-unavailable+))))
+
+(defun %update-plan-call (source arguments)
+  (let* ((doc (plan-tools-document source))
+         (args (%plan-tool-args arguments))
+         (step (gethash "step" args))
+         (status (gethash "status" args))
+         (keyword (cond ((equal status "pending") :pending)
+                        ((equal status "in_progress") :in-progress)
+                        ((equal status "done") :done))))
+    (unless keyword
+      (%tool-input-fail "update_plan: status must be pending, in_progress or done"))
+    (set-plan-step doc step keyword)
+    (format nil "~{~a~^~%~}" (plan-steps-lines doc))))
+
+(defmethod agent:list-agent-tools ((source plan-tools) &key context)
+  (declare (ignore context))
+  (%plan-tool-descriptors source))
+
+(defmethod agent:tool-executable-p ((source plan-tools) name &key context)
+  (declare (ignore context))
+  (and (find name (%plan-tool-descriptors source) :key #'llm:llm-tool-name :test #'equal) t))
+
+(defmethod agent:tool-needs-approval-p ((source plan-tools) name arguments &key context)
+  (declare (ignore name arguments context))
+  nil)
+
+(defmethod agent:invoke-tool-async ((source plan-tools) name arguments
+                                    &key context callback error-callback)
+  (let ((handler (and (agent:tool-executable-p source name)
+                      (cond ((equal name "propose_plan") (lambda (a) (%propose-plan-call source a)))
+                            ((equal name "ask_user") (lambda (a) (%ask-user-call source a)))
+                            ((equal name "update_plan") (lambda (a) (%update-plan-call source a)))))))
+    (if handler
+        (agent:invoke-tool-async (agent:make-function-tool :name name :handler handler)
+                                 name arguments
+                                 :context context :callback callback :error-callback error-callback)
+        (call-next-method))))
+
+(defmethod agent:tool-failure-text ((condition plan-format-error) name)
+  (let ((doc (plan-document-error-document condition)))
+    (format nil "~a: the plan is missing ~{~a~^, ~}. Use this template:~%~a"
+            name (plan-format-error-missing condition)
+            (plan-template-text (if doc (plan-document-template doc) :default)))))
+
+(defmethod agent:tool-failure-text ((condition plan-document-error) name)
+  (format nil "~a: ~a" name condition))
+
+;;; ------------------------------------------------------------------
+;;; Host helpers shared by -p, the TUI and the SDK.
+
+(defun %line-plan-doc-record (store &optional (designator +head-ref+))
+  "The newest RECORD-PLAN-DOCUMENT on STORE's DESIGNATOR line, or NIL."
+  (and store
+       (find-if #'identity (reverse (mapcar #'record-plan-document
+                                            (session-records store designator))))))
+
+(defun %session-plan-doc (store project data-dir)
+  "The plan document STORE's head line names last (reopened from disk), or
+NIL when there is none or it is gone."
+  (let ((record (%line-plan-doc-record store)))
+    (and record
+         (handler-case (reopen-plan-document (plan-documents-directory project :data-dir data-dir)
+                                             (getf record :id))
+           (plan-document-not-found () nil)))))
+
+(defun %open-session-plan-doc (store project data-dir settings)
+  "The session's open plan document (:DRAFTING or :PROPOSED), else a new one.
+→ (values doc reopened-p)."
+  (let ((doc (%session-plan-doc store project data-dir)))
+    (if (and doc (member (plan-document-status doc) '(:drafting :proposed)))
+        (values doc t)
+        (values (open-plan-document project :data-dir data-dir
+                                            :session-id (and store (session-id store))
+                                            :template (or (settings-plan-template settings) :default))
+                nil))))
+
+(defun %plan-doc-exploration-area (doc open-area)
+  "DOC's exploration area: reopened by its id, else (OPEN-AREA) → a new H5a
+PLAN whose id DOC records. The model's scratch directory is created. → area."
+  (let ((area (or (%doc-area doc)
+                  (let ((new (funcall open-area)))
+                    (setf (plan-document-area-id doc) (plan-id new))
+                    (%write-plan-doc-meta doc)
+                    new))))
+    (ensure-directories-exist
+     (uiop:merge-pathnames* (format nil "~a/" +plan-scratch-directory-name+) (plan-root area)))
+    area))
+
+(defun %plan-migration-notice-p (data-dir)
+  "True the first time a plan run uses DATA-DIR (0.15.x): the marker
+<data-dir>/notices/plan-mode-0.15 is written then."
+  (let ((marker (uiop:merge-pathnames* "notices/plan-mode-0.15"
+                                       (uiop:ensure-directory-pathname data-dir))))
+    (unless (probe-file marker)
+      (ensure-directories-exist marker)
+      (multiple-value-bind (sec min hour day month year) (get-decoded-time)
+        (declare (ignore sec min hour))
+        (%write-utf-8 marker (format nil "~4,'0d-~2,'0d-~2,'0d~%" year month day)))
+      t)))
+
+(defun %plan-doc-step-plists (doc)
+  (mapcar #'%step-plist (plan-document-steps doc)))
+
+;;; Plan versus the diff of an execution in the project: a snapshot before and
+;;; after the turn (pathlib, :ignore :auto), whatever the checkpoint settings.
+
+(defun %execution-snapshot (project store)
+  (p:fs-snapshot (%local-fs) (uiop:native-namestring (uiop:ensure-directory-pathname project))
+                 :ignore :auto :store store))
+
+(defun %execution-changes (store pre post)
+  "→ (values changes diff-text) from snapshot PRE to POST in STORE."
+  (let ((changes (mapcar (lambda (c) (list (p:fs-change-kind c) (p:fs-change-path c)))
+                         (p:snapshot-changes pre post :store store))))
+    (values changes
+            (if changes
+                (diff:render-diff (%compute-diff (%snapshot-view store pre)
+                                                 (%snapshot-view store post)
+                                                 changes)
+                                  :unified nil)
+                ""))))
+
+(defun %plan-executed-keys (doc changes diff)
+  "The \"executed\" event's keys and values after \"subtype\"."
+  (list "plan_id" (plan-document-id doc)
+        "status" (%status-name (plan-document-status doc))
+        "steps" (%steps-json doc)
+        "changes" (map 'vector (lambda (c)
+                                 (%json-object "path" (second c)
+                                               "kind" (%status-name (first c))))
+                       changes)
+        "rows" (map 'vector (lambda (row)
+                              (destructuring-bind (path change planned) row
+                                (%json-object "path" path
+                                              "change" (if change (%status-name change) :null)
+                                              "planned" (and planned t))))
+                    (plan-versus-diff doc changes))
+        "diff" diff))
+
+;;; Conversation rewinds (H3c / H5b REWIND-TO, conversation part).
+
+(defun %rewind-plan-document (store project data-dir)
+  "After STORE's head moved: the plan document goes back to the latest
+revision on the new head line (plan.md from revisions/N.md, :PROPOSED), or to
+:DRAFTING when the line has none; an :EXECUTED document stays."
+  (let* ((dir (plan-documents-directory project :data-dir data-dir))
+         (docs (remove-if-not (lambda (d) (equal (plan-document-session-id d) (session-id store)))
+                              (list-plan-documents dir)))
+         (record (%line-plan-doc-record store)))
+    (dolist (doc docs)
+      (unless (eq :executed (plan-document-status doc))
+        (let ((n (if (and record (equal (getf record :id) (plan-document-id doc)))
+                     (getf record :revision)
+                     0)))
+          (cond ((and n (plusp n) (probe-file (%plan-doc-revision-file doc n)))
+                 (let ((text (uiop:read-file-string (%plan-doc-revision-file doc n)
+                                                    :external-format :utf-8)))
+                   (%write-utf-8 (plan-document-path doc) text)
+                   (%set-doc-content doc text)
+                   (setf (plan-document-revision doc) n
+                         (plan-document-status doc) :proposed)))
+                (t
+                 (when (probe-file (plan-document-path doc))
+                   (delete-file (plan-document-path doc)))
+                 (setf (plan-document-revision doc) 0
+                       (plan-document-status doc) :drafting
+                       (plan-document-title doc) nil
+                       (plan-document-steps doc) '()
+                       (plan-document-files doc) '())))
+          (%write-plan-doc-meta doc))))))
 
 ;;; Given SDK spellings for the preview (H5a) functions.
 

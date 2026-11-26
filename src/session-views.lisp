@@ -149,7 +149,8 @@ header)."
 
 (defun session-tree-lines (store &key (width 80) marked)
   "→ the /tree lines of STORE (strings; see the file header). MARKED (H5b):
-revision ids whose rows end their message with \" ◆\"."
+revision ids whose rows end their message with \" ◆\". H5c-0: a turn that
+recorded a plan revision N ends its message with \" ✎ rN\"."
   (let* ((all (%all-revisions store))
          (positions (make-hash-table :test 'equal))
          (on-line (make-hash-table :test 'equal))
@@ -164,14 +165,21 @@ revision ids whose rows end their message with \" ◆\"."
     (labels ((children (r)
                (sort (copy-list (rev:revision-children store (rev:revision-id r)))
                      #'< :key (lambda (c) (gethash (rev:revision-id c) positions))))
+             (plan-mark (r)
+               (let ((doc (handler-case (record-plan-document (revision-record r))
+                            (session-error () nil))))
+                 (if (and doc (plusp (or (getf doc :revision) 0)))
+                     (format nil " ✎ r~d" (getf doc :revision))
+                     "")))
              (label (r prefix)
                (let* ((id (rev:revision-id r))
                       (fixed (format nil "~a~a ~a " prefix
                                      (if (gethash id on-line) "●" "○")
                                      (subseq id 0 (min 8 (length id)))))
                       (suffix (concatenate 'string
-                                      (if (member id marked :test #'equal) " ◆" "")
-                                      (if (equal id head-id) "  (head)" "")))
+                                           (plan-mark r)
+                                           (if (member id marked :test #'equal) " ◆" "")
+                                           (if (equal id head-id) "  (head)" "")))
                       (message (or (rev:revision-message r) ""))
                       (line (concatenate 'string fixed message suffix)))
                  (if (> (length line) width)
@@ -276,16 +284,27 @@ prompt cut to 60 characters (59 and \"…\"); with 0 turns the line ends after
 
 (defun export-session (store stream &key (format :markdown) (designator +head-ref+))
   "Write DESIGNATOR's line of STORE to STREAM as FORMAT (:MARKDOWN or :JSON;
-see the file header). → the number of turns written."
+see the file header). → the number of turns written. H5c-0: in markdown, a
+turn that recorded a plan revision is followed by \"### Plan <id8> revision
+N\" and the plan's markdown."
   (let ((line (session-line store designator)))
     (ecase format
       (:markdown
        (let ((blocks (list (format nil "# Session ~a" (session-id store)))))
          (loop for revision in line
                for n from 1
+               for record = (revision-record revision)
+               for doc = (record-plan-document record)
                do (setf blocks (append blocks (list (format nil "## Turn ~d" n))))
-                  (dolist (entry (%record-entries (revision-record revision)))
-                    (setf blocks (append blocks (%markdown-blocks entry)))))
+                  (dolist (entry (%record-entries record))
+                    (setf blocks (append blocks (%markdown-blocks entry))))
+                  (when (and doc (plusp (or (getf doc :revision) 0)))
+                    (setf blocks (append blocks
+                                         (list (format nil "### Plan ~a revision ~d"
+                                                       (subseq (getf doc :id) 0 8)
+                                                       (getf doc :revision))
+                                               (string-right-trim '(#\Newline)
+                                                                  (or (getf doc :markdown) "")))))))
          (format stream "~{~a~^~%~%~}~%" blocks)))
       (:json
        (let ((head (session-head store))

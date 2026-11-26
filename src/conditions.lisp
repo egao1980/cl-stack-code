@@ -170,10 +170,11 @@ read or written, or an operation on a plan that is no longer open. Exit 1.")
                :documentation "The plan id asked for."))
   (:documentation "REOPEN-PLAN: no plan with that id under the plans
 directory, the plan is no longer :OPEN, or its area directory is gone. Exit 2
-(it comes from the command line).")
+(it comes from the command line). H5c-0: user-facing, an H5a plan is a
+preview.")
   (:report (lambda (c s)
              (format s "~a" (or (code-error-message c)
-                                (format nil "no open plan ~a" (plan-not-found-designator c)))))))
+                                (format nil "no open preview ~a" (plan-not-found-designator c)))))))
 
 (define-condition plan-drift (plan-error)
   ((paths :initarg :paths :reader plan-drift-paths :initform '()
@@ -189,7 +190,7 @@ the plan stays open). Unhandled, nothing is written and the plan stays open.
 Exit 1.")
   (:report (lambda (c s)
              (format s "~a" (or (code-error-message c)
-                                (format nil "the working copy changed since plan ~a was opened: ~{~a~^, ~}"
+                                (format nil "the working copy changed since preview ~a was opened: ~{~a~^, ~}"
                                         (let ((p (plan-error-plan c)))
                                           (if p (plan-id p) "?"))
                                         (plan-drift-paths c)))))))
@@ -212,7 +213,7 @@ before each bash and job_input call. Signalled before the model is called and
 before anything runs. Exit 1.")
   (:report (lambda (c s)
              (format s "~a" (or (code-error-message c)
-                                (format nil "plan ~a: no sandbox (~a) and sandbox.failIfUnavailable is set; nothing ran"
+                                (format nil "preview ~a: no sandbox (~a) and sandbox.failIfUnavailable is set; nothing ran"
                                         (let ((p (plan-error-plan c)))
                                           (if p (subseq (plan-id p) 0 8) "?"))
                                         (plan-sandbox-unavailable-reason c)))))))

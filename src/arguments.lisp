@@ -41,6 +41,18 @@ NIL to read the prompt from input (no free argument, or \"-\").")
              :documentation "--on-drift: :ABORT, :REBASE or :OVERWRITE, or NIL (not given).")
    (plan-area :initarg :plan-area :reader invocation-plan-area :initform nil
               :documentation "--plan-area: :AUTO, :GIT or :COPY, or NIL (not given).")
+   (plan-area-deprecated-p :initarg :plan-area-deprecated-p
+                           :reader invocation-plan-area-deprecated-p :initform nil
+                           :documentation "H5c-0: the area kind came from --plan-area (deprecated).")
+   ;; H5c-0
+   (approve-plan-p :initarg :approve-plan-p :reader invocation-approve-plan-p :initform nil
+                   :documentation "--approve-plan: run the resumed session's proposed plan.")
+   (reject-plan-p :initarg :reject-plan-p :reader invocation-reject-plan-p :initform nil
+                  :documentation "--reject-plan: reject the resumed session's plan.")
+   (save-plan-p :initarg :save-plan-p :reader invocation-save-plan-p :initform nil
+                :documentation "--save-plan: save the resumed session's plan to the workspace.")
+   (propose-only-p :initarg :propose-only-p :reader invocation-propose-only-p :initform nil
+                   :documentation "--propose-only: --permission-mode plan.")
    ;; H5b
    (rewind :initarg :rewind :reader invocation-rewind :initform nil
            :documentation "--rewind TURN as given (\"0\", a turn number, or a turn id prefix), or NIL.")
@@ -88,7 +100,7 @@ ours to rebind, so it goes in as :BACKEND)."
            (opt "allowed-tools" "Allow rules TOOL or TOOL(SPEC), comma or space separated; repeatable"
                 :kind :list)
            (opt "disallowed-tools" "Deny rules, same syntax; repeatable" :kind :list)
-           (opt "permission-mode" "default, acceptEdits, bypassPermissions or plan")
+           (opt "permission-mode" "default, acceptEdits, bypassPermissions, plan (explore and propose a plan) or preview (work in a copy, approve the diff)")
            (opt "append-system-prompt" "Text appended to the system prompt")
            (opt "model-param" "Model parameter KEY=VALUE for every model call (VALUE as JSON, else a string), e.g. top_k=20; repeatable"
                 :kind :list)
@@ -99,14 +111,24 @@ ours to rebind, so it goes in as :BACKEND)."
            (opt "fork-session" "With --resume or --continue: continue in a new session" :kind :flag)
            (opt "list-sessions" "Print this project's sessions, newest first" :kind :flag)
            ;; H5a
-           (opt "apply" "Plan mode: apply the projected change (after the run; with --resume and no prompt, at once)"
+           (opt "apply" "Preview mode: apply the projected change (after the run; with --resume and no prompt, at once)"
                 :kind :flag)
            (opt "reject" "With --resume or --continue and no prompt: discard the session's open plan"
                 :kind :flag)
            (opt "on-drift" "With --apply, when the working copy changed under the plan: abort (default), rebase or overwrite")
-           (opt "plan-area" "Plan mode: auto (default), git or copy")
+           (opt "preview-area" "Preview and plan mode: the copy's kind, auto (default), git or copy")
+           (opt "plan-area" "Deprecated alias of --preview-area (until 0.16.0)")
+           ;; H5c-0
+           (opt "approve-plan" "With --resume or --continue: run the session's proposed plan (a prompt adds instructions)"
+                :kind :flag)
+           (opt "reject-plan" "With --resume or --continue and no prompt: reject the session's plan"
+                :kind :flag)
+           (opt "save-plan" "With --resume or --continue and no prompt: save the session's plan under docs/plans/"
+                :kind :flag)
+           (opt "propose-only" "Plan mode: explore and propose a plan (= --permission-mode plan)"
+                :kind :flag)
            ;; R4d-4b
-           (opt "allow-network" "Plan mode: let the confined shell reach the network (sandbox.network allow)"
+           (opt "allow-network" "Plan and preview mode: let the confined shell reach the network (sandbox.network allow)"
                 :kind :flag)
            ;; H3e-1
            (opt "skill-dir" "Another skill directory (holding NAME/SKILL.md), absolute or ~/; repeatable (skillDirs)"
@@ -261,7 +283,19 @@ are present is checked by RUN-CLI, not here."
          :apply-p (and (get-opt :apply) t)
          :reject-p (and (get-opt :reject) t)
          :on-drift (%choice-flag "--on-drift" (get-opt :on-drift) +on-drift-names+)
-         :plan-area (%choice-flag "--plan-area" (get-opt :plan-area) +plan-area-names+)
+         :plan-area (or (%choice-flag "--preview-area" (get-opt :preview-area) +plan-area-names+)
+                        (%choice-flag "--plan-area" (get-opt :plan-area) +plan-area-names+))
+         :plan-area-deprecated-p
+         (and (get-opt :plan-area) (not (get-opt :preview-area)) t)
+         ;; H5c-0
+         :approve-plan-p
+         (and (get-opt :approve-plan) t)
+         :reject-plan-p
+         (and (get-opt :reject-plan) t)
+         :save-plan-p
+         (and (get-opt :save-plan) t)
+         :propose-only-p
+         (and (get-opt :propose-only) t)
          :rewind (get-opt :rewind)
          :rewind-mode (%choice-flag "--rewind-mode" (get-opt :rewind-mode) +rewind-mode-names+)
          :list-checkpoints-p (and (get-opt :list-checkpoints) t)
@@ -271,7 +305,9 @@ are present is checked by RUN-CLI, not here."
          :settings (make-settings
                     :model (get-opt :model)
                     :max-turns (%max-turns (get-opt :max-turns))
-                    :permission-mode (%permission-mode (get-opt :permission-mode))
+                    :permission-mode (or (%permission-mode (get-opt :permission-mode))
+                                         ;; H5c-0: --propose-only is --permission-mode plan
+                                         (and (get-opt :propose-only) :plan))
                     :append-system-prompt (get-opt :append-system-prompt)
                     :allow (%flag-rules (get-opt :allowed-tools) :allow)
                     :deny (%flag-rules (get-opt :disallowed-tools) :deny)
@@ -344,41 +380,84 @@ Whether the sessions exist is checked later (SESSION-NOT-FOUND)."
 ;;; H5a: plan flags.
 
 (defun check-plan-flags (invocation mode)
-  "→ T when INVOCATION's plan flags go together, MODE being the effective
-permission mode (flags over settings); otherwise CODE-USAGE-ERROR:
+  "→ T when INVOCATION's plan and preview flags go together, MODE being the
+effective permission mode (flags over settings); otherwise CODE-USAGE-ERROR.
+H5c-0, plan documents, first:
+  --approve-plan with --reject-plan       → \"--approve-plan and --reject-plan cannot be used together\"
+  --propose-only with --approve-plan      → \"--propose-only and --approve-plan cannot be used together\"
+  --approve-plan / --reject-plan / --save-plan without --resume or --continue
+                                          → \"--X needs --resume or --continue\"
+  --reject-plan / --save-plan with a prompt → \"--X takes no prompt\"
+  --approve-plan with --permission-mode plan
+                                          → \"--approve-plan runs the plan: --permission-mode must be default, acceptEdits, bypassPermissions or preview\"
+  --propose-only with another --permission-mode
+                                          → \"--propose-only is --permission-mode plan\"
+  --apply or --reject in plan mode        → \"--apply and --reject act on a preview: use --permission-mode preview\"
+then H5a's (preview mode):
   --apply with --reject                   → \"--apply and --reject cannot be used together\"
   --reject with a prompt, or without --resume / --continue
                                           → \"--reject needs --resume or --continue and no prompt\"
   --on-drift without --apply or --rewind  → \"--on-drift needs --apply or --rewind\"
-  --apply with a prompt and MODE not :PLAN, or --plan-area with MODE not :PLAN
-                                          → \"--apply and --plan-area need --permission-mode plan\"
-  --allow-network with MODE not :PLAN     → \"--allow-network needs --permission-mode plan\"
+  --apply with a prompt and MODE not :PREVIEW, or --preview-area with MODE
+  neither :PREVIEW nor :PLAN              → \"--apply and --preview-area need --permission-mode preview\"
+  --allow-network with MODE neither :PLAN nor :PREVIEW
+                                          → \"--allow-network needs --permission-mode plan or preview\"
 An action-only invocation (--apply or --reject, --resume or --continue, no
-prompt) does not need plan mode; it acts on the session's open plan."
+prompt) does not need preview mode; it acts on the session's open preview."
   (let* ((apply-p (invocation-apply-p invocation))
          (reject-p (invocation-reject-p invocation))
+         (approve-plan-p (invocation-approve-plan-p invocation))
+         (reject-plan-p (invocation-reject-plan-p invocation))
+         (save-plan-p (invocation-save-plan-p invocation))
+         (propose-only-p (invocation-propose-only-p invocation))
+         (flag-mode (settings-permission-mode (invocation-settings invocation)))
          (prompt (invocation-prompt invocation))
          (resumed (or (invocation-continue-p invocation) (invocation-resume invocation)))
-         (plan-mode-p (eq mode :plan)))
-    (when (and apply-p reject-p)
-      (%usage-fail "--apply and --reject cannot be used together"))
-    (when (and reject-p (or prompt (not resumed)))
-      (%usage-fail "--reject needs --resume or --continue and no prompt"))
-    (when (and (invocation-on-drift invocation) (not apply-p) (not (invocation-rewind invocation)))
-      (%usage-fail "--on-drift needs --apply or --rewind"))
-    (when (and (not plan-mode-p)
-               (or (and apply-p (or prompt (not resumed)))
-                   (invocation-plan-area invocation)))
-      (%usage-fail "--apply and --plan-area need --permission-mode plan"))
-    ;; R4d-4b
-    (when (and (not plan-mode-p) (invocation-allow-network-p invocation))
-      (%usage-fail "--allow-network needs --permission-mode plan"))
+         (action-only (and resumed (null prompt))))
+    ;; H5c-0
+    (when (and approve-plan-p reject-plan-p)
+      (%usage-fail "--approve-plan and --reject-plan cannot be used together"))
+    (when (and propose-only-p approve-plan-p)
+      (%usage-fail "--propose-only and --approve-plan cannot be used together"))
+    (loop for (given flag) in `((,approve-plan-p "--approve-plan") (,reject-plan-p "--reject-plan")
+                                (,save-plan-p "--save-plan"))
+          when (and given (not resumed))
+            do (%usage-fail "~a needs --resume or --continue" flag))
+    (loop for (given flag) in `((,reject-plan-p "--reject-plan") (,save-plan-p "--save-plan"))
+          when (and given prompt)
+            do (%usage-fail "~a takes no prompt" flag))
+    (when (and approve-plan-p (eq flag-mode :plan))
+      (%usage-fail "--approve-plan runs the plan: --permission-mode must be default, acceptEdits, bypassPermissions or preview"))
+    (when (and propose-only-p (not (eq flag-mode :plan)))
+      (%usage-fail "--propose-only is --permission-mode plan"))
+    (when (and (eq mode :plan) (not approve-plan-p) (or apply-p reject-p)
+               (or (not action-only) (eq flag-mode :plan)))
+      (%usage-fail "--apply and --reject act on a preview: use --permission-mode preview"))
+    ;; H5a (preview mode)
+    (let ((preview-p (eq mode :preview)))
+      (when (and apply-p reject-p)
+        (%usage-fail "--apply and --reject cannot be used together"))
+      (when (and reject-p (or prompt (not resumed)))
+        (%usage-fail "--reject needs --resume or --continue and no prompt"))
+      (when (and (invocation-on-drift invocation) (not apply-p) (not (invocation-rewind invocation)))
+        (%usage-fail "--on-drift needs --apply or --rewind"))
+      (when (or (and (not preview-p) apply-p (or prompt (not resumed)))
+                (and (not (member mode '(:plan :preview))) (invocation-preview-area invocation)))
+        (%usage-fail "--apply and --preview-area need --permission-mode preview"))
+      ;; R4d-4b
+      (when (and (not (member mode '(:plan :preview))) (invocation-allow-network-p invocation))
+        (%usage-fail "--allow-network needs --permission-mode plan or preview")))
     t))
 
 (defun invocation-allow-network-p (invocation)
   "R4d-4b: true when INVOCATION has --allow-network (the flag layer's
 sandbox.network \"allow\")."
   (eq :allow (getf (settings-sandbox (invocation-settings invocation)) :network)))
+
+(defun invocation-preview-area (invocation)
+  "H5c-0: --preview-area (or the deprecated --plan-area): :AUTO, :GIT or :COPY,
+or NIL. INVOCATION-PLAN-AREA is H5a's name for it."
+  (invocation-plan-area invocation))
 
 ;;; H5b: rewind flags.
 
@@ -439,12 +518,13 @@ otherwise CODE-USAGE-ERROR, checked in this order:
   --rpc with any of --continue, --resume, --session-id, --fork-session,
   --list-sessions              → \"--rpc opens sessions with session/new and session/resume, not --continue, --resume, --session-id, --fork-session or --list-sessions\"
   --rpc with any of --apply, --reject, --on-drift, --rewind, --rewind-mode,
-  --list-checkpoints           → \"--rpc approves plans and rewinds with plan/approve, plan/reject and rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints\"
+  --list-checkpoints, --approve-plan, --reject-plan, --save-plan
+                               → \"--rpc applies previews with preview/apply, approves plans with plan/approve and rewinds with rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode, --list-checkpoints, --approve-plan, --reject-plan or --save-plan\"
 Every other flag goes with --rpc: --cwd (the default working directory of
 new sessions), --model, --max-turns, --permission-mode, --allowed-tools,
 --disallowed-tools, --append-system-prompt, --model-param, --lisp-image, --lisp-observe
-(the flag layer of every session) and --plan-area (the area kind of plan
-sessions, whatever the mode)."
+(the flag layer of every session) and --preview-area (the area kind of
+preview and plan sessions, whatever the mode)."
   (let ((i invocation))
     (when (invocation-rpc-p i)
       (when (invocation-print-p i)
@@ -458,8 +538,9 @@ sessions, whatever the mode)."
         (%usage-fail "--rpc opens sessions with session/new and session/resume, not --continue, --resume, --session-id, --fork-session or --list-sessions"))
       (when (or (invocation-apply-p i) (invocation-reject-p i) (invocation-on-drift i)
                 (invocation-rewind i) (invocation-rewind-mode i)
-                (invocation-list-checkpoints-p i))
-        (%usage-fail "--rpc approves plans and rewinds with plan/approve, plan/reject and rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode or --list-checkpoints")))
+                (invocation-list-checkpoints-p i) (invocation-approve-plan-p i)
+                (invocation-reject-plan-p i) (invocation-save-plan-p i))
+        (%usage-fail "--rpc applies previews with preview/apply, approves plans with plan/approve and rewinds with rewind, not --apply, --reject, --on-drift, --rewind, --rewind-mode, --list-checkpoints, --approve-plan, --reject-plan or --save-plan")))
     t))
 
 ;;; ACP-2: --acp.
