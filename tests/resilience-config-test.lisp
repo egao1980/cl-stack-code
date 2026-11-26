@@ -231,6 +231,17 @@
   (ok (has "(--turn-timeout)"
            (princ-to-string (make-condition 'turn-timeout :ms 5000 :source "--turn-timeout")))))
 
+(deftest-parametrize turn-timeout-report-seconds
+    ((ms text)
+     :ids ("whole" "half" "hundredths" "float")
+     (4000 "after 4 s (")
+     (1500 "after 1.5 s (")
+     (1250 "after 1.25 s (")
+     (1500.0 "after 1.5 s ("))
+  ;; #60: a decimal, never a ratio ("3/2 s").
+  (let ((report (princ-to-string (make-condition 'turn-timeout :ms ms :source "--turn-timeout"))))
+    (ok (has text report) report)))
+
 (deftest apply-request-timeout-default-is-a-no-op
   (ok (null (apply-request-timeout (llm:make-mock-llm-backend) 30)))
   (let ((b (make-scripted-backend '())))

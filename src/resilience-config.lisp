@@ -234,6 +234,14 @@ limit and the cut tool call was answered with a tool error. Informational.")
              (format s "model output truncated at ~a max tokens"
                      (or (model-output-truncated-max-tokens c) "the")))))
 
+(defun %ms-as-seconds (ms)
+  "→ MS milliseconds as seconds text: \"4\" when whole, else a decimal (\"1.5\"),
+never a ratio (#60)."
+  (let ((ms (round ms)))
+    (if (zerop (mod ms 1000))
+        (princ-to-string (floor ms 1000))
+        (string-right-trim "0" (format nil "~,3f" (/ ms 1000))))))
+
 (define-condition turn-timeout (code-error)
   ((ms :initarg :ms :reader turn-timeout-ms :initform nil)
    (source :initarg :source :reader turn-timeout-source :initform "turnTimeoutMs"
@@ -243,7 +251,7 @@ limit and the cut tool call was answered with a tool error. Informational.")
              (format s "~a" (or (code-error-message c)
                                 (format nil "the turn timed out after ~a s (~a)"
                                         (and (turn-timeout-ms c)
-                                             (/ (turn-timeout-ms c) 1000))
+                                             (%ms-as-seconds (turn-timeout-ms c)))
                                         (turn-timeout-source c)))))))
 
 (defmethod condition-exit-code ((condition model-provider-error)) +exit-model-failure+)
