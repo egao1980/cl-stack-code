@@ -76,7 +76,7 @@
 ;;;                 a mode name: STATE-PERMISSION-MODE, (:set-permission-mode
 ;;;                 MODE), :notice "permission mode: <name>"; anything else:
 ;;;                 :error "unknown permission mode \"X\": use default,
-;;;                 acceptEdits, bypassPermissions, plan"
+;;;                 acceptEdits, bypassPermissions, plan, preview"
 ;;;   /exit         as (:quit)
 ;;;   other         :error "unknown command /X: try /help"
 ;;; While busy only /help and /exit run; /clear, /model and /permissions add
@@ -676,9 +676,7 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
                (t
                 (%add-entry state :kind :error
                                   :text (format nil "unknown permission mode ~s: use ~{~a~^, ~}"
-                                                argument
-                                                ;; H5c-0: the sealed core test (core-permissions) keeps 0.14's list.
-                                                (remove "preview" +permission-mode-names+ :test #'string=)))
+                                                argument +permission-mode-names+))
                 '())))
         (t
          (%add-entry state :kind :error
