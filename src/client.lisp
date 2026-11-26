@@ -752,6 +752,15 @@ MCP-CONFIGS, when given, are the servers exactly (a fork's)."
                                (event:wake-call eb el (lambda ()
                                                         (handler-case (funcall fn)
                                                           (error () nil)))))))
+           ;; H3e-2b: the servers' requests join the session's approvals; the
+           ;; sampler is the session's model.
+           (setf (mcp-manager-broker mcp) (%sdk-mcp-broker client mcp)
+                 (%mcp-sampler mcp) (%mcp-sampler-plist backend (third resolved) designator
+                                                        :providers (%client-providers client)
+                                                        :env env :settings settings
+                                                        :secrets (%run-secrets settings getenv))
+                 (%mcp-rule-store mcp) (make-settings-rule-store
+                                        (third (settings-file-paths dir :user-config-dir config))))
            ;; H3e-1: the session's instruction set (:start or :resume).
            (multiple-value-setq (context discovery instruction-set)
              (%open-session-instructions dir settings store
@@ -975,13 +984,15 @@ close after its result), or NIL."
   (let ((st (%session-state session))
         (client (code-session-client session)))
     (when (and st (not (%s-closed st)))
+      ;; H3e-2b: the servers' requests waiting are answered "closed".
+      (%sdk-withdraw-mcp session st "closed")
       (setf (%s-closed st) t
             (%client-sessions client) (remove session (%client-sessions client)))
       (%interrupt st session)
       (if (eq :idle (%s-state st))
           (progn (%close-session-resources st) nil)
           (progn (setf (%s-close-pending st) t)
-                 (%s-turn st))))))
+            (%s-turn st))))))
 
 (defun client-close-session (session)
   (let* ((client (code-session-client session))
@@ -1724,15 +1735,18 @@ on the loop thread. The watcher only reads the session's state."
        :name "cl-stack-code interrupt"))))
 
 (defun %interrupt (st session)
-  "Loop thread. → T when a turn was running or waiting."
+  "Loop thread. → T when a turn was running or waiting. H3e-2b: the servers'
+requests waiting are withdrawn first (approval_resolved \"interrupt\")."
   (case (%s-state st)
     (:running
+     (%sdk-withdraw-mcp session st "interrupt")
      (setf (%s-interrupted st) t)
      (let ((target (or (%s-run st) (%s-handle st))))
        (when target (agent:cancel-agent-run target)))
      (%stop-foreground-shell st)
      t)
     (:waiting
+     (%sdk-withdraw-mcp session st "interrupt")
      (setf (%s-interrupted st) t)
      (%finish-turn session st (%s-run st) nil)
      t)
@@ -1851,7 +1865,10 @@ on the loop thread. The watcher only reads the session's state."
                (agent:deny-invocation run (car other) :feedback feedback))
              (%push-denial (%s-report st) (car other) "rejected"))
            (dolist (inv (%proposed run))
-             (agent:deny-invocation run inv :feedback feedback)))))
+             (agent:deny-invocation run inv :feedback feedback))
+           ;; H3e-2b: the servers' requests waiting too
+           (dolist (mcp-id (%sdk-reject-all-mcp session st))
+             (push mcp-id resolved)))))
       (%maybe-resume-run session st)
       (nreverse resolved))))
 
@@ -1872,9 +1889,132 @@ on the loop thread. The watcher only reads the session's state."
                                                  :error-callback (%sdk-error-callback session)))
         (error (e) (%finish-turn session st run e))))))
 
+;;; H3e-2b: the servers' requests (src/mcp-requests.lisp). The handler's
+;;; thread waits on the request's %MCP-WAIT; everything below runs on the
+;;; loop thread (the broker only posts here, never %CALLs).
+
+(defun %sdk-session-of-mcp (client manager)
+  "The open session whose manager is MANAGER, or NIL."
+  (find manager (%client-sessions client)
+        :key (lambda (s) (let ((st (%session-state s))) (and st (%s-mcp st))))
+        :test #'eq))
+
+(defun %sdk-mcp-broker (client manager)
+  "The session's broker: PUBLISH emits approval_request and calls ON-APPROVAL,
+REPORT emits the system event; both on the loop thread."
+  (let ((eb (%client-event-backend client))
+        (el (%client-event-loop client)))
+    (flet ((post (fn)
+             (event:wake-call eb el (lambda ()
+                                      (handler-case (funcall fn)
+                                        (error () nil))))))
+      (%make-publishing-broker
+       manager
+       :publish (lambda (wait)
+                  (post (lambda ()
+                          (%sdk-publish-mcp (%sdk-session-of-mcp client manager) wait))))
+       :report (lambda (request event)
+                 (let ((wait (%mcp-find-wait manager (mcp-request-id request))))
+                   (post (lambda ()
+                           (%sdk-mcp-reported (%sdk-session-of-mcp client manager) wait event)))))))))
+
+(defun %sdk-mcp-report-of (session st)
+  "The report MCP events go out through: the running turn's, else the idle one."
+  (if (and (%s-report st) (member (%s-state st) '(:running :waiting :ending)))
+      (%s-report st)
+      (%session-report session)))
+
+(defun %sdk-publish-mcp (session wait)
+  "Loop thread: WAIT's approval_request, then ON-APPROVAL (its value answers at once)."
+  (let* ((request (%mcp-wait-request wait))
+         (st (and session (%session-state session))))
+    (cond ((%mcp-wait-answer wait) nil)
+          ((or (null st) (%s-closed st))
+           (%mcp-wait-resolve wait (%mcp-withdrawn request) :cause "closed"))
+          (t
+           (let* ((report (%sdk-mcp-report-of session st))
+                  (object (mcp-request-object
+                           request :session-id (code-session-id session)
+                           :step (and (member (%s-state st) '(:running :waiting))
+                                      (%s-report st)
+                                      (%report-step (%s-report st))))))
+             (setf (%mcp-wait-object wait) object)
+             (%emit-mcp-object report object)
+             (let ((f (%client-on-approval (code-session-client session))))
+               (when f
+                 (let ((decision (handler-case (funcall f session object)
+                                   (error () nil))))
+                   (when decision
+                     (handler-case (%sdk-answer-mcp session st (mcp-request-id request)
+                                                    decision nil nil)
+                       (error () nil)))))))))))
+
+(defun %sdk-mcp-resolved (session st wait decision)
+  "One approval_resolved for WAIT (once)."
+  (unless (%mcp-wait-emitted wait)
+    (setf (%mcp-wait-emitted wait) t)
+    (%emit-event (%sdk-mcp-report-of session st) "approval_resolved"
+                 "id" (mcp-request-id (%mcp-wait-request wait))
+                 "decision" decision)))
+
+(defun %sdk-reject-all-mcp (session st)
+  "Loop thread: every published MCP request answered \"reject_all\" → their ids."
+  (loop for wait in (%mcp-waiting-published (%s-mcp st))
+        for request = (%mcp-wait-request wait)
+        when (%mcp-wait-resolve wait (if (eq :sampling (mcp-request-kind request)) :reject :decline))
+          do (%sdk-mcp-resolved session st wait "reject_all")
+          and collect (mcp-request-id request)))
+
+(defun %sdk-withdraw-mcp (session st cause)
+  "Loop thread: interrupt / close: every waiting request withdrawn; the
+published ones get approval_resolved CAUSE now."
+  (let ((m (%s-mcp st)))
+    (when m
+      (let ((published (%mcp-waiting-published m)))
+        (%mcp-answer-all m cause)
+        (dolist (wait published)
+          (%sdk-mcp-resolved session st wait cause))))))
+
+(defun %sdk-answer-mcp (session st id decision feedback content &optional cause)
+  "Loop thread: CLIENT-RESPOND-APPROVAL of an MCP request → the ids resolved."
+  (let ((m (%s-mcp st)))
+    (if (eq decision :reject-all)
+        (progn
+          (unless (find id (%mcp-waiting-published m)
+                        :key (lambda (w) (mcp-request-id (%mcp-wait-request w))) :test #'equal)
+            (error 'approval-not-found :id id))
+          (append (%sdk-reject-all-mcp session st)
+                  ;; The tool calls waiting too ("every waiting call and request").
+                  (let ((entry (first (%s-pending st))))
+                    (and entry (%s-run st) (eq :waiting (%s-state st))
+                         (%respond session st (agent:agent-invocation-id (car entry))
+                                   :reject-all feedback)))))
+        (multiple-value-bind (wait name)
+            (%mcp-answer m id decision :content content :feedback feedback :cause cause)
+          (%sdk-mcp-resolved session st wait name)
+          (list id)))))
+
+(defun %sdk-respond-mcp (session id decision &key feedback content cause)
+  "%RESPOND-MCP-REQUEST's SDK side. CAUSE (internal, ACP's fallback): the
+event's reason, \"unsupported\" or \"headless\"."
+  (%on-client-loop ((code-session-client session))
+    (%sdk-answer-mcp session (%live session) id decision feedback content cause)))
+
+(defun %sdk-mcp-reported (session wait event)
+  "Loop thread: a request was answered: its approval_resolved when nobody sent
+one yet (a connection closed), then the system event."
+  (let ((st (and session (%session-state session))))
+    (when (and st (not (%s-closed st)))
+      (when (and wait (%mcp-wait-object wait))
+        (%sdk-mcp-resolved session st wait (or (fourth (%mcp-wait-answer wait)) "closed")))
+      (%emit-mcp-object (%sdk-mcp-report-of session st) event))))
+
 (defun client-pending-approvals (session)
   (%on-client-loop ((code-session-client session))
-    (mapcar #'cdr (%s-pending (%live session)))))
+    (let ((st (%live session)))
+      (append (mapcar #'cdr (%s-pending st))
+              ;; H3e-2b: the servers' requests waiting for an answer
+              (mapcar #'%mcp-wait-object (%mcp-waiting-published (%s-mcp st)))))))
 
 (defun client-respond-approval (session id decision &key feedback content)
   ;; H3e-2b: an MCP request id (src/mcp-requests.lisp) is answered there;

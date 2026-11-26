@@ -297,6 +297,8 @@ RPC-PROTOCOL:RPC-ERROR (checked before the table) keeps its own code.")
     (subscription-not-found (list "subscription" (%null (subscription-not-found-id condition))))
     ;; H3e-2a
     (mcp-server-not-found (list "server" (%null (mcp-server-not-found-server condition))))
+    (mcp-elicitation-content-error
+     (list "errors" (coerce (mcp-elicitation-content-error-errors condition) 'vector)))
     ;; H3f
     (model-error (list "error_class" (string-downcase (symbol-name (type-of condition)))
                        "status" (%null (let ((cause (model-error-cause condition)))
@@ -490,13 +492,16 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
                                     (cons :member (mapcar #'car +approval-decision-names+))
                                     :required t))
                   (feedback (%param method params "feedback" :string))
+                  ;; H3e-2b: an elicitation's accepted content
+                  (content (%param method params "content" :object))
                   (session (%session-param client method params)))
              (%json-object "resolved"
                            (coerce (client-respond-approval
                                     session id
                                     (cdr (assoc decision +approval-decision-names+
                                                 :test #'string=))
-                                    :feedback feedback)
+                                    :feedback feedback
+                                    :content content)
                                    'vector)))))
    (cons "plan/approve"
          (lambda (client method params)

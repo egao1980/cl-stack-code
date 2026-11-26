@@ -132,7 +132,7 @@ mode section and the template). → list of two strings."
               +plan-mode-feedback+))))
 
 (defun assemble-system-prompt (cwd &key tools backend settings user-config-dir plan lisp-image
-                                     sandbox context instruction-set)
+                                   sandbox context instruction-set)
   "→ (values prompt files). Sections joined by one blank line: steer's
 BUILD-SYSTEM-PROMPT for TOOLS (offered names) and BACKEND, the # Environment
 section, each instruction file as <instructions path=\"…\">…</instructions>,
@@ -152,16 +152,19 @@ SKILL-LISTING-SECTION of CONTEXT-SKILLS (when there are skills), then
 SETTINGS-APPEND-SYSTEM-PROMPT. → (values prompt files context): FILES is
 CONTEXT-FILES. With INSTRUCTION-SET (an INSTRUCTION-SET with a current
 revision), those blocks are INSTRUCTION-SET-BLOCKS of its current revision
-instead (a rewound or resumed session renders the set it continues). "
+instead (a rewound or resumed session renders the set it continues).
+H3e-2b: with INSTRUCTION-SET, MCP-INSTRUCTION-BLOCKS of its current revision
+are the last sections (src/mcp-context.lisp); everything before them is as
+without servers."
   (let* ((settings (or settings (make-settings)))
          (cwd (%truename-directory cwd))
          (context (or context
                       (load-instruction-context cwd :settings settings
                                                     :user-config-dir user-config-dir)))
          (files (context-files context))
-         (blocks (if (and instruction-set (instruction-set-current instruction-set))
-                     (instruction-set-blocks (instruction-set-store instruction-set)
-                                             (instruction-set-current instruction-set))
+         (current (and instruction-set (instruction-set-current instruction-set)))
+         (blocks (if current
+                     (instruction-set-blocks (instruction-set-store instruction-set) current)
                      (%context-blocks context)))
          (append-prompt (settings-append-system-prompt settings))
          (sections (append
@@ -174,7 +177,10 @@ instead (a rewound or resumed session renders the set it continues). "
                     (and lisp-image (%lisp-image-sections lisp-image settings))
                     blocks
                     (and append-prompt (plusp (length append-prompt))
-                         (list append-prompt)))))
+                         (list append-prompt))
+                    ;; H3e-2b: the servers' instructions, last
+                    (and current
+                         (mcp-instruction-blocks (instruction-set-store instruction-set) current)))))
     (values (format nil "~{~a~^~%~%~}" sections) files context)))
 
 (defun %context-blocks (context)

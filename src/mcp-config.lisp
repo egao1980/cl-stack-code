@@ -706,12 +706,8 @@ way round; :LATER → nothing. Other keys of the file are kept. → the file."
                     +default-mcp-tool-timeout-ms+)))
       (values (/ startup 1000) (/ tool 1000)))))
 
-;;; H3e-2b: the new keys (the header's rules). Given: the constants and the
-;;; pending marker; stubbed: the parsers and the readers.
-
-(defun %h3e2b-pending (what)
-  "Every H3e-2b stub calls this (team-solve's implementation removes it)."
-  (error 'code-error :message (format nil "H3e-2b: ~a is not implemented yet" what)))
+;;; H3e-2b: the new keys (the header's rules). Given: the constants; then
+;;; the parsers and the readers.
 
 (defparameter +default-mcp-sampling-max-tokens+ 4096
   "The maxTokens cap of a server's sampling request when its config sets none.")
@@ -723,26 +719,72 @@ way round; :LATER → nothing. Other keys of the file are kept. → the file."
 
 (defun %parse-mcp-server-extras (name object file)
   "The H3e-2b keys of server NAME's OBJECT → initargs (see the header)."
-  (declare (ignore name object file))
-  (%h3e2b-pending "%parse-mcp-server-extras"))
+  (let ((out '()))
+    (multiple-value-bind (value present) (%json-present object "sampling")
+      (when present
+        (setf (getf out :sampling)
+              (cond ((eq value t) (list :model nil :max-tokens nil))
+                    ((null value) nil)
+                    ((hash-table-p value)
+                     (let ((model (multiple-value-bind (m p) (%json-present value "model")
+                                    (when (and p (not (stringp m)))
+                                      (%settings-fail file (%mcp-server-key name "sampling.model")
+                                                      "must be a string"))
+                                    (and p m)))
+                           (max (multiple-value-bind (m p) (%json-present value "maxTokens")
+                                  (when (and p (not (%mcp-ms-p m)))
+                                    (%settings-fail file (%mcp-server-key name "sampling.maxTokens")
+                                                    "must be an integer >= 1"))
+                                  (and p m))))
+                       (list :model model :max-tokens max)))
+                    (t (%settings-fail file (%mcp-server-key name "sampling")
+                                       "must be true, false or an object"))))))
+    (loop for (key indicator) in '(("elicitation" :elicitation)
+                                   ("includeInstructions" :include-instructions)
+                                   ("alwaysLoad" :always-load))
+          do (multiple-value-bind (value present) (%json-present object key)
+               (when present
+                 (unless (%mcp-boolean-p value)
+                   (%settings-fail file (%mcp-server-key name key) "must be true or false"))
+                 (setf (getf out indicator) (and value t)))))
+    out))
 
 (defun %parse-mcp-search-keys (file object)
   "\"mcpToolSearch\" / \"mcpToolSearchThreshold\" of OBJECT → plist (see the header)."
-  (declare (ignore file object))
-  (%h3e2b-pending "%parse-mcp-search-keys"))
+  (let ((out '()))
+    (multiple-value-bind (value present) (%json-present object "mcpToolSearch")
+      (when present
+        (setf (getf out :tool-search)
+              (or (and (stringp value)
+                       (find value +mcp-tool-search-modes+
+                             :key (lambda (mode) (string-downcase (symbol-name mode)))
+                             :test #'string=))
+                  (%settings-fail file "mcpToolSearch"
+                                  "must be \"auto\", \"always\" or \"never\"")))))
+    (multiple-value-bind (value present) (%json-present object "mcpToolSearchThreshold")
+      (when present
+        (unless (and (integerp value) (>= value 0))
+          (%settings-fail file "mcpToolSearchThreshold" "must be an integer >= 0"))
+        (setf (getf out :tool-search-threshold) value)))
+    out))
 
 (defun mcp-sampling-settings (config)
   "→ (values enabled-p model max-tokens) of CONFIG (see the header)."
-  (declare (ignore config))
-  (%h3e2b-pending "mcp-sampling-settings"))
+  (let ((sampling (mcp-server-config-sampling config)))
+    (values (and sampling t)
+            (getf sampling :model)
+            (or (getf sampling :max-tokens) +default-mcp-sampling-max-tokens+))))
 
 (defun mcp-server-includes-instructions-p (config &key (approval :approved))
   "True when CONFIG's server instructions may join the system prompt; APPROVAL
 is MCP-SERVER-APPROVAL's value for project and local servers (see the header)."
-  (declare (ignore config approval))
-  (%h3e2b-pending "mcp-server-includes-instructions-p"))
+  (let ((include (mcp-server-config-include-instructions config)))
+    (if (mcp-server-trusted-p config)
+        (and include t)
+        (and (eq include t) (eq approval :approved)))))
 
 (defun mcp-tool-search-settings (settings)
   "→ (values mode threshold) of SETTINGS's MCP plist (see the header)."
-  (declare (ignore settings))
-  (%h3e2b-pending "mcp-tool-search-settings"))
+  (let ((plist (and settings (settings-mcp settings))))
+    (values (or (getf plist :tool-search) :auto)
+            (or (getf plist :tool-search-threshold) +default-mcp-tool-search-threshold+))))

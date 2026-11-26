@@ -120,23 +120,50 @@
 
 (defun mcp-connection-instructions (connection)
   "→ CONNECTION's server instructions for the prompt, or NIL."
-  (declare (ignore connection))
-  (%h3e2b-pending "mcp-connection-instructions"))
+  (let ((client (mcp-connection-client connection)))
+    (when (and client
+               (eq :connected (mcp-connection-status connection))
+               ;; Only approved project and local servers connect.
+               (mcp-server-includes-instructions-p (mcp-connection-config connection)
+                                                   :approval :approved))
+      (let ((text (mcp-protocol:mcp-client-instructions client)))
+        (when (stringp text)
+          (let ((trimmed (string-trim '(#\Space #\Tab #\Return #\Newline #\Page) text)))
+            (cond ((zerop (length trimmed)) nil)
+                  ((> (length trimmed) +max-mcp-instructions-chars+)
+                   (format nil "~a~%[truncated]" (subseq trimmed 0 +max-mcp-instructions-chars+)))
+                  (t trimmed))))))))
 
 (defun mcp-instruction-block (name text)
   "→ the <mcp-instructions server=\"NAME\"> block of TEXT."
-  (declare (ignore name text))
-  (%h3e2b-pending "mcp-instruction-block"))
+  (format nil "<mcp-instructions server=\"~a\">~%~a~%</mcp-instructions>"
+          (with-output-to-string (s)
+            (loop for c across name
+                  do (case c
+                       (#\& (write-string "&amp;" s))
+                       (#\< (write-string "&lt;" s))
+                       (#\> (write-string "&gt;" s))
+                       (#\" (write-string "&quot;" s))
+                       (t (write-char c s)))))
+          text))
 
 (defun mcp-instruction-blocks (store id)
   "→ the MCP instruction blocks of revision ID of STORE, in snapshot order."
-  (declare (ignore store id))
-  (%h3e2b-pending "mcp-instruction-blocks"))
+  (loop for entry in (cdr (assoc :mcp-servers (read-instruction-set store id)))
+        for hash = (getf entry :instructions)
+        when hash
+          collect (mcp-instruction-block (getf entry :name) (instruction-text store hash))))
 
 (defun mcp-tool-search-object (manager)
   "→ the init event's \"mcp_tool_search\" object of MANAGER."
-  (declare (ignore manager))
-  (%h3e2b-pending "mcp-tool-search-object"))
+  (multiple-value-bind (mode threshold) (mcp-tool-search-settings (mcp-manager-settings manager))
+    (let ((deferred (%mcp-deferred-source manager)))
+      (%json-object "mode" (string-downcase (symbol-name mode))
+                    "threshold" threshold
+                    "active" (and deferred (agent:deferred-tool-source-active-p deferred) t)
+                    "deferred" (if deferred
+                                   (length (agent:deferred-tool-source-deferred deferred))
+                                   0)))))
 
 ;;; Exports.
 

@@ -52,31 +52,82 @@
 ;;;   request_permission.
 ;;; tool_search (src/mcp-context.lisp): TOOL-KIND "tool_search" → "search".
 
+(defun %sampling-messages-text (input)
+  "The sampling request's messages, one \"ROLE: TEXT\" line each, the system
+prompt first as \"system: TEXT\"."
+  (let ((system (code:event-value input "system_prompt"))
+        (messages (code:event-value input "messages")))
+    (format nil "~{~a~^~%~}"
+            (append (and (stringp system) (list (format nil "system: ~a" system)))
+                    (map 'list (lambda (m)
+                                 (format nil "~a: ~a" (code:event-value m "role")
+                                         (or (code:event-value m "text") "")))
+                         (if (typep messages 'sequence) messages #()))))))
+
 (defun mcp-sampling-tool-call (object)
   "→ the UPDATE-TOOL-CALL announcing the sampling approval_request OBJECT."
-  (declare (ignore object))
-  (code::%h3e2b-pending "mcp-sampling-tool-call"))
+  (let ((input (code:event-value object "input")))
+    (acp:make-acp 'acp:update-tool-call
+                  :tool-call-id (code:event-value object "id")
+                  :title (code:event-value object "summary")
+                  :kind "other"
+                  :status "pending"
+                  :raw-input input
+                  :content (%result-text-content (%sampling-messages-text input)))))
 
 (defun mcp-sampling-permission-tool-call (object)
   "→ the TOOL-CALL-UPDATE of OBJECT's session/request_permission."
-  (declare (ignore object))
-  (code::%h3e2b-pending "mcp-sampling-permission-tool-call"))
+  (acp:make-acp 'acp:tool-call-update
+                :tool-call-id (code:event-value object "id")
+                :title (code:event-value object "summary")
+                :kind "other"
+                :status "pending"
+                :raw-input (code:event-value object "input")))
 
 (defun mcp-request-updates (event &key announced)
   "→ the session/update objects for a system event of subtype mcp_sampling /
 mcp_elicitation (see the header); ANNOUNCED: the request ids announced so far."
-  (declare (ignore event announced))
-  (code::%h3e2b-pending "mcp-request-updates"))
+  (when (and (equal "system" (code:event-type event))
+             (equal code:+mcp-sampling-action+ (code:event-value event "subtype")))
+    (let* ((id (code:event-value event "request_id"))
+           (status (if (member (code:event-value event "outcome") '("allowed" "approved")
+                               :test #'equal)
+                       "completed"
+                       "failed"))
+           (notice (code:mcp-request-notice event)))
+      (list (if (member id announced :test #'equal)
+                (acp:make-acp 'acp:update-tool-call-update
+                              :tool-call-id id
+                              :status status
+                              :content (%result-text-content notice))
+                (acp:make-acp 'acp:update-tool-call
+                              :tool-call-id id
+                              :title notice
+                              :kind "other"
+                              :status status
+                              :content (%result-text-content notice)))))))
 
 (defun elicitation-create-request (object session-id)
   "→ the CREATE-ELICITATION-REQUEST for the elicitation approval_request OBJECT."
-  (declare (ignore object session-id))
-  (code::%h3e2b-pending "elicitation-create-request"))
+  (let ((input (code:event-value object "input"))
+        (tool-use-id (code:event-value object "tool_use_id")))
+    (acp:make-acp 'acp:create-elicitation-request
+                  :mode "form"
+                  :message (format nil "MCP server ~a asks: ~a"
+                                   (code:event-value object "server")
+                                   (or (code:event-value input "message") ""))
+                  :requested-schema (code:event-value input "requested_schema")
+                  :session-id session-id
+                  :tool-call-id (and (stringp tool-use-id) tool-use-id))))
 
 (defun elicitation-response-decision (response)
   "→ (values decision content) of a CREATE-ELICITATION-RESPONSE."
-  (declare (ignore response))
-  (code::%h3e2b-pending "elicitation-response-decision"))
+  (let ((action (%slot response 'acp:action)))
+    (cond ((equal action "accept")
+           (let ((content (%slot response 'acp:content)))
+             (values :accept (if (hash-table-p content) content (make-hash-table :test 'equal)))))
+          ((equal action "cancel") (values :cancel nil))
+          (t (values :decline nil)))))
 
 (export '(mcp-sampling-tool-call mcp-sampling-permission-tool-call mcp-request-updates
           elicitation-create-request elicitation-response-decision))

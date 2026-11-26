@@ -176,7 +176,9 @@
         when (member key '(:on-event :on-approval))
           do (error 'code:code-usage-error
                     :message (format nil "MAKE-CODE-ACP-AGENT: ~s is the agent's own" key)))
-  (let ((client (apply #'code:make-client :on-event nil :on-approval nil client-args)))
+  ;; H3e-2b: ON-APPROVAL answers an MCP request that comes while no prompt runs.
+  (let ((client (apply #'code:make-client :on-event nil :on-approval (%idle-mcp-answerer)
+                       client-args)))
     (let ((agent (make-instance 'code-acp-agent
                                 :client client
                                 :info (acp:make-acp 'acp:implementation
@@ -638,14 +640,74 @@ Calls a previous answer resolved already (:always, :reject-all) ask nothing."
                 (setf (gethash resolved answered) t))
             (code:approval-not-found () nil)))))))
 
+;;; H3e-2b: an MCP server's requests (src/acp/requests.lisp), asked from the
+;;; prompt thread.
+
+(defun %answer-mcp-request (session id decision &key content cause)
+  "CLIENT-RESPOND-APPROVAL for an MCP request; a request no longer waiting is
+not an error here (the turn moved on). CAUSE: the event's reason."
+  (handler-case (code::%sdk-respond-mcp session id decision :content content :cause cause)
+    (code:approval-not-found () nil)))
+
+(defun %ask-mcp-sampling (as event)
+  "A sampling request: its tool call, then session/request_permission."
+  (let ((sid (courier-session-id (%asess-courier as)))
+        (id (code:event-value event "id")))
+    (acp:acp-send-update acp:*acp-remote* sid (mcp-sampling-tool-call event))
+    (let ((decision (permission-kind-decision
+                     (acp:acp-ask-permission acp:*acp-remote* sid
+                                             (mcp-sampling-permission-tool-call event)
+                                             +acp-permission-options+))))
+      ;; A cancelled outcome answers nothing: the cancel interrupts, which rejects it.
+      (when decision
+        (%answer-mcp-request (%asess-session as) id decision)))))
+
+(defun %ask-mcp-elicitation (as event)
+  "An elicitation request: elicitation/create when the editor renders forms,
+else declined at once (reason \"unsupported\")."
+  (let ((session (%asess-session as))
+        (id (code:event-value event "id")))
+    (if (acp:client-supports-p (%asess-caps as) :elicitation-form)
+        (multiple-value-bind (decision content)
+            (handler-case
+                (elicitation-response-decision
+                 (acp:acp-create-elicitation acp:*acp-remote*
+                                             (elicitation-create-request
+                                              event (courier-session-id (%asess-courier as)))))
+              ;; The editor does not implement it, or failed: declined.
+              (error () (values :decline nil)))
+          (handler-case (%answer-mcp-request session id decision :content content)
+            ;; Content that does not match the schema is declined.
+            (code:mcp-elicitation-content-error ()
+              (%answer-mcp-request session id :decline))))
+        (%answer-mcp-request session id :decline :cause "unsupported"))))
+
+(defun %idle-mcp-answerer ()
+  "The client's ON-APPROVAL: an MCP request of a session with no prompt
+running is answered as headless -p answers it. Loop thread; → NIL (it
+answers itself, with the reason)."
+  (lambda (session object)
+    (let ((kind (code:event-value object "kind"))
+          (st (code::%session-state session)))
+      (when (and st
+                 (member kind (list code:+mcp-sampling-action+ code:+mcp-elicitation-action+)
+                         :test #'equal)
+                 (not (member (code::%s-state st) '(:running :waiting :ending))))
+        (code::%sdk-answer-mcp session st (code:event-value object "id")
+                               (if (equal kind code:+mcp-sampling-action+) :reject :decline)
+                               nil nil "headless"))
+      nil)))
+
 (defun %pump (agent as)
   "Pump AS's courier on this (the prompt's) thread until the turn's result.
 → (values result proposal): PROPOSAL is the propose_plan call id when the
-turn proposed a plan (its \"plan\" \"proposed\" event), else NIL."
+turn proposed a plan (its \"plan\" \"proposed\" event), else NIL. H3e-2b: an
+MCP server's requests are asked from here too (src/acp/requests.lisp)."
   (let ((courier (%asess-courier as))
         (client (code-acp-agent-client agent))
         (answered (make-hash-table :test 'equal))
         (diffs (make-hash-table :test 'equal))
+        (announced '())
         (propose-id nil)
         (proposed nil))
     (loop
@@ -656,7 +718,9 @@ turn proposed a plan (its \"plan\" \"proposed\" event), else NIL."
              (error 'acp:acp-internal-error :message "The agent closed during the turn")))
           ((eq :call (first item)) (courier-run-call courier item))
           (t (destructuring-bind (event diff) (rest item)
-               (let ((type (code:event-type event)))
+               (let ((type (code:event-type event))
+                     (kind (code:event-value event "kind"))
+                     (subtype (code:event-value event "subtype")))
                  (when (and (equal type "tool_use")
                             (equal "propose_plan" (code:event-value event "name")))
                    (setf propose-id (code:event-value event "id")))
@@ -665,6 +729,17 @@ turn proposed a plan (its \"plan\" \"proposed\" event), else NIL."
                    (setf proposed t))
                  (cond ((equal type "result")
                         (return (values event (and proposed (or propose-id "propose_plan")))))
+                       ;; H3e-2b
+                       ((and (equal type "approval_request") (equal kind code:+mcp-sampling-action+))
+                        (push (code:event-value event "id") announced)
+                        (%ask-mcp-sampling as event))
+                       ((and (equal type "approval_request") (equal kind code:+mcp-elicitation-action+))
+                        (%ask-mcp-elicitation as event))
+                       ((and (equal type "system")
+                             (member subtype (list code:+mcp-sampling-action+ code:+mcp-elicitation-action+)
+                                     :test #'equal))
+                        (dolist (update (mcp-request-updates event :announced announced))
+                          (acp:acp-send-update acp:*acp-remote* (courier-session-id courier) update)))
                        ((equal type "approval_request") (%ask as event answered diffs))
                        (t (%send-event as event diff diffs)))))))))))
 

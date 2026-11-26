@@ -766,6 +766,14 @@ whose AGENT-INVOCATION-STATUS is still :proposed."
             (ecase kind
               (:submit (%submit state (first args)))
               (:interrupt (cond ((state-approvals state) (%reply state :reject-all nil))
+                                ;; H3e-2b: a server's request queued: Esc answers the first
+                                ((state-mcp-requests state)
+                                 (let ((first (first (state-mcp-requests state))))
+                                   (%mcp-request-event state
+                                                       (list :mcp-request-reply (gethash "id" first)
+                                                             (if (equal +mcp-sampling-action+ (gethash "kind" first))
+                                                                 :reject
+                                                                 :cancel)))))
                                 ;; H5c-0
                                 ((state-plan-document-prompt state) (%plan-doc-event state event))
                                 ((state-plan-prompt state) (%plan-event state event))
