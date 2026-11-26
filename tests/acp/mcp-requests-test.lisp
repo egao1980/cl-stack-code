@@ -162,43 +162,55 @@ or NIL for the default (-32601, as acp-protocol's).")
 (deftest acp-h3e2b-elicitation-loopback
   (with-project (project config :base base) '()
     (%f2-settings config base)
-    (let ((*elicitation-answer* (list "accept" (args "colour" "blue"))))
-      (with-loopback (ra client project config :caps *zed-client-caps*
-                      :settings (%allow "mcp__f2__ask_user")
-                      :steps (list (%f2-call "ask_user") "Done."))
-        (let ((sid (req (new-session-id ra project))))
-          (ok (equal "end_turn" (req (stop-reason ra sid "ask me"))))
-          (let ((calls (client-calls client "elicitation/create")))
-            (ok (= 1 (length calls)) "elicitation/create on the editor")
-            (when calls
-              (let ((r (cdr (first calls))))
-                (ok (equal "form" (slot r 'acp:mode)))
-                (ok (equal "MCP server f2 asks: Which colour?" (slot r 'acp:message)))
-                (ok (equal sid (slot r 'acp:session-id)))
-                (ok (equal "call-1-1" (slot r 'acp:tool-call-id))))))
-          (ok (has "elicited: accept colour=blue" (%tool-text client "call-1-1"))))))))
+    (unwind-protect
+        (progn
+          ;; Global, not LET: the recording client answers on its own thread.
+          (setf *elicitation-answer* (list "accept" (args "colour" "blue")))
+          (with-loopback (ra client project config :caps *zed-client-caps*
+                                                   :settings (%allow "mcp__f2__ask_user")
+                                                   :steps (list (%f2-call "ask_user") "Done."))
+            (let ((sid (req (new-session-id ra project))))
+              (ok (equal "end_turn" (req (stop-reason ra sid "ask me"))))
+              (let ((calls (client-calls client "elicitation/create")))
+                (ok (= 1 (length calls)) "elicitation/create on the editor")
+                (when calls
+                  (let ((r (cdr (first calls))))
+                    (ok (equal "form" (slot r 'acp:mode)))
+                    (ok (equal "MCP server f2 asks: Which colour?" (slot r 'acp:message)))
+                    (ok (equal sid (slot r 'acp:session-id)))
+                    (ok (equal "call-1-1" (slot r 'acp:tool-call-id))))))
+              (ok (has "elicited: accept colour=blue" (%tool-text client "call-1-1"))))))
+      (setf *elicitation-answer* nil))))
 
 (deftest acp-h3e2b-elicitation-invalid-answer
   (with-project (project config :base base) '()
     (%f2-settings config base)
-    (let ((*elicitation-answer* (list "accept" (args "colour" "pink"))))
-      (with-loopback (ra client project config :caps *zed-client-caps*
-                      :settings (%allow "mcp__f2__ask_user")
-                      :steps (list (%f2-call "ask_user") "Done."))
-        (let ((sid (req (new-session-id ra project))))
-          (req (stop-reason ra sid "ask me"))
-          (ok (has "elicited: decline" (%tool-text client "call-1-1"))
-              "content that does not match the schema is declined"))))))
+    (unwind-protect
+        (progn
+          ;; Global, not LET: the recording client answers on its own thread.
+          (setf *elicitation-answer* (list "accept" (args "colour" "pink")))
+          (with-loopback (ra client project config :caps *zed-client-caps*
+                                                   :settings (%allow "mcp__f2__ask_user")
+                                                   :steps (list (%f2-call "ask_user") "Done."))
+            (let ((sid (req (new-session-id ra project))))
+              (req (stop-reason ra sid "ask me"))
+              (ok (has "elicited: decline" (%tool-text client "call-1-1"))
+                  "content that does not match the schema is declined"))))
+      (setf *elicitation-answer* nil))))
 
 (deftest acp-h3e2b-elicitation-fallback
   (with-project (project config :base base) '()
     (%f2-settings config base)
-    (let ((*elicitation-answer* (list "accept" (args "colour" "blue"))))
-      (with-loopback (ra client project config :caps *bare-client-caps*
-                      :settings (%allow "mcp__f2__ask_user")
-                      :steps (list (%f2-call "ask_user") "Done."))
-        (let ((sid (req (new-session-id ra project))))
-          (ok (equal "end_turn" (req (stop-reason ra sid "ask me"))))
-          (ok (null (client-calls client "elicitation/create")) "never asked without elicitation.form")
-          (ok (has "elicited: decline" (%tool-text client "call-1-1"))
-              "declined, the documented fallback"))))))
+    (unwind-protect
+        (progn
+          ;; Global, not LET: the recording client answers on its own thread.
+          (setf *elicitation-answer* (list "accept" (args "colour" "blue")))
+          (with-loopback (ra client project config :caps *bare-client-caps*
+                                                   :settings (%allow "mcp__f2__ask_user")
+                                                   :steps (list (%f2-call "ask_user") "Done."))
+            (let ((sid (req (new-session-id ra project))))
+              (ok (equal "end_turn" (req (stop-reason ra sid "ask me"))))
+              (ok (null (client-calls client "elicitation/create")) "never asked without elicitation.form")
+              (ok (has "elicited: decline" (%tool-text client "call-1-1"))
+                  "declined, the documented fallback"))))
+      (setf *elicitation-answer* nil))))
