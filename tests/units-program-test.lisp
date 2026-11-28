@@ -58,7 +58,9 @@ for the selection to move (the screen redraws asynchronously). → true when it 
           (ok (equal +unit-list-help+ (nth 28 rows)) "the help row above the status line")
           (ok (rule-row-p (nth 27 rows)))
           (ok (not (search "Started." (screen-text tui))) "the panel replaces the transcript"))
-        (ok (search "4 running · " (last-row tui)) "the status line count")
+        (ok (wait-for* tui (lambda () (search "4 running · " (last-row tui))))
+            ;; The status line redraws on its own tick: wait for the count (#69).
+            "the status line count")
         (ok (cell-inverse-p tui 4 2) "the selected row is inverse")
         (ok (not (cell-inverse-p tui 4 4)))
         (h:tui-press tui :escape)
