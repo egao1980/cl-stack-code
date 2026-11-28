@@ -217,6 +217,19 @@
       (ok (eql 124 exit))
       (ok (has "--turn-timeout" err)))))
 
+(deftest turn-timeout-does-not-wait-for-the-request
+  ;; #59: the turn ends when the timer fires, not when the silent request does.
+  (with-project (project config) '()
+    (let ((start (get-internal-real-time)))
+      (multiple-value-bind (exit out err) (code project config '("-p" "--turn-timeout" "1" "hi")
+                                                :steps '((:stall 15 "late")))
+        (declare (ignore out))
+        (let ((elapsed (/ (- (get-internal-real-time) start)
+                          internal-time-units-per-second)))
+          (ok (eql 124 exit))
+          (ok (has "--turn-timeout" err))
+          (ok (< elapsed 8) (format nil "run-cli returned after ~,1f s" elapsed)))))))
+
 (deftest request-timeout-reaches-the-backend
   (with-project (project config) '()
     (h3f-settings config "{\"requestTimeoutMs\":900000}")
