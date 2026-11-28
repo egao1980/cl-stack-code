@@ -1338,21 +1338,6 @@ PLAN-DOCUMENT-NOT-FOUND."
     (setf (gethash "markdown" object) (or (plan-document-markdown doc) ""))
     object))
 
-(defun %client-plan-target (session)
-  "H5c-0, for the RPC aliases: :DOCUMENT when the session has a plan document
-waiting (:DRAFTING :PROPOSED :INTERRUPTED), else :PREVIEW when it has an open
-preview, else :DOCUMENT when it has a document at all (its status refuses),
-else NIL."
-  (%on-client-loop ((code-session-client session))
-    (let* ((st (%live session))
-           (doc (handler-case (%session-plan-doc-of session st)
-                  (plan-document-not-found () nil))))
-      (cond ((and doc (member (plan-document-status doc) '(:drafting :proposed :interrupted)))
-             :document)
-            ((%s-plan st) :preview)
-            (doc :document)
-            (t nil)))))
-
 (defun client-plan-document (session)
   "→ the session's plan document object with \"markdown\", or NIL."
   (%on-client-loop ((code-session-client session))

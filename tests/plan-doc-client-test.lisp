@@ -163,24 +163,28 @@
           (ok (eql -32030 code))
           (ok (equal "plan-document-not-found" (event-value data "condition"))))))))
 
-(deftest rpc-plan-approve-on-a-preview-is-deprecated
-  ;; Through 0.15.x plan/approve and plan/reject still act on an open preview.
+(deftest rpc-plan-approve-on-a-preview-is-not-an-alias
+  ;; #62 (0.17.0): plan/approve and plan/reject act only on plan documents; on
+  ;; a session with only an open preview they answer -32030, and the preview
+  ;; stays open for preview/apply and preview/reject.
   (with-project (project config) (list (list "a.txt" (nl "alpha")))
     (with-rpc (rpc backend project config :steps (list (write-tool "a.txt" (nl "beta")) "Done."
                                                        (write-tool "a.txt" (nl "gamma")) "Done."))
       (let ((id (new-session rpc "permission_mode" "preview")))
         (call rpc "turn/start" "session_id" id "prompt" "beta")
         (rpc-result rpc id)
-        (let ((applied (call rpc "plan/approve" "session_id" id)))
-          (ok (equal "applied" (event-value applied "subtype")))
-          (ok (equal "plan/approve on a preview is preview/apply; the alias goes in 0.16.0"
-                     (event-value applied "deprecated"))))
+        (multiple-value-bind (code data) (fault rpc "plan/approve" "session_id" id)
+          (ok (eql -32030 code) (format nil "plan/approve on a preview: ~a" code))
+          (ok (equal "plan-document-not-found" (event-value data "condition"))))
+        (ok (equal (nl "alpha") (read-file project "a.txt")) "nothing applied")
+        (ok (equal "applied" (event-value (call rpc "preview/apply" "session_id" id) "subtype")))
         (ok (equal (nl "beta") (read-file project "a.txt")))
         (call rpc "turn/start" "session_id" id "prompt" "gamma")
         (rpc-result rpc id :n 1)
-        (let ((discarded (call rpc "plan/reject" "session_id" id)))
-          (ok (equal "discarded" (event-value discarded "subtype")))
-          (ok (has "preview/reject" (event-value discarded "deprecated"))))))))
+        (multiple-value-bind (code data) (fault rpc "plan/reject" "session_id" id)
+          (ok (eql -32030 code) (format nil "plan/reject on a preview: ~a" code))
+          (ok (equal "plan-document-not-found" (event-value data "condition"))))
+        (ok (equal "discarded" (event-value (call rpc "preview/reject" "session_id" id) "subtype")))))))
 
 (deftest rpc-plan-doc-error-codes
   (multiple-value-bind (code message data)

@@ -172,21 +172,15 @@
   (args "type" "plan" "subtype" subtype "session_id" "s" "plan_id" "abc"
         "changes" (map 'vector (lambda (c) (args "path" (second c) "kind" (first c))) changes)))
 
-(deftest acp-event-plan-projected
-  (let ((u (one-update (plan-event "projected" '("modified" "a.txt") '("added" "b.txt")))))
-    (ok (typep u 'acp:update-plan))
-    (let ((entries (coerce (acp:entries u) 'list)))
-      (ok (equal '("modified a.txt" "added b.txt") (mapcar #'acp:content entries)))
-      (ok (every (lambda (e) (equal "pending" (acp:status e))) entries))
-      (ok (every (lambda (e) (equal "medium" (acp:priority e))) entries)))
-    (ok (encodes-p u))))
-
-(deftest acp-event-plan-applied-and-discarded
-  (let ((u (one-update (plan-event "applied" '("modified" "a.txt")))))
-    (ok (equal '("completed") (map 'list #'acp:status (acp:entries u)))))
-  (let ((u (one-update (plan-event "discarded"))))
-    (ok (typep u 'acp:update-plan))
-    (ok (zerop (length (acp:entries u))) "an empty checklist")))
+(deftest-parametrize acp-event-plan-h5a-subtypes-without-updates
+    ;; #64 (0.17.0): since 0.15.0 H5a's events are "preview" events (no plan
+    ;; update; plan-test.lisp's acp-plan-preview-events-without-updates), and
+    ;; no producer sends a "plan" event with H5a's subtypes. They map to none.
+    ((subtype)
+     :ids ("projected" "applied" "discarded")
+     ("projected") ("applied") ("discarded"))
+  (ok (null (event-updates (plan-event subtype '("modified" "a.txt"))
+                           :cwd (uiop:ensure-directory-pathname (uiop:temporary-directory))))))
 
 (deftest-parametrize acp-events-without-updates
     ((event)

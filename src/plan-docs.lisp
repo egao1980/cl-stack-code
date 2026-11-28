@@ -51,10 +51,9 @@
 ;;;   RPC: preview/apply {session_id, on_drift?} and preview/reject
 ;;;     {session_id} are the H5a methods (result: the preview object, keys as
 ;;;     the old plan object). plan/approve and plan/reject act on the plan
-;;;     document (below); on a session with no proposed plan and an open
-;;;     preview they still apply / reject the preview through 0.15.x, and the
-;;;     result gains "deprecated": "plan/approve on a preview is preview/apply;
-;;;     the alias goes in 0.16.0" (resp. plan/reject, preview/reject). A
+;;;     document (below) only: 0.15.x let them apply / reject an open preview
+;;;     when the session had no proposed plan (with a "deprecated" note); since
+;;;     0.17.0 (#62) such a session answers -32030 (no plan document). A
 ;;;     session cannot have both pending: a plan executing in preview has
 ;;;     already been approved.
 ;;;   ACP: the session modes are the five mode names (ACP-2's +ACP-MODE-IDS+).

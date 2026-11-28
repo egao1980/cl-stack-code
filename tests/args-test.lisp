@@ -10,8 +10,8 @@
   (invocation-settings (parse-arguments argv)))
 
 (deftest version-constant
-  (ok (equal "0.16.5" +version+))
-  (ok (equal "0.16.5" (asdf:component-version (asdf:find-system "cl-stack-code")))))
+  (ok (equal "0.17.0" +version+))
+  (ok (equal "0.17.0" (asdf:component-version (asdf:find-system "cl-stack-code")))))
 
 (deftest args-print-and-prompt
   (let ((i (inv "-p" "fix" "the" "test")))
