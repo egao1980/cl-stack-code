@@ -757,10 +757,24 @@ are denied (the last rules, so they win) with the refusal text as feedback."
                           :feedback (plan-sandbox-refusal-result sandbox name)))
                        +shell-tool-names+))))
 
-(defun %drive (agent prompt report mode &key sandbox error-output)
+(defun %test-plan-call-p (policy invocation)
+  "True when INVOCATION is a bash call whose command POLICY (an approved
+plan's PLAN-TEST-COMMAND-POLICY) permits."
+  (and policy invocation
+       (string= "bash" (agent:agent-invocation-name invocation))
+       (let* ((arguments (agent:agent-invocation-arguments invocation))
+              (table (if (stringp arguments)
+                         (handler-case (json:decode arguments) (error () nil))
+                         arguments)))
+         (and (hash-table-p table)
+              (plan-test-command-permits-p policy (gethash "command" table))))))
+
+(defun %drive (agent prompt report mode &key sandbox error-output test-plan-policy)
   "Run AGENT on PROMPT on the bound loop. Approvals are answered headless.
 R4d-4b: with a plan SANDBOX, a confined bash the backend refuses becomes
-PLAN-SANDBOX-REFUSAL-RESULT, the notice going once to ERROR-OUTPUT.
+PLAN-SANDBOX-REFUSAL-RESULT, the notice going once to ERROR-OUTPUT. #66:
+TEST-PLAN-POLICY (an approved plan's PLAN-TEST-COMMAND-POLICY) approves the
+asks for the bash commands its Test plan quotes; other asks are refused.
 → (values run failure interrupted-p)."
   (let ((interrupted nil))
     (handler-bind ((agent:agent-tool-error
@@ -769,7 +783,9 @@ PLAN-SANDBOX-REFUSAL-RESULT, the notice going once to ERROR-OUTPUT.
                       (lambda (notice) (%plan-stderr-line error-output "~a" notice))))
                    (agent:agent-approval-required
                      (lambda (c)
-                       (if (eq mode :bypass-permissions)
+                       (if (or (eq mode :bypass-permissions)
+                               (%test-plan-call-p test-plan-policy
+                                                  (agent:agent-approval-required-invocation c)))
                            (agent:invoke-approve c)
                            (agent:invoke-deny c +headless-denial-feedback+
                                               :by :unattended))))
@@ -1362,6 +1378,16 @@ result, then signals its failure. H5c-0: plan runs, --approve-plan,
          (prompt (if approved-doc
                      (plan-execution-prompt approved-doc prompt)
                      prompt))
+         (test-plan-policy (and approved-doc
+                                (let ((policy (plan-test-command-policy approved-doc)))
+                                  ;; #66: -p cannot ask, so the commands the approved
+                                  ;; Test plan quotes are approved for this run; say which.
+                                  (when policy
+                                    (%plan-stderr-line error-output
+                                                       "plan ~a: the Test plan's commands may run: ~{~a~^, ~}"
+                                                       (subseq (plan-document-id approved-doc) 0 8)
+                                                       (plan-test-commands approved-doc)))
+                                  policy)))
          (area (when plan-doc-p
                  (handler-bind ((error (lambda (e)
                                          (declare (ignore e))
@@ -1529,7 +1555,8 @@ result, then signals its failure. H5c-0: plan runs, --approve-plan,
                                         history
                                         (append history (list (llm:user-turn prompt))))
                               report mode
-                              :sandbox sandbox :error-output error-output)
+                              :sandbox sandbox :error-output error-output
+                              :test-plan-policy test-plan-policy)
                     ;; H5c-0: plan versus diff (a preview: its projection).
                     (when approved-doc
                       (multiple-value-bind (changes diff)
