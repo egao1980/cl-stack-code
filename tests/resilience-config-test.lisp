@@ -247,3 +247,22 @@
   (let ((b (make-scripted-backend '())))
     (ok (eq b (apply-request-timeout b 30)))
     (ok (eql 30 (scripted-request-timeout b)))))
+
+;;; #58: the agent loop always streams, and a stream's limit is the backend's
+;;; idle timeout, not its request timeout. requestTimeoutMs sets both, on the
+;;; real backend classes (not only the mock's own method).
+(deftest apply-request-timeout-reaches-streaming-requests
+  (let ((openai (llm-protocol-openai:make-openai-compat-backend
+                 :base-url "http://127.0.0.1:1/v1" :api-key "k" :default-model "m"))
+        (anthropic (llm-protocol-anthropic:make-anthropic-backend
+                    :base-url "http://127.0.0.1:1" :api-key "k" :default-model "m")))
+    (ok (eq openai (apply-request-timeout openai 1)))
+    (ok (eql 1 (llm-protocol-openai:openai-request-timeout openai)) "openai: non-streaming")
+    (ok (eql 1 (llm-protocol-openai:openai-stream-idle-timeout openai))
+        (format nil "openai: streaming idle timeout (got ~S)"
+                (llm-protocol-openai:openai-stream-idle-timeout openai)))
+    (ok (eq anthropic (apply-request-timeout anthropic 1)))
+    (ok (eql 1 (llm-protocol-anthropic:anthropic-request-timeout anthropic)) "anthropic: non-streaming")
+    (ok (eql 1 (llm-protocol-anthropic:anthropic-stream-idle-timeout anthropic))
+        (format nil "anthropic: streaming idle timeout (got ~S)"
+                (llm-protocol-anthropic:anthropic-stream-idle-timeout anthropic)))))

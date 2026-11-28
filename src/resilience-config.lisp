@@ -634,18 +634,25 @@ replaced by \"[redacted]\"."
 (defgeneric apply-request-timeout (backend seconds)
   (:documentation "Give BACKEND (an LLM-BACKEND) the per-request timeout
 SECONDS (requestTimeoutMs / 1000). Methods for the built-in openai and
-anthropic backends set the request-timeout initarg's accessor that
-llm-protocol-openai#13 adds (PLACEHOLDER: its name is that fix's; see
-.team-solve/task.md). The default method does nothing and returns NIL, so a
-custom provider's backend is left alone. → BACKEND when applied.")
+anthropic backends set both the request timeout (non-streaming calls) and
+the stream idle timeout: the agent loop always streams, and a stream is
+bounded by its idle timeout (#58). The default method does nothing and
+returns NIL, so a custom provider's backend is left alone. → BACKEND when
+applied.")
   (:method (backend seconds)
     (declare (ignore backend seconds))
     nil))
 
 (defmethod apply-request-timeout ((backend llm-protocol-openai:openai-compat-backend) seconds)
-  (setf (llm-protocol-openai:openai-request-timeout backend) seconds)
+  ;; The agent loop always streams, and a stream is bounded by the idle
+  ;; timeout (llm-protocol-openai's %REQUEST-TIMEOUT-SPEC), not the request
+  ;; timeout: set both (#58).
+  (setf (llm-protocol-openai:openai-request-timeout backend) seconds
+        (llm-protocol-openai:openai-stream-idle-timeout backend) seconds)
   backend)
 
 (defmethod apply-request-timeout ((backend llm-protocol-anthropic:anthropic-backend) seconds)
-  (setf (llm-protocol-anthropic:anthropic-request-timeout backend) seconds)
+  ;; Streams too: the idle timeout (#58).
+  (setf (llm-protocol-anthropic:anthropic-request-timeout backend) seconds
+        (llm-protocol-anthropic:anthropic-stream-idle-timeout backend) seconds)
   backend)
