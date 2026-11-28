@@ -1391,10 +1391,16 @@ else NIL."
 turn. → (values object turn). ON-EVENT is the turn's, as CLIENT-TURN's.
 EXECUTE NIL only approves (→ (values object nil)); a document approved so
 waits for its execution turn, which a later call starts under the approved
-mode (ACP-2: session/set_mode out of plan, then session/prompt)."
+mode (ACP-2: session/set_mode out of plan, then session/prompt). A document
+whose execution has started (running or done) is not approved again:
+PLAN-DOCUMENT-STATE-ERROR, also while that turn runs (0.16.4, #65)."
   (declare (ignore on-drift))
   (%on-client-loop ((code-session-client session))
     (let ((st (%live session)))
+      (let ((doc (handler-case (%session-plan-doc-of session st)
+                   (plan-document-not-found () nil))))
+        (when (and doc (eq :approved (plan-document-status doc)))
+          (check-plan-approvable doc)))
       (%check-idle session st)
       (let* ((doc (%session-plan-doc-of session st))
              (waiting (eq :approved (plan-document-status doc)))
@@ -1414,6 +1420,7 @@ mode (ACP-2: session/set_mode out of plan, then session/prompt)."
              (let ((store (p:make-memory-snapshot-store)))
                (setf (%s-exec-snapshots st) store
                      (%s-exec-before st) (%execution-snapshot (%s-project-dir st) store))))
+           (note-plan-execution-started doc)
            (let* ((object (plan-document-object doc))
                   (turn (%start-turn session (plan-execution-prompt doc prompt) nil on-event
                                      :approved-doc doc)))

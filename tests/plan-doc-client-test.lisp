@@ -85,6 +85,57 @@
         (ok (equal (nl "echo hello") (read-file project "hello.sh")))
         (ok (rpc-client-events rpc :type "plan" :session-id id) "plan events are notifications")))))
 
+;;; #65: approving a plan whose execution has started is refused
+;;; (plan-document-state-error, -32031); approving with :execute nil and then
+;;; again (ACP's session/set_mode, then session/prompt) still runs it once.
+
+(defun stalled-execution-steps (seconds)
+  "EXECUTION-STEPS whose first step waits SECONDS, so the turn is still running."
+  (let ((steps (execution-steps)))
+    (cons (list :stall seconds (first steps)) (rest steps))))
+
+(defun executed-count (events)
+  (count "executed" (events-of events "plan")
+         :key (lambda (e) (event-value e "subtype")) :test #'equal))
+
+(deftest client-plan-doc-approve-twice-runs-once
+  (with-project (project config) (list (list "hello.sh" ""))
+    (with-test-client (client backend events project config
+                              :steps (list* (propose-step) (stalled-execution-steps 2)))
+      (let ((s (client-new-session client :permission-mode :plan)))
+        (client-query s "add a greeting" :timeout 60)
+        (multiple-value-bind (object turn) (client-approve-plan-document s :mode :accept-edits :execute nil)
+          (ok (equal "approved" (event-value object "status")))
+          (ok (null turn) "approved, not run"))
+        (multiple-value-bind (object turn) (client-approve-plan-document s)
+          (ok (equal "approved" (event-value object "status")))
+          (ok turn "the approved plan's execution turn starts")
+          (let ((again (failure (client-approve-plan-document s))))
+            (ok (typep again 'plan-document-state-error)
+                (format nil "approving it again while it runs is refused, got ~a" (type-of again))))
+          (ok (equal "executed" (event-value (client-wait turn :timeout 60) "plan" "status"))))
+        (ok (typep (failure (client-approve-plan-document s)) 'plan-document-state-error))
+        (ok (eql 1 (executed-count events)) "one execution")))))
+
+(deftest rpc-plan-doc-approve-twice-runs-once
+  (with-project (project config) (list (list "hello.sh" ""))
+    (with-rpc (rpc backend project config :steps (list* (propose-step) (stalled-execution-steps 2)))
+      (let ((id (new-session rpc "permission_mode" "plan")))
+        (call rpc "turn/start" "session_id" id "prompt" "add a greeting")
+        (rpc-result rpc id)
+        (ok (equal "approved" (event-value (call rpc "plan/approve" "session_id" id "mode" "acceptEdits")
+                                           "plan" "status")))
+        (multiple-value-bind (code data) (fault rpc "plan/approve" "session_id" id "mode" "acceptEdits")
+          (ok (eql -32031 code) (format nil "a second plan/approve is -32031, got ~a" code))
+          (ok (equal "approved" (event-value data "status"))))
+        (ok (equal "executed" (event-value (rpc-result rpc id :n 1) "plan" "status")))
+        (multiple-value-bind (code data) (fault rpc "plan/approve" "session_id" id)
+          (ok (eql -32031 code))
+          (ok (equal "executed" (event-value data "status"))))
+        (ok (eql 1 (count "executed" (rpc-client-events rpc :type "plan" :session-id id)
+                          :key (lambda (e) (event-value e "subtype")) :test #'equal))
+            "one execution")))))
+
 (deftest rpc-plan-doc-update-save-reject
   (with-project (project config) '()
     (with-rpc (rpc backend project config :steps (list (propose-step)))

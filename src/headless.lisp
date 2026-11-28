@@ -1352,7 +1352,7 @@ result, then signals its failure. H5c-0: plan runs, --approve-plan,
                      (%open-session-plan-doc store project (%plan-doc-data-dir data-dir getenv)
                                              settings)))
                    (approved-doc
-                    (approve-plan-document approved-doc :mode execution-mode)
+                    (note-plan-execution-started (approve-plan-document approved-doc :mode execution-mode))
                     (list approved-doc nil)))))
          (doc (first doc-and-reopened))
          (doc-start-revision (and doc (plan-document-revision doc)))

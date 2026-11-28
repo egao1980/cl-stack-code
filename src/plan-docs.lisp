@@ -772,7 +772,7 @@ decision's feedback; no opinion otherwise (a policy only tightens)."
 
 (defun %write-plan-doc-meta (doc)
   "Write DOC's meta.sexp atomically (format 1; extra keys :OPENED-US,
-:REVISIONS, :APPROVED-FROM)."
+:REVISIONS, :APPROVED-FROM, :EXECUTION-STARTED)."
   (let ((form (list :format +plan-document-format+
                     :id (plan-document-id doc)
                     :project-dir (uiop:native-namestring (plan-document-project-dir doc))
@@ -789,6 +789,7 @@ decision's feedback; no opinion otherwise (a policy only tightens)."
                     :opened-us (%doc-extra doc :opened-us)
                     :revisions (copy-list (%doc-extra doc :revisions))
                     :approved-from (%doc-extra doc :approved-from)
+                    :execution-started (plan-execution-started-p doc)
                     :version +version+)))
     (ensure-directories-exist (plan-document-directory doc))
     (p:write-text (%plan-doc-meta-file (plan-document-directory doc))
@@ -815,7 +816,7 @@ PLAN-DOCUMENT-NOT-FOUND :DESIGNATOR ID when it is missing or unreadable."
         (unless (%plist-p form) (lost))
         (destructuring-bind (&key format ((:id file-id)) project-dir session status revision template
                                   title steps files area mode opened-at opened-us revisions
-                                  approved-from
+                                  approved-from execution-started
                                   &allow-other-keys)
             form
           (unless (and (eql format +plan-document-format+)
@@ -836,7 +837,8 @@ PLAN-DOCUMENT-NOT-FOUND :DESIGNATOR ID when it is missing or unreadable."
                                     :opened-at opened-at)))
             (setf (%doc-extra doc :opened-us) (or opened-us (* (or opened-at 0) 1000000))
                   (%doc-extra doc :revisions) revisions
-                  (%doc-extra doc :approved-from) approved-from)
+                  (%doc-extra doc :approved-from) approved-from
+                  (%doc-extra doc :execution-started) (and execution-started t))
             doc))))))
 
 ;;; Opening, reading back.
@@ -1115,7 +1117,8 @@ the previews); a lost area is skipped. DOC forgets the area."
     (setf (plan-document-area-id doc) nil)))
 
 (defun approve-plan-document (doc &key (mode :accept-edits))
-  "→ DOC, :APPROVED under MODE (see the header)."
+  "→ DOC, :APPROVED under MODE (see the header). Its execution has not
+started yet (PLAN-EXECUTION-STARTED-P is NIL)."
   (unless (member (plan-document-status doc) '(:proposed :interrupted))
     (%plan-doc-state-fail doc "approved"))
   (unless (member mode +plan-execution-modes+)
@@ -1130,9 +1133,33 @@ the previews); a lost area is skipped. DOC forgets the area."
     (%discard-doc-area doc :keep-scratch t)
     (setf (plan-document-status doc) :approved
           (plan-document-execution-mode doc) mode
-          (%doc-extra doc :approved-from) status)
+          (%doc-extra doc :approved-from) status
+          (%doc-extra doc :execution-started) nil)
     (%write-plan-doc-meta doc)
     doc))
+
+(defun plan-execution-started-p (doc)
+  "0.16.4 (#65): true once the execution turn of DOC's current approval has
+started (kept in meta.sexp). An :APPROVED document whose execution has not
+started (approved with :EXECUTE NIL, ACP's session/set_mode) may be approved
+again, which runs it; one whose execution started may not."
+  (and (%doc-extra doc :execution-started) t))
+
+(defun note-plan-execution-started (doc)
+  "Record that DOC's execution turn starts now. → DOC."
+  (setf (%doc-extra doc :execution-started) t)
+  (%write-plan-doc-meta doc)
+  doc)
+
+(defun check-plan-approvable (doc)
+  "PLAN-DOCUMENT-STATE-ERROR unless DOC may be approved now: :PROPOSED,
+:INTERRUPTED, or :APPROVED with its execution not started. → DOC."
+  (let ((status (plan-document-status doc)))
+    (cond ((member status '(:proposed :interrupted)) doc)
+          ((and (eq status :approved) (not (plan-execution-started-p doc))) doc)
+          ((eq status :approved)
+           (%plan-doc-state-fail doc "approved again: its execution has started"))
+          (t (%plan-doc-state-fail doc "approved")))))
 
 (defun reject-plan-document (doc)
   "→ :REJECTED, the area discarded."

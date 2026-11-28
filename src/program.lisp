@@ -2280,7 +2280,7 @@ exploration area, switch to M and run the execution turn."
         (progn
           (unless doc
             (error 'plan-document-not-found :designator nil :message "no plan yet"))
-          (approve-plan-document doc :mode mode)
+          (note-plan-execution-started (approve-plan-document doc :mode mode))
           (setf (%cp-doc-area program) nil
                 (%cp-exec-doc program) doc
                 (%cp-exec-tools program) (make-plan-tools doc :phase :execute))
