@@ -69,12 +69,11 @@
 ;;;                               "pending"; "step": the whole "steps" list
 ;;;                               again (ACP replaces it), status "pending" /
 ;;;                               "in_progress" / "completed" (a step's
-;;;                               "done"); "rejected": no entries. H5a's
-;;;                               subtypes, should a "plan" event carry them,
-;;;                               map as in 0.14 ("projected": "<kind>
-;;;                               <path>" pending; "applied": completed;
-;;;                               "discarded": no entries). Other subtypes
-;;;                               ("opened", "approved", "executed", …) → none
+;;;                               "done"); "rejected": no entries. Other
+;;;                               subtypes ("opened", "approved", "executed",
+;;;                               and H5a's "projected" / "applied" /
+;;;                               "discarded", which no producer sends since
+;;;                               0.15.0, #64) → none
 ;;;     preview (H5a's events, renamed) → no update
 ;;;     instructions {files: [{path, kind}]} (#41)
 ;;;                             → per file an UPDATE-TOOL-CALL, id
@@ -194,17 +193,6 @@ STATUS, else the step's own status mapped to ACP's."
        (let ((steps (code:event-value event "steps")))
          (if (typep steps 'sequence) steps #()))))
 
-(defun %change-entries (event status)
-  "H5a: one PLAN-ENTRY per change of EVENT, \"<kind> <path>\", with STATUS."
-  (map 'vector (lambda (change)
-                 (acp:make-acp 'acp:plan-entry
-                               :content (format nil "~a ~a"
-                                                (code:event-value change "kind")
-                                                (code:event-value change "path"))
-                               :priority "medium"
-                               :status status))
-       (or (code:event-value event "changes") #())))
-
 (defun event-updates (event &key cwd)
   (let ((type (code:event-type event)))
     (cond
@@ -236,19 +224,16 @@ STATUS, else the step's own status mapped to ACP's."
                                        (if (stringp c) c (princ-to-string (or c ""))))))))
       ((equal type "plan")
        ;; H5c-0: plan document events. The core sends H5a's preview events as
-       ;; "preview" now (no update); a "plan" event of H5a's subtypes still maps
-       ;; as in 0.14 (the mapping table is pure).
+       ;; "preview" (no update).
        (let ((subtype (code:event-value event "subtype")))
          (cond ((equal subtype "proposed")
                 (list (acp:make-acp 'acp:update-plan :entries (%plan-entries event "pending"))))
                ((equal subtype "step")
                 (list (acp:make-acp 'acp:update-plan :entries (%plan-entries event))))
-               ((member subtype '("rejected" "discarded") :test #'equal)
+               ((equal subtype "rejected")
                 (list (acp:make-acp 'acp:update-plan :entries (vector))))
-               ((equal subtype "projected")
-                (list (acp:make-acp 'acp:update-plan :entries (%change-entries event "pending"))))
-               ((equal subtype "applied")
-                (list (acp:make-acp 'acp:update-plan :entries (%change-entries event "completed"))))
+               ;; #64 (0.17.0): H5a's subtypes (projected / applied / discarded) are
+               ;; "preview" events since 0.15.0 and map to none, like any other.
                (t '()))))
       ((equal type "instructions")
        ;; #41: a lazily loaded AGENTS.md or path-scoped rule, as a finished

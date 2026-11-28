@@ -63,10 +63,10 @@
 ;;;                    "bypassPermissions" "preview"), prompt?, on_drift?}
 ;;;                                               → {"plan", "session_id"}: the plan document
 ;;;                                                  approved, its execution turn started
-;;;                                                  (H5c-0). On an open preview: preview/apply
-;;;                                                  (0.15.x alias, deprecated; gone in 0.16.0)
-;;;   plan/reject      {session_id}               → {"plan"} (the document rejected); on an open
-;;;                                                  preview: preview/reject (alias, deprecated)
+;;;                                                  (H5c-0). Plan documents only (0.17.0,
+;;;                                                  #62): with just an open preview, -32030
+;;;   plan/reject      {session_id}               → {"plan"} (the document rejected); plan
+;;;                                                  documents only (preview/reject discards)
 ;;;   plan/revise      {session_id, feedback}     → {"session_id"}: the plan turn revising it
 ;;;   plan/get         {session_id}               → {"plan": object with "markdown" | null}
 ;;;   plan/update      {session_id, markdown}     → {"plan"} (a :USER revision; a bad format
@@ -377,10 +377,6 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
 (defparameter +rpc-plan-execution-names+ '("default" "acceptEdits" "bypassPermissions" "preview")
   "H5c-0: plan/approve's mode values (+PLAN-EXECUTION-MODES+ as names).")
 
-(defun %deprecated (object text)
-  "OBJECT (a JSON object) with \"deprecated\": TEXT."
-  (setf (gethash "deprecated" object) text)
-  object)
 (defparameter +rpc-drift-names+ '("abort" "rebase" "overwrite"))
 (defparameter +rpc-rewind-mode-names+ '("both" "conversation" "files"))
 
@@ -504,28 +500,23 @@ RPC-INVALID-PARAMS); a mistyped value → RPC-INVALID-PARAMS."
                                     :content content)
                                    'vector)))))
    (cons "plan/approve"
+         ;; #62 (0.17.0): plan documents only; a session with just an open
+         ;; preview answers -32030 (preview/apply applies it).
          (lambda (client method params)
            (let ((session (%session-param client method params))
-                 (on-drift (%param method params "on_drift" (cons :member +rpc-drift-names+))))
-             (if (eq :preview (%client-plan-target session))
-                 ;; 0.15.x: the H5a alias on an open preview.
-                 (%deprecated (client-apply-preview session :on-drift (or (%keyword on-drift) :abort))
-                              "plan/approve on a preview is preview/apply; the alias goes in 0.16.0")
-                 (let ((mode (%param method params "mode" (cons :member +rpc-plan-execution-names+)))
-                       (prompt (%param method params "prompt" :string)))
-                   (%json-object "plan" (client-approve-plan-document
-                                         session :mode (if mode (parse-permission-mode mode) :accept-edits)
-                                         :prompt prompt
-                                         :on-drift (%keyword on-drift))
-                                 "session_id" (code-session-id session)))))))
+                 (on-drift (%param method params "on_drift" (cons :member +rpc-drift-names+)))
+                 (mode (%param method params "mode" (cons :member +rpc-plan-execution-names+)))
+                 (prompt (%param method params "prompt" :string)))
+             (%json-object "plan" (client-approve-plan-document
+                                   session :mode (if mode (parse-permission-mode mode) :accept-edits)
+                                   :prompt prompt
+                                   :on-drift (%keyword on-drift))
+                           "session_id" (code-session-id session)))))
    (cons "plan/reject"
+         ;; #62 (0.17.0): plan documents only (preview/reject discards a preview).
          (lambda (client method params)
-           (let ((session (%session-param client method params)))
-             (if (eq :preview (%client-plan-target session))
-                 ;; 0.15.x: the H5a alias on an open preview.
-                 (%deprecated (client-reject-preview session)
-                              "plan/reject on a preview is preview/reject; the alias goes in 0.16.0")
-                 (%json-object "plan" (client-reject-plan-document session))))))
+           (%json-object "plan" (client-reject-plan-document
+                                 (%session-param client method params)))))
    (cons "plan/revise"
          (lambda (client method params)
            (let ((session (%session-param client method params))
