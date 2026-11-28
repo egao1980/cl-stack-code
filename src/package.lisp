@@ -673,9 +673,13 @@
    #:plan-sandbox-unavailable-backend
    #:settings-sandbox
    #:sandbox-settings
-   #:+sandbox-network-names+))
+   #:+sandbox-network-names+
+   #:test-plan-commands
+   #:plan-test-commands
+   #:plan-test-command-policy
+   #:plan-test-command-permits-p))
 
 (in-package #:cl-stack-code)
 
-(defparameter +version+ "0.16.4"
+(defparameter +version+ "0.16.5"
   "The product version, as in the .asd.")

@@ -256,6 +256,58 @@ only a goal
         (update-step 1 "done")
         "Done."))
 
+;;; #66: headless --approve-plan (acceptEdits) cannot ask, so the commands
+;;; the approved plan's "Test plan" quotes are allowed for its execution run;
+;;; any other command still asks, which -p refuses.
+
+(deftest plan-doc-cli-approve-runs-the-test-plan-commands
+  (with-project (project config) '(("hello.sh" "") ("tests/hello-test.sh" "echo ran > ran.txt"))
+    (let ((session (proposed-session project config)))
+      (multiple-value-bind (exit out err)
+          (code project config (list "-p" "--output-format" "stream-json" "--resume" session "--approve-plan")
+                :steps (list (write-tool "hello.sh" (nl "echo hello"))
+                             (bash-step "sh tests/hello-test.sh")
+                             (bash-step "touch other.txt")
+                             "Done."))
+        (ok (eql 0 exit))
+        (let ((bashes (tool-results out "bash")))
+          (ok (= 2 (length bashes)))
+          (ok (not (equal "denied" (jget (first bashes) "status")))
+              (format nil "the Test plan's command runs: ~a" (jget (first bashes) "content")))
+          (ok (equal "denied" (jget (second bashes) "status")) "another command still asks, which -p refuses")
+          (ok (has +headless-denial-feedback+ (jget (second bashes) "content"))))
+        (ok (file-exists project "ran.txt") "the test ran in the project")
+        (ok (not (file-exists project "other.txt")))
+        (ok (has "sh tests/hello-test.sh" err) "stderr names the allowed commands")))))
+
+(deftest plan-test-commands-from-the-test-plan
+  (with-project (project config) '()
+    (let* ((session (proposed-session project config))
+           (doc (only-plan-doc project config))
+           (policy (plan-test-command-policy doc)))
+      (declare (ignore session))
+      (ok (equal '("sh tests/hello-test.sh") (plan-test-commands doc)))
+      (ok (plan-test-command-permits-p policy "sh tests/hello-test.sh"))
+      (ok (plan-test-command-permits-p policy "  sh tests/hello-test.sh ") "trimmed")
+      (ok (not (plan-test-command-permits-p policy "sh tests/hello-test.sh; rm -rf ~")) "exactly the command")
+      (ok (not (plan-test-command-permits-p policy "touch other.txt")))
+      (ok (not (plan-test-command-permits-p nil "sh tests/hello-test.sh")) "no policy, no approval"))))
+
+(deftest-parametrize plan-test-commands-of-markdown
+    ((test-plan expected)
+     :ids ("code-spans" "code-block" "compound-as-quoted" "glob-skipped" "none" "duplicates")
+     ("Run `make test` and `sh t.sh -v`." '("make test" "sh t.sh -v"))
+     ((format nil "Run:~%~%```sh~%# the suite~%make test~%~%./run-tests --fast~%```~%")
+      '("make test" "./run-tests --fast"))
+     ("`sh greet.sh; sh greet.sh Ada`" '("sh greet.sh; sh greet.sh Ada"))
+     ("`rm *.o` then `make`" '("make"))
+     ("Read the output by hand." '())
+     ("`make` - `make`" '("make")))
+  (let ((got (test-plan-commands
+              (format nil "# T~%~%## Goal~%g~%~%## Steps~%1. s~%~%## Test plan~%~a~%~%## Notes~%`not this`~%"
+                      test-plan))))
+    (ok (equal expected got) (format nil "~s" got))))
+
 (deftest plan-doc-cli-approve-executes-in-the-project
   (with-project (project config) '(("hello.sh" ""))
     (let ((session (proposed-session project config)))

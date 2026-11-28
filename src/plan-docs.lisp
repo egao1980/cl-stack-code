@@ -957,6 +957,88 @@ heading NAME, before the next heading of the same or a higher level."
                                t)))
         finally (return (values nil nil))))
 
+(defun %md-section-blocks (blocks name)
+  "The blocks after the level ≥ 2 heading NAME, before the next heading of
+the same or a higher level (NIL when there is no such heading)."
+  (loop for (b . rest) on blocks
+        when (and (eq (first b) :heading) (>= (second b) 2)
+                  (string-equal (%md-trim (%md-inline-text (third b))) name))
+          do (let ((level (second b)))
+               (return (loop for x in rest
+                             until (and (eq (first x) :heading) (<= (second x) level))
+                             collect x)))))
+
+(defun %md-command-texts (blocks)
+  "The code span texts of BLOCKS' paragraphs and list items, and the
+non-blank, non-comment lines of their code blocks, in order."
+  (let ((out '()))
+    (labels ((inlines (xs)
+               (dolist (x xs)
+                 (when (consp x)
+                   (case (first x)
+                     (:code (push (second x) out))
+                     ((:soft-break :hard-break))
+                     ((:link :image) (inlines (third x)))
+                     (t (inlines (second x)))))))
+             (blocks (bs)
+               (dolist (b bs)
+                 (case (first b)
+                   (:paragraph (inlines (second b)))
+                   (:code-block
+                    (dolist (line (third b))
+                      (let ((text (%md-trim line)))
+                        (unless (or (zerop (length text)) (char= (char text 0) #\#))
+                          (push text out)))))
+                   (:block-quote (blocks (second b)))
+                   ((:bullet-list :ordered-list)
+                    (dolist (item (%md-list-items b))
+                      (blocks item)))))))
+      (blocks blocks))
+    (nreverse out)))
+
+(defun test-plan-commands (markdown)
+  "0.16.5 (#66): the shell commands MARKDOWN's \"Test plan\" section quotes
+(code spans, and code-block lines that are not blank or comments), trimmed,
+in order, without duplicates. A command with a glob character (* ? [) is left
+out: the policy matches commands with globs, so it could not be allowed as
+quoted."
+  (let ((commands '()))
+    (dolist (text (%md-command-texts (%md-section-blocks (mdp:parse-markdown markdown) "Test plan")))
+      (let ((command (%md-trim text)))
+        (unless (or (zerop (length command))
+                    (find-if (lambda (c) (find c "*?[")) command)
+                    (member command commands :test #'string=))
+          (push command commands))))
+    (nreverse commands)))
+
+(defun plan-test-commands (doc)
+  "TEST-PLAN-COMMANDS of DOC's plan.md (NIL before the first proposal)."
+  (let ((markdown (plan-document-markdown doc)))
+    (and markdown (test-plan-commands markdown))))
+
+(defun plan-test-command-policy (doc)
+  "A policy-protocol policy that permits the bash calls whose command is one
+of PLAN-TEST-COMMANDS of DOC, exactly, or NIL when there are none. Headless
+--approve-plan answers the asks of the execution run with it: the user
+approved those commands with the plan, and -p cannot ask (#66)."
+  (let ((commands (plan-test-commands doc)))
+    (and commands
+         (stack-policy:make-policy
+          :name "plan-test-commands"
+          :rules (loop for command in commands
+                       for i from 1
+                       collect `(permit :id ,(format nil "test-plan-~d" i)
+                                        :action "bash" :resource ,command))))))
+
+(defun plan-test-command-permits-p (policy command)
+  "True when POLICY (PLAN-TEST-COMMAND-POLICY's) permits a bash call of
+COMMAND (a string; trimmed first)."
+  (and policy (stringp command)
+       (eq :permit
+           (stack-policy:decision-effect
+            (stack-policy:evaluate-policy
+             policy (list :action "bash" :resources (list (%md-trim command))))))))
+
 (defun %template-headings (template)
   "→ (values required steps-heading) of TEMPLATE."
   (ecase template
